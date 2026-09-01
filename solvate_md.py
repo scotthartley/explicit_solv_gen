@@ -110,10 +110,24 @@ class Condition:
     # Fraction of the packing shell filled by solvent at bulk density. Sets
     # how thick the shell is for a given n_solvent -- see `shell_padding`.
     shell_fill: float = 0.5
-    # How far past the packed shell a solvent atom may stray from the solute
-    # surface before the wall pulls it back, in solvent diameters.
-    wall_slack: float = 1.0
+    # How far past the packed shell a solvent atom may stray before the wall
+    # pulls it back, in solvent diameters -- and now measured in the wall's own
+    # metric, so it means the same thing for every solute (see
+    # `packing_wall_distance`). 0.25 leaves ~1-1.5 A of room to rearrange.
+    #
+    # Not just a safety margin: the wall volume sets the translational entropy
+    # of a dissociated solvent molecule, so loosening it makes dissociation
+    # more favourable. The old default of 1.0 meant a different thing under
+    # the previous formula and is far too loose under this one.
+    wall_slack: float = 0.25
     wall_k: float = 1.0  # eV/Angstrom^2
+    # Packmol's global minimum interatomic distance. Left at the conventional
+    # 2.0 deliberately, but exposed because it has a chemical consequence that
+    # is easy to miss: it forbids hydrogen-bond contacts outright (H...O/N sit
+    # at 1.8-2.0 A), so a packed structure cannot start bonded. That is fine
+    # here -- gas-phase MD forms the contacts within a few ps from a 2.0 start
+    # -- but lower it if you need contact geometries straight out of packing.
+    tolerance: float = 2.0
     label: str = "condition"
     calculator_kwargs: dict = field(default_factory=dict)
 
@@ -122,10 +136,27 @@ class SolventShellWall(Calculator):
     """Keep every solvent atom within `max_distance` of the nearest solute atom.
 
     A finite cluster in vacuum has nothing holding the solvent on the solute,
-    and under ALPB it is actively favourable for a solvent molecule to leave
-    (the continuum solvates it perfectly well out there). So the shell needs
-    a confining potential or it simply dissociates -- this is why CREST/QCG
-    runs its microsolvation MD under wall potentials too.
+    so the shell needs a confining potential or it drifts apart -- this is why
+    CREST/QCG runs its microsolvation MD under wall potentials too.
+
+    How much work that wall has to do is strongly solvent-dependent, and it is
+    worth knowing which regime you are in before trusting a run. Measured with
+    GFN2-xTB, binding of one solvent molecule, gas -> ALPB:
+
+        methanol...water   in ALPB(water)    -3.6 -> +2.6 kcal/mol
+        pyrazine...HCCl3   in ALPB(chcl3)    -5.7 -> -6.6 kcal/mol
+        pyrazine...acetone in ALPB(acetone)  -2.1 -> -3.5 kcal/mol
+
+    ALPB(water) reproduces a water's full hydration free energy, so a water
+    that leaves the cluster loses nothing and dissociation is downhill: the
+    wall ends up load-bearing and its energy contaminates everything. The
+    weaker continua do the opposite -- they stabilise the complex, because the
+    polarised contact has a larger dipole than the separated monomers.
+
+    So `wall_energy_eV` in the trajectory output is the diagnostic to watch.
+    Rarely nonzero means the shell is self-bound and the wall is a safety net.
+    Persistently nonzero means the wall is holding together something the
+    Hamiltonian wants to disperse, and the energies are not clean.
 
     Phrased as a distance to the nearest solute atom rather than as a
     geometric cage, which sidesteps every way a cage can be wrong: it follows
@@ -280,6 +311,33 @@ def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill=0.5,
     return max(0.5 * (low + high), min_padding)
 
 
+def packing_wall_distance(region, solute_positions, r_solvent, wall_slack=1.0,
+                          n_samples=4096):
+    """Wall radius that just contains the packing region, plus slack.
+
+    The wall measures a solvent atom's distance to the *nearest solute atom*,
+    so its radius has to be derived in that same metric. Adding the shell
+    `padding` to it instead -- a thickness laid on semi-axes measured from the
+    origin, where the semi-axes already include vdW radii -- mixes two
+    different reference surfaces, and the mismatch does not scale with solute
+    size: for methanol it put the wall 1.75 A outside the region the solvent
+    was packed into, so MD's first act was to expand the shell.
+
+    Sampling the region's surface and taking the largest distance to the
+    nearest solute atom gives a wall that contains the packed shell exactly,
+    and makes `wall_slack` mean the same thing for every solute.
+    """
+    i = np.arange(n_samples) + 0.5
+    phi = np.arccos(1.0 - 2.0 * i / n_samples)
+    theta = np.pi * (1.0 + 5.0**0.5) * i
+    unit = np.c_[np.cos(theta) * np.sin(phi),
+                 np.sin(theta) * np.sin(phi),
+                 np.cos(phi)]
+    surface = unit * np.asarray(region)
+    d = np.linalg.norm(surface[:, None, :] - solute_positions[None, :, :], axis=2)
+    return float(d.min(axis=1).max() + wall_slack * 2.0 * r_solvent)
+
+
 @dataclass
 class Packing:
     atoms: object
@@ -287,6 +345,7 @@ class Packing:
     semi_axes: np.ndarray
     padding: float
     wall_distance: float
+    atoms_per_solvent: int
 
 
 def pack_solvent(
@@ -329,9 +388,25 @@ def pack_solvent(
         min_padding=r_solvent,  # always at least a contact layer
     )
     region = semi_axes + padding
-    # Leash measured from the solute surface, not from any centre: the shell
-    # thickness plus `wall_slack` solvent diameters of room to rearrange.
-    wall_distance = float(padding + wall_slack * 2.0 * r_solvent)
+    wall_distance = packing_wall_distance(
+        region, solute.get_positions(), r_solvent, wall_slack=wall_slack
+    )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if n_solvent == 0:
+        # The continuum-only reference point of an n-sweep. Nothing to pack,
+        # and packmol rejects `number 0`, so short-circuit.
+        write(out_path, solute)
+        return Packing(
+            atoms=solute,
+            n_solute=len(solute),
+            semi_axes=semi_axes,
+            padding=padding,
+            wall_distance=wall_distance,
+            atoms_per_solvent=len(solvent_unit),
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -389,8 +464,6 @@ end structure
             f"molecules.\n{result.stdout}"
         )
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     write(out_path, packed)
     return Packing(
         atoms=packed,
@@ -398,6 +471,7 @@ end structure
         semi_axes=semi_axes,
         padding=padding,
         wall_distance=wall_distance,
+        atoms_per_solvent=len(solvent_unit),
     )
 
 
@@ -413,6 +487,7 @@ def run_one_job(condition, seed, out_dir):
         solvent=condition.solvent,
         shell_fill=condition.shell_fill,
         wall_slack=condition.wall_slack,
+        tolerance=condition.tolerance,
         seed=seed,
     )
     atoms = packing.atoms
@@ -508,6 +583,12 @@ def run_one_job(condition, seed, out_dir):
                 "solvent": condition.solvent,
                 "n_solvent": condition.n_solvent,
                 "n_atoms": n_atoms,
+                # The scorer reads the trajectory back without the Condition
+                # that produced it, and needs these to split solute from
+                # solvent and solvent into molecules.
+                "n_solute": packing.n_solute,
+                "atoms_per_solvent": packing.atoms_per_solvent,
+                "tolerance": condition.tolerance,
                 "calculator": condition.calculator,
                 "implicit_solvent": condition.implicit_solvent,
                 "solvation": list(solvation) if solvation else None,

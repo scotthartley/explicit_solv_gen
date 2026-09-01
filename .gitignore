@@ -3,3 +3,4 @@ resources/
 smoke_test_output/
 __pycache__/
 *.pyc
+pyrazine_sweep_output/
