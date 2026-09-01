@@ -1,2 +1,5 @@
 # Specify filepatterns you want git to ignore.
 resources/
+smoke_test_output/
+__pycache__/
+*.pyc

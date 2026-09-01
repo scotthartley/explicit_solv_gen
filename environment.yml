@@ -1,0 +1,14 @@
+name: solvate_md
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - packmol
+  - xtb
+  - ase
+  - tblite
+  - tblite-python
+  - numpy
+  - pip
+  - pip:
+      - mace-torch
