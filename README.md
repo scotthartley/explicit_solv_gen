@@ -257,6 +257,16 @@ behind every default and a list of gotchas worth reading before changing one.
 - MACE-OFF23 as a generator is supported but untested here; it needs a model
   download and cannot share a process with tblite.
 
+## Authorship
+
+Written by Scott Hartley in collaboration with [Claude
+Code](https://claude.com/claude-code), Anthropic's agentic coding tool. The
+chemistry, the design decisions and the validation are the author's; much of
+the implementation and documentation was drafted by the model and reviewed,
+corrected and measured against real runs before landing. The numbers quoted
+throughout — binding energies, decorrelation times, timings, the cost of a
+loose convergence threshold — were measured, not estimated.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
