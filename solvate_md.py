@@ -652,45 +652,67 @@ def run_one_job(condition, seed, out_dir):
     return str(out_dir)
 
 
-def _run_job_worker(args):
-    condition, seed, out_dir = args
-    return run_one_job(condition, seed, out_dir)
+def pool_map(func, arg_tuples, n_workers=None):
+    """Call `func(*args)` once per tuple in `arg_tuples`, one process each.
+
+    Both halves of a sweep fan out through here -- the MD jobs below, the
+    candidate optimisations in `ensemble` -- because both want the same four
+    things and neither wants its own copy of them.
+
+    The pool uses **spawn**, since tblite and torch cannot safely share a
+    forked process, so every worker re-imports the calling module. A driver
+    script MUST therefore guard its call:
+
+        if __name__ == "__main__":
+            run_sweep(...)
+
+    Without the guard each worker re-runs the whole grid on import, forking
+    recursively until the machine gives out.
+
+    Workers are capped at the task count. A spawn pool builds every worker up
+    front, and one that never receives a task still pays for an interpreter
+    and a full numpy/ASE/tblite import -- ~100 MB resident each.
+
+    `chunksize=1` rather than `map`'s default, which hands each worker a
+    contiguous block of the input. The tasks here are markedly unequal -- a
+    rigid 10-atom molecule against a floppy 25-atom cluster -- and blocking
+    them up strands the slow ones together behind a single worker.
+
+    One task, or one worker, runs in this process: spawning an interpreter to
+    run a single task costs more than it saves, and an exception arrives with
+    a useful traceback rather than a pickled one.
+    """
+    arg_tuples = list(arg_tuples)
+    if not arg_tuples:
+        return []
+    n_workers = min(n_workers or os.cpu_count(), len(arg_tuples))
+    if n_workers == 1:
+        return [func(*args) for args in arg_tuples]
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=n_workers) as pool:
+        # `starmap` preserves input order, so results come back in the order a
+        # serial loop would have produced them and nothing downstream has to
+        # sort.
+        return pool.starmap(func, arg_tuples, chunksize=1)
 
 
 def run_job_grid(conditions, n_seeds, out_root, n_workers=None):
     """Run every (condition, seed) pair, one single-threaded worker each.
 
-    Because the pool uses "spawn", each worker re-imports the calling module.
-    A driver script MUST therefore guard its call:
+    Returns the run directories in order, which is also the only place their
+    names are built -- the scorer takes them from here rather than rebuilding
+    `<label>_seed<n>` for itself.
 
-        if __name__ == "__main__":
-            run_job_grid(...)
-
-    Without the guard every worker re-runs the whole grid on import, which
-    forks recursively until the machine gives out.
+    One trajectory is inherently sequential, so the parallelism is over jobs
+    and its ceiling is the job count; see `pool_map` for the `__main__` guard
+    a caller has to provide.
     """
     out_root = Path(out_root)
-
-    jobs = []
-    for condition in conditions:
-        for seed in range(n_seeds):
-            job_dir = out_root / f"{condition.label}_seed{seed}"
-            jobs.append((condition, seed, job_dir))
-
-    if not jobs:
-        return []
-    # Capped at the job count, as in `ensemble.score_run_grid`. A spawn pool
-    # builds every worker up front, and a worker that never receives a job
-    # still pays for an interpreter and a full numpy/ASE/tblite import --
-    # ~100 MB of resident memory each. A 4-point sweep at 3 seeds is 12 jobs
-    # on an 18-core machine, so six of them were pure overhead.
-    n_workers = min(n_workers or os.cpu_count(), len(jobs))
-
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=n_workers) as pool:
-        results = pool.map(_run_job_worker, jobs)
-
-    return results
+    jobs = [(condition, seed, out_root / f"{condition.label}_seed{seed}")
+            for condition in conditions
+            for seed in range(n_seeds)]
+    return pool_map(run_one_job, jobs, n_workers)
 
 
 if __name__ == "__main__":
