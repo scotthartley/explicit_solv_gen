@@ -646,7 +646,7 @@ def run_one_job(condition, seed, out_dir):
 
     # Reports the wall-active fraction, and warns when the confinement turns
     # out to have been load-bearing rather than a safety net.
-    logger.footer()
+    logger.footer(energies)
     logger.close()
 
     with open(out_dir / "energies.json", "w") as f:

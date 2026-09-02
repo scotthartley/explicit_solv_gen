@@ -56,7 +56,9 @@ def git_commit():
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout.strip() or None if out.returncode == 0 else None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
 
 
 def timestamp():
@@ -64,11 +66,21 @@ def timestamp():
 
 
 def kv_block(title, mapping, indent="  "):
-    """An aligned key/value section -- the common building block of every log."""
+    """An aligned key/value section -- the common building block of every log.
+
+    A value containing newlines is wrapped onto continuation lines indented to
+    the value column, so a key whose explanation runs to several lines is one
+    entry in the mapping. It used to take one entry per line, keyed by "",
+    " ", "  " and so on -- distinct strings so the dict kept them all, padded
+    to the key width so they printed as blanks.
+    """
     rows = [(str(k), "-" if v is None else str(v)) for k, v in mapping.items()]
     width = max((len(k) for k, _ in rows), default=0)
     lines = [title, "-" * len(title)]
-    lines += [f"{indent}{k:<{width}}   {v}".rstrip() for k, v in rows]
+    for key, value in rows:
+        first, *rest = value.split("\n")
+        lines.append(f"{indent}{key:<{width}}   {first}".rstrip())
+        lines += [f"{indent}{'':<{width}}   {line}".rstrip() for line in rest]
     return "\n".join(lines)
 
 
@@ -309,7 +321,6 @@ class RunLogger:
         self._fh = open(self.path, "w")
         self._live = live
         self._t0 = time.time() if live else None
-        self._records = []
         self._target_K = None
 
     def _write(self, text):
@@ -324,13 +335,18 @@ class RunLogger:
 
     def md_row(self, record):
         """Log one trajectory dump. Takes the same dict `energies.json` gets."""
-        self._records.append(record)
         self._write(format_md_row(record))
 
-    def footer(self):
+    def footer(self, records):
+        """Summarise the run. `records` is the list `md_row` was fed.
+
+        Passed in rather than accumulated here: the caller already holds that
+        list -- it is what becomes `energies.json` -- and one copy cannot fall
+        out of step with the other.
+        """
         elapsed = None if self._t0 is None else time.time() - self._t0
         self._write("")
-        self._write(format_run_footer(self._records, self._target_K, elapsed))
+        self._write(format_run_footer(records, self._target_K, elapsed))
 
     def close(self):
         if not self._fh.closed:
@@ -428,16 +444,16 @@ def format_scored_log(summary, meta):
         "calculator": summary["calculator"],
         "continuum": _solvation_str(summary["scoring_solvation"]),
         "optimiser": (f"BFGS, fmax {summary['opt_fmax']} eV/A "
-                      "(ASE: largest per-atom force). xtb's"),
-        "": ("`--opt normal` instead stops at a gradient norm of 1e-3 Eh/a "
-             "-- see"),
-        " ": f"the gnorm column. Max {summary['opt_steps']} steps",
-        "reproduce": f"xtb best.xyz --gfn 2{alpb} --sp",
-        "  ": ("best.xyz was relaxed WITH the continuum -- omitting "
-               + (f"--alpb {solvation[1]}" if alpb else "it")),
-        "   ": "puts it on a different surface",
-        "wall": "none -- dissolution is the signal, not a failure;",
-        "    ": ("a solvent molecule that optimises away into the "
+                      "(ASE: largest per-atom force). xtb's\n"
+                      "`--opt normal` instead stops at a gradient norm of "
+                      "1e-3 Eh/a -- see\n"
+                      f"the gnorm column. Max {summary['opt_steps']} steps"),
+        "reproduce": (f"xtb best.xyz --gfn 2{alpb} --sp\n"
+                      "best.xyz was relaxed WITH the continuum -- omitting "
+                      + (f"--alpb {solvation[1]}" if alpb else "it")
+                      + "\nputs it on a different surface"),
+        "wall": ("none -- dissolution is the signal, not a failure;\n"
+                 "a solvent molecule that optimises away into the "
                  "continuum contributes ~0 to E_int"),
     }))
 
@@ -789,7 +805,7 @@ def render_run_dir(path):
         log.header(meta)
         for record in records:
             log.md_row(record)
-        log.footer()
+        log.footer(records)
     written = [path / "run.log"]
 
     for scored in sorted(path.glob("scored*.json")):

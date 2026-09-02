@@ -35,6 +35,7 @@ from ase.calculators.calculator import all_properties
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read, write
 from ase.optimize import BFGS
+from ase.units import Bohr, Hartree
 
 from report import EV_TO_KCAL, ensemble_energy, format_scored_log, wall_stats
 from solvate_md import (
@@ -58,7 +59,7 @@ CONTACT_GAP_A = 0.5
 # per-atom force; xtb reports a gradient norm over all 3N components in
 # Eh/bohr. The two criteria are not comparable by eye -- fmax 0.05 eV/A is
 # about 2.5x looser than xtb's `--opt normal` -- so both are recorded.
-EV_A_PER_EH_BOHR = 51.42208619
+EV_A_PER_EH_BOHR = Hartree / Bohr
 
 
 @dataclass

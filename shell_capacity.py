@@ -24,6 +24,8 @@ the size of the asymmetry before reading anything into a conformer energy
 difference.
 """
 
+import single_thread  # noqa: F401  -- must precede numpy; see its docstring
+
 import argparse
 
 import numpy as np
