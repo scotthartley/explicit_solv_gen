@@ -27,8 +27,6 @@ such a molecule contributes exactly zero.
 import single_thread  # noqa: F401  -- must precede numpy; see its docstring
 
 import json
-import multiprocessing
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -43,7 +41,12 @@ from report import (
     format_scored_log,
     wall_stats,
 )
-from solvate_md import _vdw_radii_array, align_to_principal_axes, get_calculator
+from solvate_md import (
+    _vdw_radii_array,
+    align_to_principal_axes,
+    get_calculator,
+    pool_map,
+)
 
 # EV_TO_KCAL and the two Boltzmann helpers live in `report` so that formatting
 # a number, or regenerating a log from JSON, never drags in ASE. They are
@@ -60,6 +63,42 @@ CONTACT_GAP_A = 0.5
 # Eh/bohr. The two criteria are not comparable by eye -- fmax 0.05 eV/A is
 # about 2.5x looser than xtb's `--opt normal` -- so both are recorded.
 EV_A_PER_EH_BOHR = 51.42208619
+
+
+@dataclass
+class Scoring:
+    """Everything that sets how a trajectory is rescored.
+
+    One owner per default, for the same reason the MD lengths live only on
+    `Condition`: `score_run` used to default `stride=10, max_frames=40` while
+    the CLI advertised 1 and 50, so a script that called it directly scored a
+    different set of frames than a sweep did and nothing said so.
+    """
+
+    # Score every Nth dump. Redundant with `max_frames` whenever that cap
+    # bites -- `max_frames` selects by `linspace` over the whole trajectory,
+    # so it discards whatever thinning happened first -- and at these defaults
+    # the cap always bites. So this is 1 unless you specifically want a
+    # prefix-thinned trajectory.
+    stride: int = 1
+    # Cap on frames scored per run, spread evenly over the whole trajectory.
+    # This, not `stride`, is what sets scoring cost, and the cost is
+    # independent of run length: a longer trajectory is scored at wider
+    # spacing for the same price.
+    max_frames: int = 50
+    # Optimiser convergence, eV/A per-atom max force. Every term of E_int has
+    # to be relaxed to convergence, not merely to a stationary-ish geometry:
+    # at the old 0.05 a frame is left hanging on whichever soft mode it was
+    # descending, which on one pyrazine + 2 chloroform frame put the reported
+    # minimum 0.58 kcal/mol above the true one. It does not cancel between
+    # solvents or conformers, because it depends on the mode rather than on
+    # the chemistry. xtb's `--opt normal` stops at a gradient norm of 1e-3
+    # Eh/a, which this is comfortably inside -- the two criteria are not
+    # comparable by eye, so `scored.log` prints both.
+    fmax: float = 0.002
+    opt_steps: int = 1000
+    # For the Boltzmann weights. Normally the same as the MD temperature.
+    temperature_K: float = 298.0
 
 
 @dataclass
@@ -116,8 +155,7 @@ def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
     return gaps
 
 
-def relax(atoms, calculator, solvation, calculator_kwargs=None, fmax=0.002,
-          steps=1000):
+def relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps):
     """Optimise `atoms` in the scoring environment. No wall -- see module doc."""
     a = atoms.copy()
     a.calc = get_calculator(calculator, solvation=solvation,
@@ -134,7 +172,7 @@ def relax(atoms, calculator, solvation, calculator_kwargs=None, fmax=0.002,
 
 
 def reference_energies(solute_path, solvent_path, calculator, solvation,
-                       calculator_kwargs=None, fmax=0.002, steps=1000):
+                       calculator_kwargs, fmax, steps):
     """Relaxed isolated solute and solvent, in the scoring environment.
 
     The solute reference is conformer-specific by construction -- it comes
@@ -165,9 +203,9 @@ def dedupe(candidates, energy_tol_eV=1e-3):
     return kept
 
 
-def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
-              stride=10, max_frames=40, fmax=0.002, steps=1000,
-              temperature_K=298.0, references=None, out_name="scored.json"):
+def score_run(run_dir, solvation, scoring, calculator=None,
+              calculator_kwargs=None, references=None,
+              out_name="scored.json"):
     """Rescore one `run_one_job` output directory in the continuum.
 
     Returns the parsed summary; also writes `<run_dir>/scored.json`, a
@@ -200,24 +238,26 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     if references is None:
         references = reference_energies(
             meta["solute_path"], meta["solvent_path"], calculator, solvation,
-            calculator_kwargs, fmax, steps)
+            calculator_kwargs, scoring.fmax, scoring.opt_steps)
     e_solute, e_solvent = references
 
-    frames = read(str(run_dir / "traj.xyz"), index=f"::{stride}")
+    frames = read(str(run_dir / "traj.xyz"), index=f"::{scoring.stride}")
     # Carried alongside so a candidate can name the dump it actually came
     # from. `i * stride` would index the subsampled list instead, and label a
     # 300-dump trajectory 0..70 as soon as `max_frames` bites.
-    indices = list(range(0, len(frames) * stride, stride))
-    if max_frames is not None and len(frames) > max_frames:
+    indices = list(range(0, len(frames) * scoring.stride, scoring.stride))
+    if scoring.max_frames is not None and len(frames) > scoring.max_frames:
         # Spread over the whole trajectory rather than taking a prefix.
-        sel = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
+        sel = np.linspace(0, len(frames) - 1,
+                          scoring.max_frames).round().astype(int)
         frames = [frames[i] for i in sel]
         indices = [indices[i] for i in sel]
 
     candidates, geometries = [], []
     for index, frame in zip(indices, frames):
         opt_atoms, energy, converged, final_fmax, gnorm = relax(
-            frame, calculator, solvation, calculator_kwargs, fmax, steps)
+            frame, calculator, solvation, calculator_kwargs, scoring.fmax,
+            scoring.opt_steps)
         gaps = solvent_molecule_gaps(opt_atoms, n_solute, aps)
         candidates.append(Candidate(
             frame=index,
@@ -261,20 +301,21 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "sampling_solvation": meta["solvation"],
         "scoring_solvation": list(solvation) if solvation else None,
         "calculator": calculator,
-        "temperature_K": temperature_K,
-        "stride": stride,
-        "max_frames": max_frames,
-        "opt_fmax": fmax,
-        "opt_steps": steps,
+        "temperature_K": scoring.temperature_K,
+        "stride": scoring.stride,
+        "max_frames": scoring.max_frames,
+        "opt_fmax": scoring.fmax,
+        "opt_steps": scoring.opt_steps,
         "n_frames_scored": len(candidates),
         "n_unique": len(unique),
         "e_solute_ref_eV": e_solute,
         "e_solvent_ref_eV": e_solvent,
         "min_interaction_kcal": min(interactions) * EV_TO_KCAL,
         "ensemble_interaction_kcal":
-            ensemble_energy(interactions, temperature_K) * EV_TO_KCAL,
+            ensemble_energy(interactions, scoring.temperature_K) * EV_TO_KCAL,
         "min_energy_eV": min(absolutes),
-        "ensemble_energy_eV": ensemble_energy(absolutes, temperature_K),
+        "ensemble_energy_eV": ensemble_energy(absolutes,
+                                              scoring.temperature_K),
         "mean_contacts": float(np.mean([c.n_contacts for c in unique])),
         "dissolved_fraction":
             float(np.mean([c.n_contacts == 0 for c in unique])) if n_solvent else 1.0,
@@ -298,53 +339,36 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     return summary
 
 
-def _score_run_worker(kwargs):
-    return score_run(**kwargs)
-
-
-def score_run_grid(jobs, n_workers=None):
+def score_run_grid(jobs, scoring, n_workers=None):
     """Score many run directories at once, one single-threaded worker each.
 
     Scoring is the expensive half of a sweep. Each candidate is a full
     geometry optimisation to `fmax = 0.002`, and there are `max_frames` of
     them per run directory against a single MD trajectory, so leaving this
     loop serial made a sweep single-threaded in practice however many cores
-    the MD grid had just used. Measured on a 9-run pyrazine/chloroform sweep,
-    scoring serially took 108.8 s against 35.8 s here, a 3.0x wall-clock win
-    on a job mix dominated by its three largest runs.
+    the MD grid had just used.
 
     The work is embarrassingly parallel -- each `score_run` reads and writes
     only its own run directory, and every candidate is an independent
     optimisation -- so there is nothing to coordinate. Results are unchanged
-    to within tblite's own run-to-run jitter, which is ~1e-11 eV and shows up
-    equally in the references computed serially in the parent.
+    to within tblite's own run-to-run jitter, which is ~1e-11 eV.
 
-    `jobs` is a list of keyword dicts for `score_run`, rather than a tuple of
-    positional arguments, so this does not have to restate that signature and
-    cannot fall behind it.
+    `jobs` is a list of keyword dicts, rather than tuples of positional
+    arguments, so this does not have to restate `score_run`'s signature and
+    cannot fall behind it. `scoring` is shared by every job of a sweep and is
+    passed once rather than copied into each.
 
     Hand the workers the `references` rather than letting each recompute them:
     they are the same two optimisations for every job in a sweep, so
     recomputing is both n_jobs times the work and a way for two rows of one
     table to end up measured against slightly different zeros.
-
-    Like `run_job_grid`, the pool uses "spawn", so each worker re-imports the
-    calling module and **a driver script must guard its call** with
-    `if __name__ == "__main__":`. `n_sweep.main()` already is.
     """
     jobs = list(jobs)
     if not jobs:
         return []
-    n_workers = min(n_workers or os.cpu_count(), len(jobs))
-    # One job, or one worker, in this process: spawning an interpreter to run
-    # a single job costs more than it saves, and an exception arrives with a
-    # useful traceback instead of a pickled one.
-    if n_workers == 1:
-        return [score_run(**job) for job in jobs]
-
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=n_workers) as pool:
-        # `map` preserves input order, so the summaries come back in the same
-        # order the serial loop produced them and the report tables are
-        # unchanged.
-        return pool.map(_score_run_worker, jobs)
+    return pool_map(score_run,
+                    [(job["run_dir"], job["solvation"], scoring,
+                      job.get("calculator"), job.get("calculator_kwargs"),
+                      job.get("references"), job.get("out_name", "scored.json"))
+                     for job in jobs],
+                    n_workers)

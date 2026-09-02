@@ -298,7 +298,7 @@ def solute_semi_axes(atoms):
     return extents.max(axis=0)
 
 
-def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill=0.5,
+def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill,
                   min_padding=0.0, max_padding=30.0):
     """Shell thickness that puts `n_solvent` molecules against the solute.
 
@@ -337,7 +337,7 @@ def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill=0.5,
     return max(0.5 * (low + high), min_padding)
 
 
-def packing_wall_distance(region, solute_positions, r_solvent, wall_slack=1.0,
+def packing_wall_distance(region, solute_positions, r_solvent, wall_slack,
                           n_samples=4096):
     """Wall radius that just contains the packing region, plus slack.
 
@@ -373,13 +373,19 @@ def pack_solvent(
     solvent_path,
     n_solvent,
     out_path,
-    solvent="chcl3",
-    shell_fill=0.5,
-    wall_slack=1.0,
-    tolerance=2.0,
-    seed=1,
+    solvent,
+    shell_fill,
+    wall_slack,
+    tolerance,
+    seed,
 ):
     """Pack n_solvent copies of solvent_path into a shell around the solute.
+
+    Every packing parameter is required rather than defaulted. `Condition`
+    owns these values and `run_one_job` passes all of them, so a default here
+    could only ever be a second, silently different opinion -- which is what
+    it was: `wall_slack` defaulted to 1.0 where `Condition` says 0.25, a value
+    that comment two hundred lines up calls far too loose.
 
     The solute is aligned to its principal axes and centred on the origin --
     matching where Packmol puts it -- and the solvent goes into an ellipsoidal
