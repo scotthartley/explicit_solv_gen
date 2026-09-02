@@ -245,6 +245,20 @@ in the basin it started in.
   never affected: they inherit an environment where the variable is already
   set, so it lands before *their* numpy import. That asymmetry is the tell if
   it ever comes back.
+- **Killing a sweep's parent process does not stop its workers.** Measured:
+  `kill <parent-pid>` on a running sweep exits the parent, and the pool's
+  workers are reparented to PID 1 and carry on at 100% CPU each until they
+  finish the job they were given. The parent's shell wrapper even reports
+  exit code 0 while they run. Kill the process **group** instead -- verified
+  to leave nothing behind, no orphans and no busy python:
+
+      kill -TERM -- -$(ps -o pgid= -p <parent-pid> | tr -d ' ')
+
+  `pkill -f n_sweep.py` is the trap: a spawn worker's command line is
+  `python -c from multiprocessing.spawn import spawn_main; ...`, so that
+  pattern matches only the parent and produces exactly the orphans it was
+  meant to prevent. (Ctrl-C on a foreground run should be fine, since SIGINT
+  goes to the whole foreground group -- but that was not tested.)
 - `run_job_grid` and `score_run_grid` both use spawn, so **every script
   calling either needs an `if __name__ == "__main__":` guard** or workers
   re-run the grid on import and fork until the machine dies. `n_sweep.main()`
