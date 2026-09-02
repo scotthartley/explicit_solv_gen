@@ -419,12 +419,15 @@ def score_run_grid(jobs, scoring, n_workers=None):
     *directories* gives a default sweep twelve tasks (4 n x 3 seeds) on an
     eighteen-core machine, and they are badly unequal -- n = 0 is a rigid
     10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
-    start and the tail is one whole run directory long. Measured that way:
-    3.0x on 18 cores. Flattening to one task per candidate gives ~600
-    near-equal tasks instead, which is what the machine can actually balance,
-    and the tail shrinks to a single optimisation. It also scales the right
-    way with the solute, because `max_frames` fixes the task count regardless
-    of system size.
+    start and the tail is one whole run directory long. Flattening to one task
+    per candidate gives ~600 near-equal tasks instead, which is what the
+    machine can actually balance, and the tail shrinks to a single
+    optimisation. It also scales the right way with the solute, because
+    `max_frames` fixes the task count regardless of system size.
+
+    Measured on six run directories -- pyrazine, n = 0..2, two seeds, ten
+    frames each, so 62 optimisations on 18 cores: 69.6 s serial, 34.5 s over
+    run directories, 10.2 s over candidates.
 
     The two **references go into the same pool**, at the front of the task
     list, rather than being computed serially in the parent between the two
@@ -463,8 +466,12 @@ def score_run_grid(jobs, scoring, n_workers=None):
     for job, (meta, *_) in zip(jobs, selections):
         if job.get("references") is not None:
             continue
+        # Everything the two reference optimisations depend on. `scoring`
+        # cannot vary between jobs -- there is one of it -- so it is not in
+        # the key.
         key = (meta["solute_path"], meta["solvent_path"], job["calculator"],
-               tuple(job["solvation"] or ()))
+               tuple(job["solvation"] or ()),
+               json.dumps(job.get("calculator_kwargs"), sort_keys=True))
         if key not in reference_at:
             reference_at[key] = len(tasks)
             tasks.append(task(align_to_principal_axes(
