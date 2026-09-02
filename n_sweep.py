@@ -21,7 +21,8 @@ offset -- "the shell dissolved" and "there was no explicit shell" agree, which
 is what makes dissolution a usable null result rather than a failure mode.
 
 Sampling is gas-phase by default and scoring is in the continuum: see the
-module docstring of `ensemble.py` for why those are separated.
+module docstring of `ensemble.py` for why those are separated. Sampling is
+`Condition.sample_in_continuum`, and there is no second name for it here.
 
 **One sweep is one solute in one solvent.** A double difference such as
 
@@ -35,13 +36,22 @@ sweep writes a **params block** into `sweep.json` recording the whole
 `wall_slack` has already changed meaning once (at c429f8a) without changing
 its name.
 
-Any script calling `run_sweep` MUST guard the call, because the job grid
-underneath uses "spawn" and each worker re-imports the calling module:
+Run one from the command line:
+
+    python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
+      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+
+A script that calls `run_sweep` itself MUST guard the call, because the job
+grid underneath uses "spawn" and each worker re-imports the calling module:
 
     if __name__ == "__main__":
         run_sweep(...)
+
+The `main()` below is under such a guard already, so the command line above
+needs no special handling.
 """
 
+import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -54,15 +64,15 @@ from solvate_md import Condition, run_job_grid
 
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
               n_seeds=1, n_workers=None, calculator="gfn2-xtb",
-              sample_in_continuum=False, temperature_K=298.0,
-              n_equilibrate_steps=2000, n_steps=6000, dump_interval=20,
-              stride=5, max_frames=20, fmax=0.05, opt_steps=300,
-              label=None, condition_kwargs=None):
+              temperature_K=298.0, n_equilibrate_steps=2000, n_steps=6000,
+              dump_interval=20, stride=5, max_frames=20, fmax=0.05,
+              opt_steps=300, label=None, condition_kwargs=None):
     """Generate and score one solute in one solvent at every n and seed.
 
-    `sample_in_continuum=False` is the default because a gas-phase generator
-    is what reliably finds contact geometries. Scoring always happens in
-    ALPB(`solvent`) regardless.
+    Sampling takes `Condition`'s default -- gas phase, because that is what
+    reliably finds contact geometries. Override it with
+    `condition_kwargs={"sample_in_continuum": True}`; scoring happens in
+    ALPB(`solvent`) either way.
 
     Writes `<out_root>/sweep.json` -- `{"params": ..., "runs": [...]}` -- and
     a human-readable `<out_root>/report.txt`, and returns the summaries.
@@ -80,7 +90,6 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
             solvent_path=str(solvent_path),
             n_solvent=n,
             solvent=solvent,
-            implicit_solvent=sample_in_continuum,
             calculator=calculator,
             temperature_K=temperature_K,
             n_equilibrate_steps=n_equilibrate_steps,
@@ -154,3 +163,61 @@ def sweep_params(condition, n_values, n_seeds, stride, max_frames, fmax,
         "timestamp": timestamp(),
     })
     return params
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Sweep n for one solute in one solvent.",
+        epilog="A double difference is four of these, subtracted by hand; "
+               "check the params blocks match before subtracting.")
+    parser.add_argument("solute", help="solute geometry file")
+    parser.add_argument("solvent_geometry", help="one solvent molecule")
+    parser.add_argument("--solvent", default="chcl3",
+                        help="solvent name; the ALPB key and the bulk-density "
+                             "key both (default: %(default)s)")
+    parser.add_argument("--n", dest="n_values", type=int, nargs="+",
+                        required=True, metavar="N",
+                        help="explicit solvent counts to sweep, e.g. 0 1 2 3")
+    parser.add_argument("--out", required=True, help="output directory")
+    parser.add_argument("--seeds", type=int, default=1,
+                        help="independent MD seeds per n (default: %(default)s)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="parallel MD workers (default: all cores)")
+    parser.add_argument("--calculator", default="gfn2-xtb",
+                        help="default: %(default)s")
+    parser.add_argument("--steps", type=int, default=6000,
+                        help="production MD steps (default: %(default)s)")
+    parser.add_argument("--equilibrate", type=int, default=2000,
+                        help="equilibration steps before recording "
+                             "(default: %(default)s)")
+    parser.add_argument("--temperature", type=float, default=298.0,
+                        help="K, for both MD and the Boltzmann weights "
+                             "(default: %(default)s)")
+    parser.add_argument("--stride", type=int, default=5,
+                        help="score every Nth dump (default: %(default)s)")
+    parser.add_argument("--max-frames", type=int, default=20,
+                        help="cap on frames scored per run, spread over the "
+                             "whole trajectory (default: %(default)s)")
+    parser.add_argument("--label", default=None,
+                        help="solute name in run directories and the table "
+                             "(default: the solute filename stem)")
+    args = parser.parse_args(argv)
+
+    run_sweep(
+        args.solute, args.solvent_geometry, args.solvent, args.n_values,
+        args.out,
+        n_seeds=args.seeds,
+        n_workers=args.workers,
+        calculator=args.calculator,
+        temperature_K=args.temperature,
+        n_equilibrate_steps=args.equilibrate,
+        n_steps=args.steps,
+        stride=args.stride,
+        max_frames=args.max_frames,
+        label=args.label,
+    )
+    print(Path(args.out) / "report.txt")
+
+
+if __name__ == "__main__":
+    main()

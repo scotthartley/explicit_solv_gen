@@ -31,13 +31,19 @@ from pathlib import Path
 import numpy as np
 from ase.io import read, write
 from ase.optimize import BFGS
-from ase.units import kB
 
-from report import EV_TO_KCAL, format_scored_log
+from report import (
+    EV_TO_KCAL,
+    boltzmann_weights,
+    ensemble_energy,
+    format_scored_log,
+)
 from solvate_md import _vdw_radii_array, align_to_principal_axes, get_calculator
 
-# EV_TO_KCAL lives in `report` so that formatting a number never drags in ASE;
-# it is imported here so that callers can keep taking it from `ensemble`.
+# EV_TO_KCAL and the two Boltzmann helpers live in `report` so that formatting
+# a number, or regenerating a log from JSON, never drags in ASE. They are
+# imported here so callers can keep taking them from `ensemble`, and so the
+# live and the regenerated logs weight identically by construction.
 
 # A solvent molecule counts as touching the solute when some atom pair is
 # within this much of van der Waals contact. Generous on purpose: it is a
@@ -136,23 +142,6 @@ def dedupe(candidates, energy_tol_eV=1e-3):
     return kept
 
 
-def boltzmann_weights(energies_eV, temperature_K=298.0):
-    e = np.asarray(energies_eV, dtype=float)
-    w = np.exp(-(e - e.min()) / (kB * temperature_K))
-    return w / w.sum()
-
-
-def ensemble_energy(energies_eV, temperature_K=298.0):
-    """Boltzmann-weighted mean.
-
-    Not a free energy: there is no vibrational or configurational entropy in
-    here, and the weights come from whatever geometries the generator found.
-    It is an ensemble-averaged energy, and should be reported as one.
-    """
-    w = boltzmann_weights(energies_eV, temperature_K)
-    return float(np.dot(w, np.asarray(energies_eV, dtype=float)))
-
-
 def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
               stride=10, max_frames=40, fmax=0.05, steps=300,
               temperature_K=298.0, references=None, out_name="scored.json"):
@@ -180,18 +169,23 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     e_solute, e_solvent = references
 
     frames = read(str(run_dir / "traj.xyz"), index=f"::{stride}")
+    # Carried alongside so a candidate can name the dump it actually came
+    # from. `i * stride` would index the subsampled list instead, and label a
+    # 300-dump trajectory 0..70 as soon as `max_frames` bites.
+    indices = list(range(0, len(frames) * stride, stride))
     if max_frames is not None and len(frames) > max_frames:
         # Spread over the whole trajectory rather than taking a prefix.
-        idx = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
-        frames = [frames[i] for i in idx]
+        sel = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
+        frames = [frames[i] for i in sel]
+        indices = [indices[i] for i in sel]
 
     candidates, geometries = [], []
-    for i, frame in enumerate(frames):
+    for index, frame in zip(indices, frames):
         opt_atoms, energy, converged, final_fmax = relax(
             frame, calculator, solvation, calculator_kwargs, fmax, steps)
         gaps = solvent_molecule_gaps(opt_atoms, n_solute, aps)
         candidates.append(Candidate(
-            frame=i * stride,
+            frame=index,
             energy_eV=energy,
             interaction_eV=energy - e_solute - n_solvent * e_solvent,
             converged=converged,

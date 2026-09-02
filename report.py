@@ -12,12 +12,11 @@ a header, a streaming table, and a footer. `RunLogger` flushes every write, so
 `run.log` is genuinely tailable while MD is running.
 
 Deliberately import-light -- no ASE, no tblite, no torch at module scope --
-because `solvate_md` imports it into every spawned MD worker. The one heavy
-import (`ensemble`, for Boltzmann weights when regenerating a log from an old
-summary that predates them) is done lazily inside the function that needs it,
-so that both the live and the regenerated path use the *same* weighting code.
-That matters: the ensemble average of E(cluster) and of E_int must rest on
-identical weights or they silently disagree.
+because `solvate_md` imports it into every spawned MD worker. That is also why
+the Boltzmann weighting lives here rather than in `ensemble`: it needs nothing
+from ASE but a constant, and putting it beside the formatting means the live
+log and a log regenerated from JSON weight identically by construction rather
+than by comment. `ensemble` imports both functions back.
 
 Regenerate logs for anything already on disk, without running any MD:
 
@@ -30,9 +29,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# Lives here rather than in `ensemble` so that a text-only consumer never has
-# to import ASE to format a number. `ensemble` re-exports it.
+import numpy as np
+
+# Live here rather than in `ensemble` so that a text-only consumer never has to
+# import ASE to format or weight a number. `ensemble` re-exports both.
 EV_TO_KCAL = 23.060548
+KB_EV_PER_K = 8.617333262e-5   # Boltzmann constant, == ase.units.kB
 
 # Above this fraction of frames with a nonzero wall energy, the confinement is
 # load-bearing rather than a safety net. Measured regimes: 4-5% for gas-phase
@@ -70,6 +72,31 @@ def kv_block(title, mapping, indent="  "):
 
 def banner(text):
     return f"{_RULE}\n {text}\n{_RULE}"
+
+
+def boltzmann_weights(energies_eV, temperature_K=298.0):
+    """Weights over a set of energies, minimum subtracted before exponentiating.
+
+    Subtracting the minimum is not only for numerical range: it makes the
+    weights invariant under a constant shift of the energies. E_int differs
+    from E(cluster) by exactly such a constant -- E(solute) + n E(solvent) --
+    so an average over one and an average over the other carry identical
+    weights and cannot disagree.
+    """
+    e = np.asarray(energies_eV, dtype=float)
+    w = np.exp(-(e - e.min()) / (KB_EV_PER_K * temperature_K))
+    return w / w.sum()
+
+
+def ensemble_energy(energies_eV, temperature_K=298.0):
+    """Boltzmann-weighted mean.
+
+    Not a free energy: there is no vibrational or configurational entropy in
+    here, and the weights come from whatever geometries the generator found.
+    It is an ensemble-averaged energy, and should be reported as one.
+    """
+    w = boltzmann_weights(energies_eV, temperature_K)
+    return float(np.dot(w, np.asarray(energies_eV, dtype=float)))
 
 
 def _num(value, spec):
@@ -269,30 +296,7 @@ class RunLogger:
 # Scoring
 # --------------------------------------------------------------------------
 
-def fill_absolute_energies(summary, temperature_K=298.0):
-    """Add `ensemble_energy_eV` / `min_energy_eV` if a summary lacks them.
-
-    `boltzmann_weights` subtracts the minimum before exponentiating, so the
-    weights over E(cluster) and over E_int are identical -- E_int differs from
-    E(cluster) only by the constant E(solute) + n E(solvent). The two averages
-    therefore cannot disagree, and this fills in old summaries written before
-    the absolute energies were reported.
-    """
-    candidates = summary.get("candidates") or []
-    if not candidates or "ensemble_energy_eV" in summary:
-        return summary
-    from ensemble import ensemble_energy   # heavy (ASE); only on this path
-
-    energies = [c["energy_eV"] for c in candidates]
-    T = summary.get("temperature_K", temperature_K)
-    summary["ensemble_energy_eV"] = ensemble_energy(energies, T)
-    summary["min_energy_eV"] = min(energies)
-    return summary
-
-
 def _candidate_table(candidates, temperature_K):
-    from ensemble import boltzmann_weights   # heavy (ASE); only on this path
-
     weights = boltzmann_weights([c["energy_eV"] for c in candidates],
                                 temperature_K)
     lines = [f"{'frame':>7} {'E(cluster)/eV':>16} {'E_int/kcal':>12} "
@@ -311,7 +315,6 @@ def _candidate_table(candidates, temperature_K):
 
 def format_scored_log(summary, meta=None):
     """The scoring section: provenance, references, candidates, result."""
-    summary = fill_absolute_energies(dict(summary))
     n = summary.get("n_solvent", 0)
     T = summary.get("temperature_K", 298.0)
     e_solute = summary.get("e_solute_ref_eV")
@@ -404,28 +407,35 @@ def format_scored_log(summary, meta=None):
 # --------------------------------------------------------------------------
 
 def _leg_name(summary):
+    """What this row is: which solute, scored in which continuum."""
     solvation = summary.get("scoring_solvation") or [None, None]
-    solvent = solvation[1] if len(solvation) > 1 else None
-    solvent = solvent or "gas"
-    name = summary.get("solute_label") or summary.get("conformer")
-    if name is None:
-        label = summary.get("label", "?")
-        suffix = f"_{solvent}_n{summary.get('n_solvent')}"
-        name = label[:-len(suffix)] if label.endswith(suffix) else label
-    return f"{name}/{solvent}"
+    solvent = (solvation[1] if len(solvation) > 1 else None) or "gas"
+    return f"{summary.get('solute_label') or summary['label']}/{solvent}"
 
 
-def format_table(summaries, n_values=None):
-    """E_int vs n, with the dissolution diagnostics and a raw cluster energy."""
-    summaries = [fill_absolute_energies(dict(s)) for s in summaries]
-    lines = [f"{'leg':20s} {'n':>3} {'E_int(ens)':>12} {'E_int(min)':>12} "
-             f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
-             f"{'uniq':>5}",
-             "-" * 92]
+def format_table(summaries):
+    """E_int vs n, with the dissolution diagnostics and a raw cluster energy.
+
+    One sweep is one solute in one solvent, so the leg is normally a constant
+    and is stated once above the table rather than repeated down a column. The
+    column comes back only when it is actually carrying information -- when
+    summaries from several sweeps have been pooled by hand, which is how a
+    double difference gets assembled now.
+    """
+    legs = sorted({_leg_name(s) for s in summaries})
+    one_leg = len(legs) == 1
+
+    lines = [f"leg: {legs[0]}", ""] if one_leg else []
+    leg_head = "" if one_leg else f"{'leg':20s} "
+    lines += [f"{leg_head}{'n':>3} {'E_int(ens)':>12} {'E_int(min)':>12} "
+              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
+              f"{'uniq':>5}",
+              "-" * (71 if one_leg else 92)]
     for s in sorted(summaries, key=lambda s: (_leg_name(s), s["n_solvent"],
                                               s.get("seed", 0))):
         lines.append(
-            f"{_leg_name(s):20s} {s['n_solvent']:>3} "
+            ("" if one_leg else f"{_leg_name(s):20s} ")
+            + f"{s['n_solvent']:>3} "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
             f"{_num(s.get('ensemble_energy_eV'), '.6f'):>15} "
@@ -448,20 +458,19 @@ def format_sweep_report(params, summaries):
     """Params block plus the E_int(n) table."""
     parts = [banner("n-sweep report")]
 
-    if params:
-        shown = {k: ("-" if v is None else v) for k, v in params.items()}
-        parts.append(kv_block("Parameters", shown))
-    else:
-        parts.append("Parameters\n----------\n  not recorded -- this sweep "
-                     "predates the params block.")
+    shown = {k: ("-" if v is None else v) for k, v in params.items()}
+    parts.append(kv_block("Parameters", shown))
 
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
                  + "-" * 58 + "\n" + format_table(summaries))
 
     zeros = [s for s in summaries if s.get("n_solvent") == 0]
     if zeros:
-        values = ", ".join(f"{_leg_name(s)} {s['ensemble_interaction_kcal']:.2f}"
-                           for s in sorted(zeros, key=_leg_name))
+        one_leg = len({_leg_name(s) for s in summaries}) == 1
+        values = ", ".join(
+            (f"{s['ensemble_interaction_kcal']:.2f}" if one_leg else
+             f"{_leg_name(s)} {s['ensemble_interaction_kcal']:.2f}")
+            for s in sorted(zeros, key=_leg_name))
         parts.append(
             "Self-consistency check\n"
             "----------------------\n"
@@ -514,10 +523,7 @@ def render_sweep_dir(path):
     """Rewrite `report.txt` plus every run's logs, from `sweep.json`."""
     path = Path(path)
     data = _load(path / "sweep.json")
-    if isinstance(data, list):        # pre-params-block sweeps
-        params, runs = {}, data
-    else:
-        params, runs = data.get("params", {}), data["runs"]
+    params, runs = data["params"], data["runs"]
 
     written = []
     for summary in runs:

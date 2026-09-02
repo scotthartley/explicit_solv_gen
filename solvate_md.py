@@ -53,6 +53,21 @@ def _vdw_radii_array(atoms):
     return np.where(np.isnan(radii), _FALLBACK_VDW_RADIUS, radii)
 
 
+def _unit_sphere_points(n):
+    """`n` roughly equispaced points on the unit sphere (golden spiral).
+
+    Deterministic and needs no relaxation, which is all either caller wants:
+    `packing_wall_distance` samples a shell surface with it, and
+    `shell_capacity.sasa` a Shrake-Rupley atomic sphere.
+    """
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1.0 - 2.0 * i / n)
+    theta = np.pi * (1.0 + 5.0**0.5) * i
+    return np.c_[np.cos(theta) * np.sin(phi),
+                 np.sin(theta) * np.sin(phi),
+                 np.cos(phi)]
+
+
 def _vdw_volume(atoms):
     """Rough molecular volume from a sum of non-overlapping vdW spheres.
 
@@ -94,10 +109,14 @@ class Condition:
     # ALPB solvent name; also the key used for bulk density when sizing the
     # shell. Must match what `solvent_path` actually contains.
     solvent: str = "chcl3"
-    # Cluster-continuum: the explicit shell carries the specific interactions,
-    # ALPB carries the bulk beyond it. Set False only for a deliberate
-    # gas-phase cluster.
-    implicit_solvent: bool = True
+    # Whether the *sampling* MD runs in the continuum. False -- gas phase --
+    # by default: sampling wants whatever actually finds the contact
+    # geometries, and ALPB can make a shell dissociate outright (measured:
+    # 50-60% wall-active for methanol + 4 water in ALPB(water), against 4-5%
+    # in gas phase). The continuum belongs to scoring, which always applies
+    # it; see the module docstring of `ensemble.py`. Set True only for a
+    # deliberate continuum-sampled run.
+    sample_in_continuum: bool = False
     calculator: str = "gfn2-xtb"
     temperature_K: float = 298.0
     # 0.5 fs, not 1.0: X-H stretches have ~9 fs periods and nothing here
@@ -225,9 +244,10 @@ def get_calculator(name, solvation=None, **kwargs):
         if solvation is not None:
             raise ValueError(
                 "MACE calculators have no implicit-solvation model, so a "
-                "cluster-continuum run is not available with them. Set "
-                "implicit_solvent=False (and expect the explicit shell alone "
-                "to under-describe the bulk) or use a GFN calculator."
+                "cluster-continuum run is not available with them. Leave "
+                "sample_in_continuum at False (MACE is a generator; the "
+                "scorer is a separate process and can be GFN2) or use a GFN "
+                "calculator here too."
             )
         return mace_off(**kwargs)
     else:
@@ -329,13 +349,7 @@ def packing_wall_distance(region, solute_positions, r_solvent, wall_slack=1.0,
     nearest solute atom gives a wall that contains the packed shell exactly,
     and makes `wall_slack` mean the same thing for every solute.
     """
-    i = np.arange(n_samples) + 0.5
-    phi = np.arccos(1.0 - 2.0 * i / n_samples)
-    theta = np.pi * (1.0 + 5.0**0.5) * i
-    unit = np.c_[np.cos(theta) * np.sin(phi),
-                 np.sin(theta) * np.sin(phi),
-                 np.cos(phi)]
-    surface = unit * np.asarray(region)
+    surface = _unit_sphere_points(n_samples) * np.asarray(region)
     d = np.linalg.norm(surface[:, None, :] - solute_positions[None, :, :], axis=2)
     return float(d.min(axis=1).max() + wall_slack * 2.0 * r_solvent)
 
@@ -498,7 +512,7 @@ def run_one_job(condition, seed, out_dir):
     # can be followed with `tail -f` instead of going silent until it finishes.
     logger = RunLogger(out_dir / "run.log")
 
-    solvation = ("alpb", condition.solvent) if condition.implicit_solvent else None
+    solvation = ("alpb", condition.solvent) if condition.sample_in_continuum else None
     calc = get_calculator(
         condition.calculator, solvation=solvation, **condition.calculator_kwargs
     )
@@ -534,7 +548,7 @@ def run_one_job(condition, seed, out_dir):
         "atoms_per_solvent": packing.atoms_per_solvent,
         "tolerance": condition.tolerance,
         "calculator": condition.calculator,
-        "implicit_solvent": condition.implicit_solvent,
+        "sample_in_continuum": condition.sample_in_continuum,
         "solvation": list(solvation) if solvation else None,
         "temperature_K": condition.temperature_K,
         "timestep_fs": condition.timestep_fs,
@@ -586,6 +600,11 @@ def run_one_job(condition, seed, out_dir):
     dyn.run(condition.n_equilibrate_steps)
 
     traj_path = out_dir / "traj.xyz"
+    # Truncate before the first dump rather than keying `append` off the step
+    # number: the step of the first dump is only zero when the equilibration
+    # length happens to be a multiple of `dump_interval`, and otherwise every
+    # frame would append to whatever a previous run left here.
+    traj_path.unlink(missing_ok=True)
     energies = []
 
     def record():
@@ -610,7 +629,7 @@ def run_one_job(condition, seed, out_dir):
         # One dict feeds both the JSON and the log, so they cannot drift.
         # Per-dump text I/O is negligible against an SCF.
         logger.md_row(entry)
-        write(traj_path, atoms, append=step > 0)
+        write(traj_path, atoms, append=True)
 
     dyn.attach(record, interval=condition.dump_interval)
     dyn.run(condition.n_steps)

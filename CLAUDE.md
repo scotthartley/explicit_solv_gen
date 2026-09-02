@@ -22,7 +22,12 @@ Conda env `solvate_md` (`~/opt/miniforge3/envs/solvate_md`). **packmol lives in
 that env's bin and is not on the default PATH**, so run with:
 
     PATH=~/opt/miniforge3/envs/solvate_md/bin:$PATH \
-      ~/opt/miniforge3/envs/solvate_md/bin/python driver.py
+      ~/opt/miniforge3/envs/solvate_md/bin/python n_sweep.py \
+        examples/pyrazine.xyz examples/chloroform.xyz \
+        --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+
+`n_sweep.py --help` lists the rest; every flag maps 1:1 onto a `run_sweep`
+argument. That is the entry point -- there is no driver script.
 
 ## Layout
 
@@ -31,7 +36,7 @@ that env's bin and is not on the default PATH**, so run with:
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimised frames in a continuum. The **scorer**. |
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
-| `report.py` | all text rendering. No ASE/tblite at module scope. |
+| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`) that `ensemble` re-exports. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
 `run_sweep` deliberately does *not* assemble a double difference. One sweep is
@@ -64,7 +69,11 @@ above 20%, rather than leaving it buried in a 74 KB `energies.json` array.
 
 Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
-    python -m report pyrazine_sweep_output/     # a sweep, or a single run dir
+    python -m report /path/to/sweep_or_run_dir/
+
+(`pyrazine_sweep_output/` is the exception: its `sweep.json` is the old bare
+list, so it no longer re-renders. Its `report.txt` is already on disk, and the
+sweep is under-sampled and due to be redone anyway.)
 
 `E_int` stays the reported number, because it alone is comparable across n.
 `E(cluster)` is now shown beside it everywhere: within a run the two differ
@@ -133,9 +142,15 @@ plateau in n is where enough explicit solvent has been added.
 
 ## Gotchas
 
-- `run_job_grid` uses spawn, so **every driver script needs an
+- `run_job_grid` uses spawn, so **every script calling it needs an
   `if __name__ == "__main__":` guard** or workers re-run the grid on import
-  and fork until the machine dies.
+  and fork until the machine dies. `n_sweep.main()` is already under one, so
+  the command line above is safe; a hand-written driver is not automatically.
+- Sampling is **gas phase by default**: `Condition.sample_in_continuum` is
+  `False`, and scoring applies the continuum regardless. It was called
+  `implicit_solvent` and defaulted to `True` -- the opposite of the documented
+  design -- until this commit, and the `metadata.json` key changed with it, so
+  older run directories carry `implicit_solvent` instead.
 - Packmol's `tolerance` (default 2.0) forbids hydrogen-bond contacts at t = 0
   (H...O/N sit at 1.8-2.0 A). Harmless here -- gas MD forms them within a few
   ps -- but it means a packed structure never starts bonded.
@@ -148,8 +163,7 @@ plateau in n is where enough explicit solvent has been added.
   closes, so no interim output appears no matter what `flush=True` says. Tail
   the run's own `run.log` instead; it is flushed per line.
 - `sweep.json` is `{"params": {...}, "runs": [...]}`, not the bare list it was
-  before. `report.render_sweep_dir` still reads the old shape (rendering an
-  empty params block), but nothing else does.
+  before. Nothing reads the old shape any more.
 - `resources/` is gitignored. `resources/handoff_md_pipeline_claude_code.md`
   contains a struck-through paragraph saying not to use ALPB with an explicit
   shell. **That advice is wrong** and was corrected in place on 2026-09-01.

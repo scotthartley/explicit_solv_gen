@@ -27,10 +27,9 @@ difference.
 import argparse
 
 import numpy as np
-from ase.data import vdw_radii
 from ase.io import read
 
-from solvate_md import _FALLBACK_VDW_RADIUS, solvent_radius
+from solvate_md import _unit_sphere_points, _vdw_radii_array, solvent_radius
 
 
 def sasa(atoms, probe, n_points=4096):
@@ -40,14 +39,8 @@ def sasa(atoms, probe, n_points=4096):
     one molecule occupies gives a monolayer count directly.
     """
     positions = atoms.get_positions()
-    radii = vdw_radii[atoms.get_atomic_numbers()]
-    radii = np.where(np.isnan(radii), _FALLBACK_VDW_RADIUS, radii) + probe
-
-    # Golden-spiral quadrature points on the unit sphere.
-    i = np.arange(n_points) + 0.5
-    phi = np.arccos(1.0 - 2.0 * i / n_points)
-    theta = np.pi * (1.0 + 5.0**0.5) * i
-    unit = np.c_[np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)]
+    radii = _vdw_radii_array(atoms) + probe
+    unit = _unit_sphere_points(n_points)
 
     total = 0.0
     for k in range(len(positions)):
