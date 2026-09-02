@@ -26,8 +26,12 @@ that env's bin and is not on the default PATH**, so run with:
         examples/pyrazine.xyz examples/chloroform.xyz \
         --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
 
-`n_sweep.py --help` lists the rest; every flag maps 1:1 onto a `run_sweep`
-argument. That is the entry point -- there is no driver script.
+`n_sweep.py --help` lists the rest; every flag maps onto a field of
+`Condition` or of `Scoring`, and takes its default from there. That is the
+entry point -- there is no driver script, and `solvate_md.py` no longer has a
+`__main__` smoke test of its own (`s_test/` is the real one: `--n 2 --seeds 1
+--steps 6000 --equilibrate 2000 --dump-interval 20 --stride 5 --max-frames
+20`).
 
 ## Layout
 
@@ -60,8 +64,8 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | file | written by | contents |
 | --- | --- | --- |
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
-| `scored.log` | `ensemble.score_run` | provenance, references, per-candidate table, result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
-| `scored_candidates.xyz` | `ensemble.score_run` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
+| `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
+| `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `report.txt` | `n_sweep.run_sweep` | params block, the `E_int(n)` table, and the sampling diagnostics below |
 
 `run.log` is flushed on every line, so a long run can be followed with
@@ -72,16 +76,24 @@ The same diagnostic now travels with the numbers it qualifies: a `wall` column
 and a **Wall diagnostic** section in `report.txt`, and in `scored.log` a
 provenance line plus a per-candidate `E_wall/eV` -- the wall energy of the
 sampling frame each candidate came from. `scored.json` carries it as
-`sampling_wall` / `n_scored_wall_active`, and older ones are backfilled from
-`energies.json` when re-rendered.
+`sampling_wall` / `n_scored_wall_active`.
+
+Nothing reads a `scored.json` or a run directory older than the current
+scorer. The backfill that used to reconstruct a missing wall diagnostic from
+`energies.json`, and the defaults every reader used to apply to a missing
+field, are gone: `run_one_job` always writes both JSON files and the scorer
+always writes every field, so a missing one is a broken run rather than an old
+one and now fails loudly.
 
 Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
     python -m report /path/to/sweep_or_run_dir/
 
 (`pyrazine_sweep_output/` is the exception: its `sweep.json` is the old bare
-list, so it no longer re-renders. Its `report.txt` is already on disk, and the
-sweep is under-sampled and due to be redone anyway.)
+list, so it no longer re-renders -- and now nor does anything scored before
+`n_opt_steps` and the mandatory wall fields, since the readers no longer
+default a missing field. Its `report.txt` is already on disk, and the sweep is
+under-sampled and due to be redone anyway.)
 
 `E_int` stays the reported number, because it alone is comparable across n.
 `E(cluster)` is now shown beside it everywhere: within a run the two differ
@@ -189,16 +201,42 @@ What sets them, measured rather than assumed:
 Expect all of these to grow with the solute; re-measure the decorrelation time
 on the hexamer rather than carrying 0.55 ps over.
 
-### Both halves of a sweep are parallel
+### Both halves of a sweep are parallel, and scoring is parallel per candidate
 
 `run_job_grid` fans the MD out across cores and `score_run_grid` does the same
-for the scoring, because scoring is the expensive half now: at the defaults a
+for the scoring, because scoring is the expensive half: at the defaults a
 4-point sweep spends a few minutes on MD and the better part of an hour on
-candidate optimisations. Both use spawn, so the `if __name__ == "__main__":`
-guard below covers both. `run_sweep` computes the references **once, in the
-parent**, and hands them to the workers -- recomputing per job would be
-n_jobs times the work and a way for two rows of one table to end up measured
-against slightly different zeros.
+candidate optimisations. Both go through `solvate_md.pool_map`, which uses
+spawn, so the `if __name__ == "__main__":` guard below covers both.
+
+**The granularity is per candidate, not per run directory.** Fanning the
+scoring out over run directories gives a default sweep 12 tasks (4 n x 3
+seeds) on an 18-core machine, and they are badly unequal -- n = 0 is a rigid
+10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
+start and the tail is one whole directory long. `score_run` therefore splits
+into `select_frames` -> `relax` per frame -> `assemble`, and `score_run_grid`
+selects every job in the parent, flattens to one `relax` task per candidate,
+and assembles afterwards. That is ~600 near-equal tasks with a tail of one
+optimisation, and the count is set by `max_frames` regardless of system size.
+Measured on 6 run directories, 62 optimisations, 18 cores: 69.6 s serial,
+34.5 s per directory, **10.2 s per candidate**.
+
+Selecting and assembling stay in the parent because they are milliseconds of
+file reading and microseconds of numpy; only the optimisations are worth
+shipping to a worker. `relax` hands its geometry back carrying a
+`SinglePointCalculator` rather than the live tblite one, which is what lets
+the result cross a pickle at all.
+
+The two **references go into the same pool**, at the front of the task list,
+computed once per distinct (solute, solvent, calculator, continuum) rather
+than once per job -- recomputing per job would be n_jobs times the work and a
+way for two rows of one table to end up measured against slightly different
+zeros. `run_sweep` no longer computes them itself.
+
+Overlapping the two halves -- starting to score a run as soon as its
+trajectory lands -- was considered and rejected: MD is the cheap half, and a
+shared pool would let a worker that had run MACE then run tblite and hit the
+OpenMP clash the file boundary exists to avoid.
 
 `--stride` and `--max-frames` are not independent: `max_frames` selects by
 `linspace` over the whole trajectory, so **whenever it bites, `stride` does
@@ -224,13 +262,22 @@ makes *when it last fell* a convergence test, and `report.txt` now runs it:
   four.
 
 Both are computed from the candidate list already in `scored.json`, so
-`python -m report <dir>` backfills them onto anything on disk -- no MD, no
+`python -m report <dir>` renders them for anything on disk -- no MD, no
 calculator. Run on the existing pyrazine sweep they immediately separate its
 two failures: n = 3 chcl3 still falling on the final frame, n = 2 chcl3 stuck
 in the basin it started in.
 
 ## Gotchas
 
+- Scoring settings live on `Scoring` and **only** on `Scoring`, the same way
+  sampling settings live on `Condition`. `run_sweep` takes a
+  `condition_kwargs` dict and a `Scoring` and names no field of either, and
+  the CLI reads every default off whichever dataclass owns it via
+  `dataclass_default`. Internal functions -- `pack_solvent`, `relax`,
+  `score_run` and the rest -- carry no defaults at all, so a caller has to say
+  what it means. `pack_solvent` used to default `wall_slack = 1.0` against
+  `Condition`'s 0.25, and `score_run` `stride = 10, max_frames = 40` against
+  the CLI's 1 and 50.
 - Sampling lengths live on `Condition` and **only** on `Condition`. Do not
   give `run_sweep` or the CLI a literal default for one; that is exactly the
   shadowing that made every run so far 3 ps when the docs said 10.
@@ -259,11 +306,12 @@ in the basin it started in.
   pattern matches only the parent and produces exactly the orphans it was
   meant to prevent. (Ctrl-C on a foreground run should be fine, since SIGINT
   goes to the whole foreground group -- but that was not tested.)
-- `run_job_grid` and `score_run_grid` both use spawn, so **every script
-  calling either needs an `if __name__ == "__main__":` guard** or workers
-  re-run the grid on import and fork until the machine dies. `n_sweep.main()`
-  is already under one, so the command line above is safe; a hand-written
-  driver is not automatically. `run_sweep` now spawns twice, once per half.
+- `run_job_grid` and `score_run_grid` both go through `solvate_md.pool_map`,
+  which uses spawn, so **every script calling either needs an
+  `if __name__ == "__main__":` guard** or workers re-run the grid on import
+  and fork until the machine dies. `n_sweep.main()` is already under one, so
+  the command line above is safe; a hand-written driver is not automatically.
+  `run_sweep` spawns twice, once per half.
 - Sampling is **gas phase by default**: `Condition.sample_in_continuum` is
   `False`, and scoring applies the continuum regardless. It was called
   `implicit_solvent` and defaulted to `True` -- the opposite of the documented
@@ -303,7 +351,9 @@ Validated: pyrazine, n = 0..3, gas sampling scored in each continuum.
 **Those run directories predate the `fmax = 0.002` scoring default and were
 not rescored**, so their energies sit up to ~0.6 kcal/mol above their true
 minima; the next production sweep picks the new default up. The numbers below
-are from the loose runs.
+are from the loose runs. They also predate the current `scored.json` shape, so
+they no longer re-render -- rescore rather than re-report if you want them
+back.
 `E_int(0)` = 0.02 / 0.04 kcal/mol, confirming self-consistency. At n = 1,
 chcl3 -5.59 vs acetone -3.55, matching the single-complex numbers within
 sampling error; the best geometry has H...N 1.98 A at 158 deg, found from a
