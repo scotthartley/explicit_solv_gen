@@ -51,6 +51,12 @@ from solvate_md import _vdw_radii_array, align_to_principal_axes, get_calculator
 # bookkeeping diagnostic, not a bond criterion.
 CONTACT_GAP_A = 0.5
 
+# 1 Eh/bohr in eV/A. ASE reports forces in eV/A and converges on the largest
+# per-atom force; xtb reports a gradient norm over all 3N components in
+# Eh/bohr. The two criteria are not comparable by eye -- fmax 0.05 eV/A is
+# about 2.5x looser than xtb's `--opt normal` -- so both are recorded.
+EV_A_PER_EH_BOHR = 51.42208619
+
 
 @dataclass
 class Candidate:
@@ -76,6 +82,10 @@ class Candidate:
     # the weight it carries. Defaulted and last so that a `scored.json` written
     # before this existed still loads into `Candidate(**d)`.
     wall_energy_eV: float = None
+    # The same convergence, in xtb's units: ||grad|| over all components, in
+    # Eh/bohr, for comparison against `xtb --opt normal`'s 1e-3 threshold.
+    # Defaulted and last for the same backward-compatibility reason.
+    gnorm_Eh_bohr: float = None
 
 
 def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
@@ -102,8 +112,8 @@ def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
     return gaps
 
 
-def relax(atoms, calculator, solvation, calculator_kwargs=None, fmax=0.05,
-          steps=300):
+def relax(atoms, calculator, solvation, calculator_kwargs=None, fmax=0.002,
+          steps=1000):
     """Optimise `atoms` in the scoring environment. No wall -- see module doc."""
     a = atoms.copy()
     a.calc = get_calculator(calculator, solvation=solvation,
@@ -113,12 +123,14 @@ def relax(atoms, calculator, solvation, calculator_kwargs=None, fmax=0.05,
     # Read both before anything else touches the geometry: `converged()`
     # re-evaluates against current positions rather than reporting on the run.
     converged = bool(opt.converged())
-    final_fmax = float(np.linalg.norm(a.get_forces(), axis=1).max())
-    return a, float(a.get_potential_energy()), converged, final_fmax
+    forces = a.get_forces()
+    final_fmax = float(np.linalg.norm(forces, axis=1).max())
+    gnorm = float(np.linalg.norm(forces) / EV_A_PER_EH_BOHR)
+    return a, float(a.get_potential_energy()), converged, final_fmax, gnorm
 
 
 def reference_energies(solute_path, solvent_path, calculator, solvation,
-                       calculator_kwargs=None, fmax=0.05, steps=300):
+                       calculator_kwargs=None, fmax=0.002, steps=1000):
     """Relaxed isolated solute and solvent, in the scoring environment.
 
     The solute reference is conformer-specific by construction -- it comes
@@ -126,10 +138,10 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
     makes an interaction energy comparable between conformers.
     """
     solute = align_to_principal_axes(read(solute_path))
-    _, e_solute, _, _ = relax(solute, calculator, solvation, calculator_kwargs,
-                              fmax, steps)
-    _, e_solvent, _, _ = relax(read(solvent_path), calculator, solvation,
-                               calculator_kwargs, fmax, steps)
+    _, e_solute, _, _, _ = relax(solute, calculator, solvation,
+                                 calculator_kwargs, fmax, steps)
+    _, e_solvent, _, _, _ = relax(read(solvent_path), calculator, solvation,
+                                  calculator_kwargs, fmax, steps)
     return e_solute, e_solvent
 
 
@@ -150,7 +162,7 @@ def dedupe(candidates, energy_tol_eV=1e-3):
 
 
 def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
-              stride=10, max_frames=40, fmax=0.05, steps=300,
+              stride=10, max_frames=40, fmax=0.002, steps=1000,
               temperature_K=298.0, references=None, out_name="scored.json"):
     """Rescore one `run_one_job` output directory in the continuum.
 
@@ -195,7 +207,7 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
 
     candidates, geometries = [], []
     for index, frame in zip(indices, frames):
-        opt_atoms, energy, converged, final_fmax = relax(
+        opt_atoms, energy, converged, final_fmax, gnorm = relax(
             frame, calculator, solvation, calculator_kwargs, fmax, steps)
         gaps = solvent_molecule_gaps(opt_atoms, n_solute, aps)
         candidates.append(Candidate(
@@ -209,6 +221,7 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
             min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
             wall_energy_eV=(float(records[index]["wall_energy_eV"])
                             if index < len(records) else None),
+            gnorm_Eh_bohr=gnorm,
         ))
         geometries.append(opt_atoms)
 
@@ -248,6 +261,12 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "dissolved_fraction":
             float(np.mean([c.n_contacts == 0 for c in unique])) if n_solvent else 1.0,
         "converged_fraction": float(np.mean([c.converged for c in candidates])),
+        # Counted over the unique candidates because those are the ones that
+        # carry Boltzmann weight. A candidate left with residual force is
+        # exactly the contamination the tight fmax exists to remove, so it is
+        # surfaced rather than dropped -- dropping would bias the ensemble
+        # toward whichever basins happen to relax easily.
+        "n_unconverged_unique": sum(1 for c in unique if not c.converged),
         # Named `sampling_*` because the scorer applies no wall: this qualifies
         # the geometries, not the energies computed from them here.
         "sampling_wall": wall_stats(records) if records else None,

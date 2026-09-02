@@ -146,6 +146,22 @@ drifts away, there was no specific interaction to capture.
 Departure from `E_int(0)` is exactly "what the continuum was missing"; the
 plateau in n is where enough explicit solvent has been added.
 
+Every term has to be relaxed *to convergence*, not merely to a stationary-ish
+geometry. The scoring optimiser therefore runs to `fmax = 0.002` eV/A
+(`--fmax`, `--opt-steps 1000`), not the 0.05 it used to. At 0.05 a frame is
+left hanging on whichever soft mode it happened to be descending: measured on
+one pyrazine + 2 chloroform frame, that put the reported minimum **0.58
+kcal/mol above the true one**, and the residual does not cancel between
+solvents or between conformers, because it depends on the mode rather than on
+the chemistry. It perturbs the Boltzmann weights too, so it contaminates the
+ensemble average as well as the minimum. The references matter as much as the
+candidates -- `E_int` subtracts `E(solute) + n E(solvent)`, so a loosely
+relaxed reference puts a constant offset on every point in the sweep.
+
+Cost on pyrazine + 2 chloroform: 4.5 s vs 1.3 s per candidate, ~90 s vs ~26 s
+per run directory. Negligible at this size; revisit when the hexamer arrives,
+which is why it is a flag and not a constant.
+
 ## Gotchas
 
 - `run_job_grid` uses spawn, so **every script calling it needs an
@@ -170,6 +186,17 @@ plateau in n is where enough explicit solvent has been added.
   the run's own `run.log` instead; it is flushed per line.
 - `sweep.json` is `{"params": {...}, "runs": [...]}`, not the bare list it was
   before. Nothing reads the old shape any more.
+- `best.xyz` is relaxed **in the scoring continuum, with no wall**, so a plain
+  `xtb best.xyz --opt` optimises it on a different surface and keeps moving it.
+  Reproduce it with `xtb best.xyz --gfn 2 --alpb <solvent> --sp`; `scored.log`
+  prints the exact command. Two further traps, both checked rather than
+  assumed: ASE's `fmax` (largest per-atom force, eV/A) and xtb's gradient norm
+  (all components, Eh/a) are **different criteria** -- the old 0.05 eV/A is
+  ~2.5x looser than `--opt normal`'s 1e-3 Eh/a -- so `scored.log` now prints
+  both per candidate. And tblite and the env's `xtb` 6.4.1 binary were
+  verified to agree to <1e-6 Eh on the same geometry, gas and ALPB(chcl3)
+  alike, with xtb reading the extended-xyz file momenta columns and all.
+  **There is no Hamiltonian or I/O discrepancy to chase.**
 - `resources/` is gitignored. `resources/handoff_md_pipeline_claude_code.md`
   contains a struck-through paragraph saying not to use ALPB with an explicit
   shell. **That advice is wrong** and was corrected in place on 2026-09-01.
@@ -177,6 +204,10 @@ plateau in n is where enough explicit solvent has been added.
 ## State
 
 Validated: pyrazine, n = 0..3, gas sampling scored in each continuum.
+**Those run directories predate the `fmax = 0.002` scoring default and were
+not rescored**, so their energies sit up to ~0.6 kcal/mol above their true
+minima; the next production sweep picks the new default up. The numbers below
+are from the loose runs.
 `E_int(0)` = 0.02 / 0.04 kcal/mol, confirming self-consistency. At n = 1,
 chcl3 -5.59 vs acetone -3.55, matching the single-complex numbers within
 sampling error; the best geometry has H...N 1.98 A at 158 deg, found from a

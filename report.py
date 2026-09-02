@@ -237,6 +237,29 @@ def wall_warning(fraction, indent="  "):
     ))
 
 
+def unconverged_warning(n_unconverged, n_unique, indent="  "):
+    """Warning for candidates that hit the optimiser step cap, or None.
+
+    Unconverged candidates are kept rather than dropped -- dropping them would
+    bias the ensemble toward whichever basins relax easily -- so the Boltzmann
+    average has to say out loud that some of its weight sits on geometries
+    that are not minima.
+    """
+    if not n_unconverged:
+        return None
+    return "\n".join(indent + line for line in (
+        f"** WARNING: {n_unconverged} of {n_unique} unique candidates hit the "
+        "optimiser step cap",
+        "** without converging (the NO rows in the conv column above). They "
+        "still carry",
+        "** Boltzmann weight, and residual force is worth up to a few tenths "
+        "of a",
+        "** kcal/mol per candidate -- the same contamination the tight fmax "
+        "exists to",
+        "** remove. Raise --opt-steps, or discount these rows by hand.",
+    ))
+
+
 def format_run_footer(records, target_K=None, elapsed_s=None):
     if not records:
         return kv_block("MD summary", {"frames written": 0})
@@ -326,7 +349,7 @@ def _candidate_table(candidates, temperature_K):
                                 temperature_K)
     lines = [f"{'frame':>7} {'E(cluster)/eV':>16} {'E_int/kcal':>12} "
              f"{'weight':>8} {'contacts':>9} {'min gap/A':>10} {'conv':>5} "
-             f"{'fmax':>7} {'E_wall/eV':>11}"]
+             f"{'fmax':>7} {'gnorm':>9} {'E_wall/eV':>11}"]
     for c, w in zip(candidates, weights):
         gap = c.get("min_gap_A")
         gap_s = "-" if gap is None or gap != gap else f"{gap:.3f}"
@@ -335,12 +358,18 @@ def _candidate_table(candidates, temperature_K):
         # records being carried through, so "not known" cannot read as "zero".
         wall = c.get("wall_energy_eV")
         wall_s = "" if wall is None else f"{wall:.6f}"
+        # fmax and gnorm are the same convergence in ASE's and xtb's units:
+        # per-atom max force in eV/A, and the norm over all components in
+        # Eh/bohr. Blank rather than 0 for a `scored.json` written before the
+        # gradient norm was recorded.
+        gnorm = c.get("gnorm_Eh_bohr")
+        gnorm_s = "" if gnorm is None else f"{gnorm:.2e}"
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
             f"{w:>8.3f} {c['n_contacts']:>9d} {gap_s:>10} "
             f"{'yes' if c['converged'] else 'NO':>5} {c['fmax']:>7.4f} "
-            f"{wall_s:>11}".rstrip())
+            f"{gnorm_s:>9} {wall_s:>11}".rstrip())
     return "\n".join(lines)
 
 
@@ -420,14 +449,26 @@ def format_scored_log(summary, meta=None):
             f"{meta.get('dump_interval')}")
     parts.append(kv_block("Provenance", provenance))
 
+    # `best.xyz` is the geometry relaxed here, so state the surface it was
+    # relaxed on: reproducing it in the xtb binary needs the same continuum,
+    # and the two codes converge on criteria that are not comparable by eye.
+    solvation = summary.get("scoring_solvation") or []
+    alpb = f" --alpb {solvation[1]}" if len(solvation) > 1 and solvation[1] else ""
     parts.append(kv_block("Scoring", {
         "calculator": summary.get("calculator"),
         "continuum": _solvation_str(summary.get("scoring_solvation")),
-        "optimiser": (f"BFGS, fmax {summary.get('opt_fmax', '?')} eV/A, "
-                      f"max {summary.get('opt_steps', '?')} steps"),
+        "optimiser": (f"BFGS, fmax {summary.get('opt_fmax', '?')} eV/A "
+                      "(ASE: largest per-atom force). xtb's"),
+        "": ("`--opt normal` instead stops at a gradient norm of 1e-3 Eh/a "
+             "-- see"),
+        " ": f"the gnorm column. Max {summary.get('opt_steps', '?')} steps",
+        "reproduce": f"xtb best.xyz --gfn 2{alpb} --sp",
+        "  ": ("best.xyz was relaxed WITH the continuum -- omitting "
+               + (f"--alpb {solvation[1]}" if alpb else "it")),
+        "   ": "puts it on a different surface",
         "wall": "none -- dissolution is the signal, not a failure;",
-        "": ("a solvent molecule that optimises away into the "
-             "continuum contributes ~0 to E_int"),
+        "    ": ("a solvent molecule that optimises away into the "
+                 "continuum contributes ~0 to E_int"),
     }))
 
     offset = (None if e_solute is None or e_solvent is None
@@ -480,6 +521,12 @@ def format_scored_log(summary, meta=None):
     # energies the confinement contaminated.
     warning = wall_warning((summary.get("sampling_wall")
                             or {}).get("wall_active_fraction"))
+    if warning:
+        parts.append(warning)
+    # Same reason, one line up the stack: these are the energies a residual
+    # force contaminated.
+    warning = unconverged_warning(summary.get("n_unconverged_unique"),
+                                  summary.get("n_unique"))
     if warning:
         parts.append(warning)
     return "\n\n".join(parts)

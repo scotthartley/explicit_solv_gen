@@ -65,8 +65,8 @@ from solvate_md import Condition, run_job_grid
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
               n_seeds=1, n_workers=None, calculator="gfn2-xtb",
               temperature_K=298.0, n_equilibrate_steps=2000, n_steps=6000,
-              dump_interval=20, stride=5, max_frames=20, fmax=0.05,
-              opt_steps=300, label=None, condition_kwargs=None):
+              dump_interval=20, stride=5, max_frames=20, fmax=0.002,
+              opt_steps=1000, label=None, condition_kwargs=None):
     """Generate and score one solute in one solvent at every n and seed.
 
     Sampling takes `Condition`'s default -- gas phase, because that is what
@@ -198,6 +198,14 @@ def main(argv=None):
     parser.add_argument("--max-frames", type=int, default=20,
                         help="cap on frames scored per run, spread over the "
                              "whole trajectory (default: %(default)s)")
+    parser.add_argument("--fmax", type=float, default=0.002,
+                        help="scoring optimiser convergence, eV/A per-atom max "
+                             "force. xtb's `--opt normal` stops at a gradient "
+                             "norm of 1e-3 Eh/a, which the default here is "
+                             "comfortably inside (default: %(default)s)")
+    parser.add_argument("--opt-steps", type=int, default=1000,
+                        help="max optimiser steps per candidate "
+                             "(default: %(default)s)")
     parser.add_argument("--label", default=None,
                         help="solute name in run directories and the table "
                              "(default: the solute filename stem)")
@@ -214,6 +222,8 @@ def main(argv=None):
         n_steps=args.steps,
         stride=args.stride,
         max_frames=args.max_frames,
+        fmax=args.fmax,
+        opt_steps=args.opt_steps,
         label=args.label,
     )
     print(Path(args.out) / "report.txt")
