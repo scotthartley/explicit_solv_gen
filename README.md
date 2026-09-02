@@ -6,7 +6,7 @@ molecules do you actually need?**
 
 Packmol packs a small solvent shell around a solute, ASE runs Langevin MD
 under a confining wall with tblite (GFN2-xTB) or MACE-OFF23, and the resulting
-frames are re-optimised in an ALPB continuum. The output is an interaction
+frames are re-optimized in an ALPB continuum. The output is an interaction
 energy as a function of shell size, `E_int(n)`, plus the diagnostics that say
 whether the sampling behind it was good enough to believe.
 
@@ -30,7 +30,7 @@ the continuum was missing*, and the plateau is the answer to "how much is
 enough". If it never departs, the continuum was already sufficient.
 
 Two properties make this work. `E_int` is comparable across `n`, because whole
-solvent molecules are subtracted off. And a solvent molecule that optimises
+solvent molecules are subtracted off. And a solvent molecule that optimizes
 away into the continuum contributes ≈ 0, so a run whose shell dissolves lands
 back on the `n = 0` answer rather than on an arbitrary offset. "The shell
 dissolved" and "there was no explicit shell" agree, which makes dissolution a
@@ -177,13 +177,13 @@ different fraction of a monolayer for each.
 ## Performance
 
 Both halves run in parallel. MD fans out across cores per job; scoring — the
-expensive half — fans out **per candidate optimisation** rather than per run
+expensive half — fans out **per candidate optimization** rather than per run
 directory, because run directories are badly unequal in cost and would leave
 cores idle with a long tail. The two references go into the same pool, at the
 front, computed once per distinct (solute, solvent, calculator, continuum) so
 that every row of a table is measured against the same zero.
 
-Measured on six run directories — 62 optimisations on 18 cores — as mean wall
+Measured on six run directories — 62 optimizations on 18 cores — as mean wall
 time per run directory: 69.6 s serial, 34.5 s parallel over run directories,
 **10.2 s** parallel over candidates.
 
@@ -210,7 +210,7 @@ kill -TERM -- -$(ps -o pgid= -p <parent-pid> | tr -d ' ')
 | file | role |
 | --- | --- |
 | `solvate_md.py` | packing + MD — the **generator** |
-| `ensemble.py` | re-optimising and scoring frames in a continuum — the **scorer** |
+| `ensemble.py` | re-optimizing and scoring frames in a continuum — the **scorer** |
 | `n_sweep.py` | the `E_int(n)` sweep, and the CLI |
 | `report.py` | all text rendering, plus the ASE-free numeric helpers; no ASE/tblite at module scope |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent` |
@@ -231,14 +231,14 @@ behind every default and a list of gotchas worth reading before changing one.
 - Sampling is **gas phase by default** (`Condition.sample_in_continuum =
   False`); scoring applies the continuum regardless.
 - `best.xyz` is relaxed in the scoring continuum with **no wall**, so plain
-  `xtb best.xyz --opt` optimises it on a different surface. Reproduce it with
+  `xtb best.xyz --opt` optimizes it on a different surface. Reproduce it with
   `xtb best.xyz --gfn 2 --alpb <solvent> --sp`; `scored.log` prints the exact
   command.
 - ASE's `fmax` (largest per-atom force, eV/Å) and xtb's gradient norm (all
   components, Eh/a₀) are different criteria and are not comparable by eye, so
   both are recorded per candidate.
 - Every term of `E_int` must be relaxed *to convergence*, not merely to a
-  stationary-ish geometry. The scoring optimiser runs to `fmax = 0.002` eV/Å
+  stationary-ish geometry. The scoring optimizer runs to `fmax = 0.002` eV/Å
   for this reason; at 0.05 a frame is left hanging on whichever soft mode it
   was descending, which on one test case put the reported minimum 0.58 kcal/mol
   above the true one — and that residual does not cancel between solvents or

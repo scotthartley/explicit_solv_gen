@@ -42,7 +42,7 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | --- | --- |
 | `single_thread.py` | pins the numeric stack to one thread per process. Must be imported **before numpy**; see its docstring. |
 | `solvate_md.py` | packing + MD. The **generator**. |
-| `ensemble.py` | rescoring optimised frames in a continuum. The **scorer**. |
+| `ensemble.py` | rescoring optimized frames in a continuum. The **scorer**. |
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
 | `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`) that `ensemble` re-exports. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
@@ -131,9 +131,9 @@ Binding of one solvent molecule, GFN2-xTB, gas -> ALPB (kcal/mol):
 
 **Water-in-water is pathological; it is not the general case.** ALPB(water)
 reproduces a water's full hydration free energy, so a departing water loses
-nothing and dissociation is downhill. The weaker continua *stabilise* the
+nothing and dissociation is downhill. The weaker continua *stabilize* the
 complex instead, and the bias differs by only 0.5 kcal/mol between chloroform
-and acetone against a 3.1 kcal/mol signal. Do not generalise a toy-system
+and acetone against a 3.1 kcal/mol signal. Do not generalize a toy-system
 failure to the real chemistry without measuring it.
 
 Sampling Hamiltonian, methanol + 4 water, 10 ps, three seeds each -- no
@@ -154,7 +154,7 @@ something the Hamiltonian wants to disperse, and the energies are contaminated.
 
 every term relaxed in the same continuum. `E_int(0)` is zero by construction.
 It is comparable across n because whole solvent molecules are subtracted off,
-and a solvent molecule that optimises away into the continuum contributes ~0 --
+and a solvent molecule that optimizes away into the continuum contributes ~0 --
 so a dissolved shell lands back on the n = 0 answer. That is what makes
 dissolution a usable *null result* rather than a failure mode: if solvent
 drifts away, there was no specific interaction to capture.
@@ -163,7 +163,7 @@ Departure from `E_int(0)` is exactly "what the continuum was missing"; the
 plateau in n is where enough explicit solvent has been added.
 
 Every term has to be relaxed *to convergence*, not merely to a stationary-ish
-geometry. The scoring optimiser therefore runs to `fmax = 0.002` eV/A
+geometry. The scoring optimizer therefore runs to `fmax = 0.002` eV/A
 (`--fmax`, `--opt-steps 1000`), not the 0.05 it used to. At 0.05 a frame is
 left hanging on whichever soft mode it happened to be descending: measured on
 one pyrazine + 2 chloroform frame, that put the reported minimum **0.58
@@ -209,7 +209,7 @@ here that is a property of the system rather than of the integrator.
 `run_job_grid` fans the MD out across cores and `score_run_grid` does the same
 for the scoring, because scoring is the expensive half: at the defaults a
 4-point sweep spends a few minutes on MD and the better part of an hour on
-candidate optimisations. Both go through `solvate_md.pool_map`, which uses
+candidate optimizations. Both go through `solvate_md.pool_map`, which uses
 spawn, so the `if __name__ == "__main__":` guard below covers both.
 
 **The granularity is per candidate, not per run directory.** Fanning the
@@ -220,12 +220,12 @@ start and the tail is one whole directory long. `score_run` therefore splits
 into `select_frames` -> `relax` per frame -> `assemble`, and `score_run_grid`
 selects every job in the parent, flattens to one `relax` task per candidate,
 and assembles afterwards. That is ~600 near-equal tasks with a tail of one
-optimisation, and the count is set by `max_frames` regardless of system size.
-Measured on 6 run directories, 62 optimisations, 18 cores: 69.6 s serial,
+optimization, and the count is set by `max_frames` regardless of system size.
+Measured on 6 run directories, 62 optimizations, 18 cores: 69.6 s serial,
 34.5 s per directory, **10.2 s per candidate**.
 
 Selecting and assembling stay in the parent because they are milliseconds of
-file reading and microseconds of numpy; only the optimisations are worth
+file reading and microseconds of numpy; only the optimizations are worth
 shipping to a worker. `relax` hands its geometry back carrying a
 `SinglePointCalculator` rather than the live tblite one, which is what lets
 the result cross a pickle at all.
@@ -335,7 +335,7 @@ in the basin it was packed into).
 - `sweep.json` is `{"params": {...}, "runs": [...]}`, not the bare list it was
   before. Nothing reads the old shape any more.
 - `best.xyz` is relaxed **in the scoring continuum, with no wall**, so a plain
-  `xtb best.xyz --opt` optimises it on a different surface and keeps moving it.
+  `xtb best.xyz --opt` optimizes it on a different surface and keeps moving it.
   Reproduce it with `xtb best.xyz --gfn 2 --alpb <solvent> --sp`; `scored.log`
   prints the exact command. Two further traps, both checked rather than
   assumed: ASE's `fmax` (largest per-atom force, eV/A) and xtb's gradient norm
