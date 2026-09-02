@@ -25,6 +25,8 @@ from ase.md.velocitydistribution import (
 from ase.optimize import BFGS
 from ase.units import fs
 
+from report import RunLogger
+
 _FALLBACK_VDW_RADIUS = 1.7  # Angstrom, used when ase.data.vdw_radii has no entry
 _AVOGADRO = 6.02214076e23
 
@@ -492,6 +494,10 @@ def run_one_job(condition, seed, out_dir):
     )
     atoms = packing.atoms
 
+    # Streams `run.log` alongside the JSON, flushing every line so a long run
+    # can be followed with `tail -f` instead of going silent until it finishes.
+    logger = RunLogger(out_dir / "run.log")
+
     solvation = ("alpb", condition.solvent) if condition.implicit_solvent else None
     calc = get_calculator(
         condition.calculator, solvation=solvation, **condition.calculator_kwargs
@@ -509,6 +515,44 @@ def run_one_job(condition, seed, out_dir):
     # thermally excited structure instead of on the relaxation.
     relax_converged = bool(opt.converged())
     relax_fmax = float(np.linalg.norm(atoms.get_forces(), axis=1).max())
+
+    # Built here rather than at the end so the log header and metadata.json
+    # are rendered from one dict: the human-readable file cannot then describe
+    # the run differently from the machine-readable one beside it.
+    metadata = {
+        "label": condition.label,
+        "seed": seed,
+        "solute_path": str(condition.solute_path),
+        "solvent_path": str(condition.solvent_path),
+        "solvent": condition.solvent,
+        "n_solvent": condition.n_solvent,
+        "n_atoms": len(atoms),
+        # The scorer reads the trajectory back without the Condition that
+        # produced it, and needs these to split solute from solvent and
+        # solvent into molecules.
+        "n_solute": packing.n_solute,
+        "atoms_per_solvent": packing.atoms_per_solvent,
+        "tolerance": condition.tolerance,
+        "calculator": condition.calculator,
+        "implicit_solvent": condition.implicit_solvent,
+        "solvation": list(solvation) if solvation else None,
+        "temperature_K": condition.temperature_K,
+        "timestep_fs": condition.timestep_fs,
+        "friction": condition.friction,
+        "n_equilibrate_steps": condition.n_equilibrate_steps,
+        "n_steps": condition.n_steps,
+        "dump_interval": condition.dump_interval,
+        "shell_semi_axes": packing.semi_axes.tolist(),
+        "shell_padding": packing.padding,
+        "wall_distance": packing.wall_distance,
+        "wall_k": condition.wall_k,
+        "relax_converged": relax_converged,
+        "relax_final_fmax": relax_fmax,
+    }
+    # shell_fill and wall_slack shape the packing but are not in metadata.json,
+    # so hand them to the header separately rather than widening that file.
+    logger.header(metadata, extra={"shell_fill": condition.shell_fill,
+                                   "wall_slack": condition.wall_slack})
 
     # Draw velocities reproducibly, then remove the net translation and
     # rotation the draw introduces. Langevin's fixcm handles the translation
@@ -543,71 +587,44 @@ def run_one_job(condition, seed, out_dir):
 
     traj_path = out_dir / "traj.xyz"
     energies = []
-    n_atoms = len(atoms)
 
     def record():
         step = dyn.get_number_of_steps() - condition.n_equilibrate_steps
         epot = atoms.get_potential_energy()
         ekin = atoms.get_kinetic_energy()
-        energies.append(
-            {
-                "step": step,
-                "time_fs": step * condition.timestep_fs,
-                "potential_energy_eV": epot,
-                "kinetic_energy_eV": ekin,
-                "total_energy_eV": epot + ekin,
-                # ASE's own accessor, which discounts the degrees of freedom
-                # removed by FixCom rather than assuming a bare 3N.
-                "temperature_K": atoms.get_temperature(),
-                # Nonzero means solvent is leaning on the wall rather than
-                # being held by the solute: the shell is not self-bound and
-                # the confinement is doing real work. Worth watching.
-                "wall_energy_eV": float(wall.get_potential_energy(atoms)),
-            }
-        )
+        entry = {
+            "step": step,
+            "time_fs": step * condition.timestep_fs,
+            "potential_energy_eV": epot,
+            "kinetic_energy_eV": ekin,
+            "total_energy_eV": epot + ekin,
+            # ASE's own accessor, which discounts the degrees of freedom
+            # removed by FixCom rather than assuming a bare 3N.
+            "temperature_K": atoms.get_temperature(),
+            # Nonzero means solvent is leaning on the wall rather than
+            # being held by the solute: the shell is not self-bound and
+            # the confinement is doing real work. Worth watching.
+            "wall_energy_eV": float(wall.get_potential_energy(atoms)),
+        }
+        energies.append(entry)
+        # One dict feeds both the JSON and the log, so they cannot drift.
+        # Per-dump text I/O is negligible against an SCF.
+        logger.md_row(entry)
         write(traj_path, atoms, append=step > 0)
 
     dyn.attach(record, interval=condition.dump_interval)
     dyn.run(condition.n_steps)
 
+    # Reports the wall-active fraction, and warns when the confinement turns
+    # out to have been load-bearing rather than a safety net.
+    logger.footer()
+    logger.close()
+
     with open(out_dir / "energies.json", "w") as f:
         json.dump(energies, f, indent=2)
 
     with open(out_dir / "metadata.json", "w") as f:
-        json.dump(
-            {
-                "label": condition.label,
-                "seed": seed,
-                "solute_path": str(condition.solute_path),
-                "solvent_path": str(condition.solvent_path),
-                "solvent": condition.solvent,
-                "n_solvent": condition.n_solvent,
-                "n_atoms": n_atoms,
-                # The scorer reads the trajectory back without the Condition
-                # that produced it, and needs these to split solute from
-                # solvent and solvent into molecules.
-                "n_solute": packing.n_solute,
-                "atoms_per_solvent": packing.atoms_per_solvent,
-                "tolerance": condition.tolerance,
-                "calculator": condition.calculator,
-                "implicit_solvent": condition.implicit_solvent,
-                "solvation": list(solvation) if solvation else None,
-                "temperature_K": condition.temperature_K,
-                "timestep_fs": condition.timestep_fs,
-                "friction": condition.friction,
-                "n_equilibrate_steps": condition.n_equilibrate_steps,
-                "n_steps": condition.n_steps,
-                "dump_interval": condition.dump_interval,
-                "shell_semi_axes": packing.semi_axes.tolist(),
-                "shell_padding": packing.padding,
-                "wall_distance": packing.wall_distance,
-                "wall_k": condition.wall_k,
-                "relax_converged": relax_converged,
-                "relax_final_fmax": relax_fmax,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(metadata, f, indent=2)
 
     return str(out_dir)
 

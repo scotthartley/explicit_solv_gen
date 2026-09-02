@@ -30,8 +30,49 @@ that env's bin and is not on the default PATH**, so run with:
 | --- | --- |
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimised frames in a continuum. The **scorer**. |
-| `n_sweep.py` | `E_int(n)` sweep and double-difference assembly. |
+| `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
+| `report.py` | all text rendering. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
+
+`run_sweep` deliberately does *not* assemble a double difference. One sweep is
+one solute in one solvent; `dd` is four sweeps subtracted by hand. The `Leg` /
+`delta_delta` machinery that used to do it had no callers and no driver script,
+and the only real sweep on disk (`pyrazine_sweep_output/`) is one solute across
+two solvents -- a shape `delta_delta` would have rejected.
+
+What that gives up is the guarantee that both halves of a difference ran under
+identical settings, so every sweep now records a **params block**: the whole
+`Condition` (via `asdict`, so new fields are picked up automatically) plus the
+git commit and a timestamp. Given `wall_slack` silently changed meaning at
+`c429f8a`, this is cheap insurance -- check it before subtracting two sweeps.
+
+## Artefacts
+
+Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
+`metadata.json`, `best.xyz`, `scored.json` -- and now
+
+| file | written by | contents |
+| --- | --- | --- |
+| `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
+| `scored.log` | `ensemble.score_run` | provenance, references, per-candidate table, result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
+| `report.txt` | `n_sweep.run_sweep` | params block + the `E_int(n)` table |
+
+`run.log` is flushed on every line, so a long run can be followed with
+`tail -f` instead of going silent until it exits. **The footer surfaces the
+wall diagnostic** -- wall-active fraction and max wall energy -- and warns
+above 20%, rather than leaving it buried in a 74 KB `energies.json` array.
+
+Regenerate any of these from the JSON already on disk, no MD and no calculator:
+
+    python -m report pyrazine_sweep_output/     # a sweep, or a single run dir
+
+`E_int` stays the reported number, because it alone is comparable across n.
+`E(cluster)` is now shown beside it everywhere: within a run the two differ
+only by the constant `E(solute) + n E(solvent)`, and `boltzmann_weights`
+subtracts the minimum before exponentiating, so the weights -- and therefore
+the two ensemble averages -- are consistent by construction. It costs nothing
+and gives the large numbers the small differences came from. Absolute energies
+are in eV (ASE's native unit), `E_int` in kcal/mol; the mix is deliberate.
 
 ## The central design decision: sampling and scoring use different Hamiltonians
 
@@ -104,7 +145,11 @@ plateau in n is where enough explicit solvent has been added.
   entropy of a dissociated solvent molecule, so a looser wall makes
   dissociation more favourable.
 - Don't pipe a long background run through `tail` -- it buffers until the pipe
-  closes, so no interim output appears no matter what `flush=True` says.
+  closes, so no interim output appears no matter what `flush=True` says. Tail
+  the run's own `run.log` instead; it is flushed per line.
+- `sweep.json` is `{"params": {...}, "runs": [...]}`, not the bare list it was
+  before. `report.render_sweep_dir` still reads the old shape (rendering an
+  empty params block), but nothing else does.
 - `resources/` is gitignored. `resources/handoff_md_pipeline_claude_code.md`
   contains a struck-through paragraph saying not to use ALPB with an explicit
   shell. **That advice is wrong** and was corrected in place on 2026-09-01.

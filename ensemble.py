@@ -33,9 +33,11 @@ from ase.io import read, write
 from ase.optimize import BFGS
 from ase.units import kB
 
+from report import EV_TO_KCAL, format_scored_log
 from solvate_md import _vdw_radii_array, align_to_principal_axes, get_calculator
 
-EV_TO_KCAL = 23.060548
+# EV_TO_KCAL lives in `report` so that formatting a number never drags in ASE;
+# it is imported here so that callers can keep taking it from `ensemble`.
 
 # A solvent molecule counts as touching the solute when some atom pair is
 # within this much of van der Waals contact. Generous on purpose: it is a
@@ -156,8 +158,13 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
               temperature_K=298.0, references=None, out_name="scored.json"):
     """Rescore one `run_one_job` output directory in the continuum.
 
-    Returns the parsed summary; also writes `<run_dir>/scored.json` and the
+    Returns the parsed summary; also writes `<run_dir>/scored.json`, a
+    human-readable `<run_dir>/scored.log` beside it, and the
     lowest-interaction-energy geometry as `<run_dir>/best.xyz`.
+
+    The log is named after `out_name`, so rescoring the same trajectory in a
+    second continuum gives `scored_acetone.json` / `scored_acetone.log`
+    rather than appending to one growing file.
     """
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "metadata.json").read_text())
@@ -197,6 +204,11 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
 
     unique = dedupe(candidates)
     interactions = [c.interaction_eV for c in unique]
+    # Absolute energies over the same candidates. `boltzmann_weights`
+    # subtracts the minimum before exponentiating and E_int differs from
+    # E(cluster) only by the constant e_solute + n * e_solvent, so these two
+    # averages carry identical weights and cannot disagree.
+    absolutes = [c.energy_eV for c in unique]
     best = min(range(len(candidates)), key=lambda i: candidates[i].interaction_eV)
     write(run_dir / "best.xyz", geometries[best])
 
@@ -208,6 +220,11 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "sampling_solvation": meta["solvation"],
         "scoring_solvation": list(solvation) if solvation else None,
         "calculator": calculator,
+        "temperature_K": temperature_K,
+        "stride": stride,
+        "max_frames": max_frames,
+        "opt_fmax": fmax,
+        "opt_steps": steps,
         "n_frames_scored": len(candidates),
         "n_unique": len(unique),
         "e_solute_ref_eV": e_solute,
@@ -215,6 +232,8 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "min_interaction_kcal": min(interactions) * EV_TO_KCAL,
         "ensemble_interaction_kcal":
             ensemble_energy(interactions, temperature_K) * EV_TO_KCAL,
+        "min_energy_eV": min(absolutes),
+        "ensemble_energy_eV": ensemble_energy(absolutes, temperature_K),
         "mean_contacts": float(np.mean([c.n_contacts for c in unique])),
         "dissolved_fraction":
             float(np.mean([c.n_contacts == 0 for c in unique])) if n_solvent else 1.0,
@@ -222,4 +241,6 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "candidates": [asdict(c) for c in unique],
     }
     (run_dir / out_name).write_text(json.dumps(summary, indent=2))
+    (run_dir / (Path(out_name).stem + ".log")).write_text(
+        format_scored_log(summary, meta))
     return summary
