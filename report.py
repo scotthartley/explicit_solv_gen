@@ -562,16 +562,17 @@ def format_table(summaries):
 
     lines = [f"leg: {legs[0]}", ""] if one_leg else []
     leg_head = "" if one_leg else f"{'leg':20s} "
-    lines += [f"{leg_head}{'n':>3} {'E_int(ens)':>12} {'E_int(min)':>12} "
+    lines += [f"{leg_head}{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
               f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
               f"{'uniq':>5} {'wall':>6}",
-              "-" * (78 if one_leg else 99)]
+              "-" * (83 if one_leg else 104)]
     for s in sorted(summaries, key=lambda s: (_leg_name(s), s["n_solvent"],
                                               s.get("seed", 0))):
         frac = _wall_fraction(s)
         lines.append(
             ("" if one_leg else f"{_leg_name(s):20s} ")
             + f"{s['n_solvent']:>3} "
+            f"{s.get('seed', 0):>4} "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
             f"{_num(s.get('ensemble_energy_eV'), '.6f'):>15} "
