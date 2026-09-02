@@ -130,7 +130,7 @@ class Condition:
     # solute frame, measured on pyrazine + 3 CHCl3, falls to 1/e in 550 fs, so
     # dumping every 5 fs recorded the same configuration ~100 times over and
     # made `energies.json` large for no extra information. Expect this to grow
-    # with the solute -- a hexamer's shell rearranges more slowly still.
+    # with the solute -- a larger one's shell rearranges more slowly still.
     dump_interval: int = 100
     # Fraction of the packing shell filled by solvent at bulk density. Sets
     # how thick the shell is for a given n_solvent -- see `shell_padding`.
@@ -309,11 +309,12 @@ def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill,
     This is the sizing rule, and it is deliberately *not* "pick a box that
     holds N molecules at bulk density". At the molecule counts used for
     microsolvation there are far too few solvent molecules to fill any convex
-    region around a solute of this size -- a dozen chloroforms is well under
-    half a monolayer on a foldamer hexamer. Sizing a volume from N therefore
-    scatters them through empty space instead of onto the solute. Sizing the
-    *thickness* from N keeps the region wrapped tightly around the solute at
-    any N, and grows smoothly into a genuine full shell as N increases.
+    region around a solute of any appreciable size -- a dozen chloroforms is
+    well under half a monolayer on a solute of a hundred atoms. Sizing a
+    volume from N therefore scatters them through empty space instead of onto
+    the solute. Sizing the *thickness* from N keeps the region wrapped tightly
+    around the solute at any N, and grows smoothly into a genuine full shell
+    as N increases.
     """
     target_volume = n_solvent * v_solvent / shell_fill
 

@@ -24,11 +24,12 @@ Sampling is gas-phase by default and scoring is in the continuum: see the
 module docstring of `ensemble.py` for why those are separated. Sampling is
 `Condition.sample_in_continuum`, and there is no second name for it here.
 
-**One sweep is one solute in one solvent.** A double difference such as
+**One sweep is one solute in one solvent.** A comparison across two solutes
+and two solvents -- a double difference such as
 
-    dd = (AAA - BBB)_chcl3 - (AAA - BBB)_acetone
+    dd = (A - B)_solvent1 - (A - B)_solvent2
 
-is assembled by hand from four sweeps, because there is no reason for this
+-- is assembled by hand from four sweeps, because there is no reason for this
 module to know that a difference is what you eventually want. What that gives
 up is the guarantee that both halves ran under identical settings, so each
 sweep writes a **params block** into `sweep.json` recording the whole

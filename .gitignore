@@ -1,6 +1,12 @@
-# Specify filepatterns you want git to ignore.
-resources/
-__pycache__/
-*.pyc
+# Run output. Sweeps write a directory wherever --out points; these are the
+# ones this repo has used.
 pyrazine_sweep_output/
 s_test/
+smoke/
+
+# Local notes and scratch.
+resources/
+
+__pycache__/
+*.pyc
+.DS_Store

@@ -20,7 +20,7 @@ than by comment. `ensemble` imports both functions back.
 
 Regenerate logs for anything already on disk, without running any MD:
 
-    python -m report pyrazine_sweep_output/
+    python -m report path/to/sweep_or_run_dir/
 """
 
 import single_thread  # noqa: F401  -- must precede numpy; see its docstring

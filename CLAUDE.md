@@ -5,33 +5,36 @@ Packmol -> ASE -> tblite (GFN2-xTB) or MACE-OFF23, with a confining wall.
 
 ## The problem this exists for
 
-Alternating o-phenylene / 2,3-pyrazinylene foldamers fold into a compact helix
-(AAA) in chloroform but an extended one (BBB) in acetone. PCM does not
-reproduce this, which points at specific solvation -- chloroform's acidic C-H
-capping the pyrazine nitrogens -- rather than at bulk dielectric. The target
-is a double difference, `dd = (AAA - BBB)_chcl3 - (AAA - BBB)_acetone`, with a
-small explicit shell carrying the specific interaction and ALPB carrying the
-bulk.
+A continuum solvation model averages the solvent away. When a solvent effect
+comes from a *specific* interaction -- a hydrogen bond to one site, a halogen
+bond, an acidic C-H capping a lone pair -- the continuum cannot see it, and a
+conformational or binding preference that depends on such a contact comes out
+wrong. The cluster-continuum answer is to put a small number of solvent
+molecules in explicitly, carry the specific interaction with them, and leave
+the bulk dielectric to the continuum.
 
-This replaced a CREST/QCG workflow that was abandoned after its ensemble
-finalization stage was found to be broken (see `resources/crest_qcg_notes.md`).
+That leaves one question, which this code turns into a measurement: **how much
+explicit solvent is enough?** Sweep the number of explicit molecules `n`, watch
+the interaction energy converge, and report the two diagnostics that say
+whether the sampling behind it was sufficient.
 
 ## Environment
 
-Conda env `solvate_md` (`~/opt/miniforge3/envs/solvate_md`). **packmol lives in
-that env's bin and is not on the default PATH**, so run with:
+Conda env from `environment.yml` (packmol, xtb, ase, tblite, numpy; MACE via
+pip). **packmol is installed into the env's bin and is not on the default
+PATH**, so either activate the env or run with it prepended:
 
-    PATH=~/opt/miniforge3/envs/solvate_md/bin:$PATH \
-      ~/opt/miniforge3/envs/solvate_md/bin/python n_sweep.py \
-        examples/pyrazine.xyz examples/chloroform.xyz \
-        --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+    conda env create -f environment.yml
+    conda activate solvate_md
+    python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
+      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
 
 `n_sweep.py --help` lists the rest; every flag maps onto a field of
 `Condition` or of `Scoring`, and takes its default from there. That is the
-entry point -- there is no driver script, and `solvate_md.py` no longer has a
-`__main__` smoke test of its own (`s_test/` is the real one: `--n 2 --seeds 1
---steps 6000 --equilibrate 2000 --dump-interval 20 --stride 5 --max-frames
-20`).
+entry point -- there is no driver script, and `solvate_md.py` has no
+`__main__` smoke test of its own. A fast end-to-end check is the same command
+with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
+--stride 5 --max-frames 20`.
 
 ## Layout
 
@@ -44,11 +47,11 @@ entry point -- there is no driver script, and `solvate_md.py` no longer has a
 | `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`) that `ensemble` re-exports. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
-`run_sweep` deliberately does *not* assemble a double difference. One sweep is
-one solute in one solvent; `dd` is four sweeps subtracted by hand. The `Leg` /
-`delta_delta` machinery that used to do it had no callers and no driver script,
-and the only real sweep on disk (`pyrazine_sweep_output/`) is one solute across
-two solvents -- a shape `delta_delta` would have rejected.
+`run_sweep` deliberately does *not* assemble a difference of sweeps. One sweep
+is one solute in one solvent; a double difference such as
+`(A - B)_solvent1 - (A - B)_solvent2` is four sweeps subtracted by hand. The
+`Leg` / `delta_delta` machinery that used to do it had no callers and no driver
+script, and imposed a shape real sweeps did not have.
 
 What that gives up is the guarantee that both halves of a difference ran under
 identical settings, so every sweep now records a **params block**: the whole
@@ -89,11 +92,9 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
     python -m report /path/to/sweep_or_run_dir/
 
-(`pyrazine_sweep_output/` is the exception: its `sweep.json` is the old bare
-list, so it no longer re-renders -- and now nor does anything scored before
-`n_opt_steps` and the mandatory wall fields, since the readers no longer
-default a missing field. Its `report.txt` is already on disk, and the sweep is
-under-sampled and due to be redone anyway.)
+(Anything scored before `n_opt_steps` and the mandatory wall fields no longer
+re-renders, since the readers no longer default a missing field. Rescore it
+rather than re-reporting it.)
 
 `E_int` stays the reported number, because it alone is comparable across n.
 `E(cluster)` is now shown beside it everywhere: within a run the two differ
@@ -173,8 +174,8 @@ candidates -- `E_int` subtracts `E(solute) + n E(solvent)`, so a loosely
 relaxed reference puts a constant offset on every point in the sweep.
 
 Cost on pyrazine + 2 chloroform: 4.5 s vs 1.3 s per candidate, ~90 s vs ~26 s
-per run directory. Negligible at this size; revisit when the hexamer arrives,
-which is why it is a flag and not a constant.
+per run directory. Negligible at this size; revisit on a larger solute, which
+is why it is a flag and not a constant.
 
 ## How much sampling? The defaults are production defaults now
 
@@ -198,8 +199,9 @@ What sets them, measured rather than assumed:
 | dump interval | 100 steps = 50 fs | 11 dumps per decorrelation time. The old 5 fs recorded each configuration ~100 times |
 | seeds | 3 | see below |
 
-Expect all of these to grow with the solute; re-measure the decorrelation time
-on the hexamer rather than carrying 0.55 ps over.
+Expect all of these to grow with the solute. Re-measure the decorrelation time
+on your own system rather than carrying 0.55 ps over -- it is the one number
+here that is a property of the system rather than of the integrator.
 
 ### Both halves of a sweep are parallel, and scoring is parallel per candidate
 
@@ -263,9 +265,10 @@ makes *when it last fell* a convergence test, and `report.txt` now runs it:
 
 Both are computed from the candidate list already in `scored.json`, so
 `python -m report <dir>` renders them for anything on disk -- no MD, no
-calculator. Run on the existing pyrazine sweep they immediately separate its
-two failures: n = 3 chcl3 still falling on the final frame, n = 2 chcl3 stuck
-in the basin it started in.
+calculator. They separate the two ways an under-sampled sweep fails, which
+otherwise look alike in the table: a run still falling on the final frame
+(too short) and a run whose minimum came from frame 2 and never moved (stuck
+in the basin it was packed into).
 
 ## Gotchas
 
@@ -341,44 +344,40 @@ in the basin it started in.
   verified to agree to <1e-6 Eh on the same geometry, gas and ALPB(chcl3)
   alike, with xtb reading the extended-xyz file momenta columns and all.
   **There is no Hamiltonian or I/O discrepancy to chase.**
-- `resources/` is gitignored. `resources/handoff_md_pipeline_claude_code.md`
-  contains a struck-through paragraph saying not to use ALPB with an explicit
-  shell. **That advice is wrong** and was corrected in place on 2026-09-01.
+- An explicit shell **and** ALPB together is the intended configuration, not a
+  double count. The continuum describes the bulk the explicit molecules do not
+  represent; advice to the contrary is wrong, and the binding table above is
+  the measurement that settles it.
 
 ## State
 
-Validated: pyrazine, n = 0..3, gas sampling scored in each continuum.
-**Those run directories predate the `fmax = 0.002` scoring default and were
-not rescored**, so their energies sit up to ~0.6 kcal/mol above their true
-minima; the next production sweep picks the new default up. The numbers below
-are from the loose runs. They also predate the current `scored.json` shape, so
-they no longer re-render -- rescore rather than re-report if you want them
-back.
-`E_int(0)` = 0.02 / 0.04 kcal/mol, confirming self-consistency. At n = 1,
-chcl3 -5.59 vs acetone -3.55, matching the single-complex numbers within
-sampling error; the best geometry has H...N 1.98 A at 158 deg, found from a
-2.0 A packing.
+Validated on the shipped example, pyrazine in chloroform and in acetone,
+n = 0..3, gas-phase sampling scored in each continuum. `E_int(0)` came out at
+0.02 / 0.04 kcal/mol, which is the self-consistency check: it is zero by
+construction, so a nonzero value would mean the two references and the n = 0
+cluster were not being relaxed to the same place. At n = 1, chcl3 -5.59 vs
+acetone -3.55, matching the single-complex numbers in the table above within
+sampling error; the best geometry has H...N at 1.98 A and 158 deg, found from
+a 2.0 A packing that forbade the contact at t = 0.
 
-Not yet established:
+Those runs predate the `fmax = 0.002` scoring default and the current
+`scored.json` shape, so their energies sit up to ~0.6 kcal/mol above their
+true minima and they no longer re-render. They were also under-sampled -- one
+seed, 15 frames, 3 ps, all well below the current defaults -- which is what
+the two diagnostics were written to catch, and did.
 
-- **No real AAA/BBB structures exist anywhere on this machine.** Every hexamer
-  number quoted so far is from a spherocylinder/lattice model. These are the
-  missing input for both `shell_capacity.py` and a real sweep.
-- The pyrazine sweep is **under-sampled** (one seed, 15 frames, 3 ps) and
-  predates the defaults below. The signature is non-monotonic contact counts
-  -- n = 2 chcl3 had *fewer* contacts than n = 1, which the two diagnostics
-  now diagnose as two different failures side by side: n = 3 chcl3 found its
-  minimum on the *last* frame (still falling, late gain -2.20 kcal/mol) while
-  n = 2 found its on frame 2 of 15 and never left that basin.
+Known limitations:
+
 - `E_int` **conflates solute-solvent with solvent-solvent** at n >= 2: two
-  chloroforms binding each other counts as solvation. Largely cancels in the
-  double difference (same solvent, same n, different conformer) but it does
-  contaminate reading convergence in n directly.
-- `n_solvent` is still an open choice. 12 is targeted microsolvation, ~40 a
-  full first shell on the hexamer. Note the tension: microsolvation is the
-  regime where *every* explicit molecule sits at the continuum boundary.
-- MACE-OFF23 as a generator is **untested**. No model is cached; it needs a
-  download. MPS is available.
+  chloroforms binding each other counts as solvation. It largely cancels in a
+  difference taken at the same solvent and the same n, but it does contaminate
+  reading convergence in n directly.
+- `n_solvent` is a real choice, not a default to accept. Run
+  `shell_capacity.py` first: a count well under a monolayer is targeted
+  microsolvation, and that is the regime where *every* explicit molecule sits
+  at the continuum boundary.
+- MACE-OFF23 as a generator is **untested** here. It needs a model download,
+  and it cannot share a process with tblite (see the file boundary above).
 - GFN2 likely **over-binds** the C-H...N contact -- 1.91 A is short against a
-  literature 2.2-2.5 A, so absolute magnitudes may be 1.5-2x too strong. Sign
-  and ordering should be robust; ratios may not be.
+  literature 2.2-2.5 A, so absolute magnitudes may be 1.5-2x too strong. Signs
+  and orderings should be robust; ratios may not be.

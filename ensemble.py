@@ -88,9 +88,9 @@ class Scoring:
     # at the old 0.05 a frame is left hanging on whichever soft mode it was
     # descending, which on one pyrazine + 2 chloroform frame put the reported
     # minimum 0.58 kcal/mol above the true one. It does not cancel between
-    # solvents or conformers, because it depends on the mode rather than on
-    # the chemistry. xtb's `--opt normal` stops at a gradient norm of 1e-3
-    # Eh/a, which this is comfortably inside -- the two criteria are not
+    # solvents or between conformers, because it depends on the mode rather
+    # than on the chemistry. xtb's `--opt normal` stops at a gradient norm of
+    # 1e-3 Eh/a, which this is comfortably inside -- the two criteria are not
     # comparable by eye, so `scored.log` prints both.
     fmax: float = 0.002
     opt_steps: int = 1000
@@ -126,8 +126,8 @@ class Candidate:
     gnorm_Eh_bohr: float
     # BFGS steps taken. Says whether the hour a sweep spends in the optimiser
     # goes to the tight `fmax` or to BFGS being the wrong optimiser for a
-    # floppy cluster -- worth knowing before anyone tries swapping it on the
-    # hexamer.
+    # floppy cluster -- worth knowing before anyone tries swapping it on a
+    # larger system.
     n_opt_steps: int
 
 
@@ -175,7 +175,7 @@ class Relaxed:
     # How many BFGS steps this candidate took. The number that says whether
     # the hour a sweep spends here goes to the tight `fmax` or to a poor
     # optimiser choice, which is worth knowing before anyone tries swapping
-    # BFGS for LBFGS on the hexamer.
+    # BFGS for LBFGS on a larger cluster.
     n_opt_steps: int
 
 
@@ -213,9 +213,9 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
                        calculator_kwargs, fmax, steps):
     """Relaxed isolated solute and solvent, in the scoring environment.
 
-    The solute reference is conformer-specific by construction -- it comes
-    from `solute_path`, so AAA and BBB each get their own -- which is what
-    makes an interaction energy comparable between conformers.
+    The solute reference is geometry-specific by construction -- it comes
+    from `solute_path`, so two conformers of one molecule each get their
+    own, which is what makes an interaction energy comparable between them.
     """
     solute = align_to_principal_axes(read(solute_path))
     return (relax(solute, calculator, solvation,
