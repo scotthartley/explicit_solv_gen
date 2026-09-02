@@ -202,6 +202,41 @@ def format_md_row(record):
             f"{record['wall_energy_eV']:>11.6f}")
 
 
+def wall_stats(records):
+    """Aggregate `wall_energy_eV` over a list of `energies.json` records.
+
+    The one number that says whether a run's energies are trustworthy, so it
+    is computed once here and rendered in three places -- the MD footer, the
+    scored log and the sweep table -- rather than recomputed in each.
+    """
+    n = len(records)
+    walls = [r["wall_energy_eV"] for r in records]
+    n_active = sum(1 for w in walls if w > 0.0)
+    return {
+        "n_frames": n,
+        "n_wall_active": n_active,
+        "wall_active_fraction": (n_active / n) if n else None,
+        "max_wall_energy_eV": max(walls) if walls else None,
+    }
+
+
+def wall_warning(fraction, indent="  "):
+    """The load-bearing-wall warning, or None when the run is under threshold."""
+    if fraction is None or fraction <= WALL_WARN_FRACTION:
+        return None
+    return "\n".join(indent + line for line in (
+        f"** WARNING: the confining wall is active in {100 * fraction:.0f}% of "
+        "frames.",
+        "** Measured regimes are 4-5% (gas-phase sampling, shell self-bound,",
+        "** wall a safety net) versus 50-60% (ALPB(water), shell dissociating).",
+        f"** Above {100 * WALL_WARN_FRACTION:.0f}% the wall is load-bearing: it "
+        "is holding together a shell",
+        "** the Hamiltonian wants to disperse, and these energies are",
+        "** contaminated by the confinement. Sample in gas phase, or accept",
+        "** that there is no bound shell to find.",
+    ))
+
+
 def format_run_footer(records, target_K=None, elapsed_s=None):
     if not records:
         return kv_block("MD summary", {"frames written": 0})
@@ -209,38 +244,28 @@ def format_run_footer(records, target_K=None, elapsed_s=None):
     n = len(records)
     temps = [r["temperature_K"] for r in records]
     epots = [r["potential_energy_eV"] for r in records]
-    walls = [r["wall_energy_eV"] for r in records]
     mean_T = sum(temps) / n
     mean_E = sum(epots) / n
     sd_E = (sum((e - mean_E) ** 2 for e in epots) / n) ** 0.5
-    n_active = sum(1 for w in walls if w > 0.0)
-    frac = n_active / n
+    wall = wall_stats(records)
+    frac = wall["wall_active_fraction"]
 
     summary = {
         "frames written": n,
         "mean temperature/K": (f"{mean_T:.1f}" + (f"  (target {target_K:.1f})"
                                                   if target_K else "")),
         "E_pot/eV": f"{mean_E:.6f} +/- {sd_E:.6f}",
-        "wall active": f"{n_active} / {n} frames ({100 * frac:.1f}%)",
-        "max wall energy/eV": f"{max(walls):.6f}",
+        "wall active": (f"{wall['n_wall_active']} / {n} frames "
+                        f"({100 * frac:.1f}%)"),
+        "max wall energy/eV": f"{wall['max_wall_energy_eV']:.6f}",
     }
     if elapsed_s is not None:
         summary["elapsed"] = f"{elapsed_s:.1f} s"
     block = kv_block("MD summary", summary)
 
-    if frac > WALL_WARN_FRACTION:
-        block += (
-            "\n\n"
-            f"  ** WARNING: the confining wall is active in {100 * frac:.0f}% of "
-            "frames.\n"
-            "  ** Measured regimes are 4-5% (gas-phase sampling, shell self-bound,\n"
-            "  ** wall a safety net) versus 50-60% (ALPB(water), shell dissociating).\n"
-            f"  ** Above {100 * WALL_WARN_FRACTION:.0f}% the wall is load-bearing: it "
-            "is holding together a shell\n"
-            "  ** the Hamiltonian wants to disperse, and these energies are\n"
-            "  ** contaminated by the confinement. Sample in gas phase, or accept\n"
-            "  ** that there is no bound shell to find."
-        )
+    warning = wall_warning(frac)
+    if warning:
+        block += "\n\n" + warning
     return block
 
 
@@ -301,16 +326,64 @@ def _candidate_table(candidates, temperature_K):
                                 temperature_K)
     lines = [f"{'frame':>7} {'E(cluster)/eV':>16} {'E_int/kcal':>12} "
              f"{'weight':>8} {'contacts':>9} {'min gap/A':>10} {'conv':>5} "
-             f"{'fmax':>7}"]
+             f"{'fmax':>7} {'E_wall/eV':>11}"]
     for c, w in zip(candidates, weights):
         gap = c.get("min_gap_A")
         gap_s = "-" if gap is None or gap != gap else f"{gap:.3f}"
+        # Of the *sampling* frame this candidate came from -- the scorer
+        # applies no wall. Blank rather than 0 when the run predates the
+        # records being carried through, so "not known" cannot read as "zero".
+        wall = c.get("wall_energy_eV")
+        wall_s = "" if wall is None else f"{wall:.6f}"
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
             f"{w:>8.3f} {c['n_contacts']:>9d} {gap_s:>10} "
-            f"{'yes' if c['converged'] else 'NO':>5} {c['fmax']:>7.4f}")
+            f"{'yes' if c['converged'] else 'NO':>5} {c['fmax']:>7.4f} "
+            f"{wall_s:>11}".rstrip())
     return "\n".join(lines)
+
+
+def _sampling_wall_str(summary):
+    """One-line summary of the wall during the MD that produced these frames."""
+    wall = summary.get("sampling_wall")
+    if not wall or wall.get("wall_active_fraction") is None:
+        return None
+    line = (f"active in {100 * wall['wall_active_fraction']:.1f}% of "
+            f"{wall['n_frames']} frames "
+            f"(max {wall['max_wall_energy_eV']:.6f} eV)")
+    n_scored_active = summary.get("n_scored_wall_active")
+    if n_scored_active is not None:
+        line += (f"; {n_scored_active} of {summary.get('n_frames_scored')} "
+                 "scored frames affected")
+    return line
+
+
+def backfill_wall_stats(summary, records):
+    """Fill a scored summary's wall diagnostic from the run's `energies.json`.
+
+    For `scored.json` files written before the scorer recorded any of this.
+    Only ever fills what is missing, so a summary written by the current code
+    re-renders to exactly the log it was first written with -- and
+    `n_scored_wall_active`, which needs to know which frames were scored,
+    stays absent rather than being guessed at from the unique candidates.
+
+    Mutates and returns `summary`. The caller does not write it back:
+    regenerating a log renders text, it does not rewrite results.
+    """
+    if not records:
+        return summary
+    if summary.get("sampling_wall") is None:
+        summary["sampling_wall"] = wall_stats(records)
+    # Trajectory dump i and energies[i] come from the same `record()` closure
+    # in `solvate_md`, and `Candidate.frame` is the true dump index, so the
+    # records index directly.
+    for candidate in summary.get("candidates") or []:
+        frame = candidate.get("frame")
+        if (candidate.get("wall_energy_eV") is None
+                and frame is not None and 0 <= frame < len(records)):
+            candidate["wall_energy_eV"] = float(records[frame]["wall_energy_eV"])
+    return summary
 
 
 def format_scored_log(summary, meta=None):
@@ -335,6 +408,9 @@ def format_scored_log(summary, meta=None):
         "sampling Hamiltonian": (
             f"{summary.get('calculator')}, "
             f"{_solvation_str(summary.get('sampling_solvation'))}"),
+        # The frames scored below were drawn from a walled trajectory, so how
+        # hard that wall was working qualifies every energy in this file.
+        "sampling wall": _sampling_wall_str(summary),
     }
     if meta:
         dt = meta.get("timestep_fs")
@@ -399,12 +475,24 @@ def format_scored_log(summary, meta=None):
   E(cluster) differs from it only by the constant offset above, so the two
   averages carry identical weights -- it is shown as a raw number to
   sanity-check the small differences of large energies against.""")
+
+    # After the Result block rather than up in Provenance: these are the
+    # energies the confinement contaminated.
+    warning = wall_warning((summary.get("sampling_wall")
+                            or {}).get("wall_active_fraction"))
+    if warning:
+        parts.append(warning)
     return "\n\n".join(parts)
 
 
 # --------------------------------------------------------------------------
 # Sweeps
 # --------------------------------------------------------------------------
+
+def _wall_fraction(summary):
+    """Wall-active fraction of the run behind this summary, or None."""
+    return (summary.get("sampling_wall") or {}).get("wall_active_fraction")
+
 
 def _leg_name(summary):
     """What this row is: which solute, scored in which continuum."""
@@ -429,10 +517,11 @@ def format_table(summaries):
     leg_head = "" if one_leg else f"{'leg':20s} "
     lines += [f"{leg_head}{'n':>3} {'E_int(ens)':>12} {'E_int(min)':>12} "
               f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
-              f"{'uniq':>5}",
-              "-" * (71 if one_leg else 92)]
+              f"{'uniq':>5} {'wall':>6}",
+              "-" * (78 if one_leg else 99)]
     for s in sorted(summaries, key=lambda s: (_leg_name(s), s["n_solvent"],
                                               s.get("seed", 0))):
+        frac = _wall_fraction(s)
         lines.append(
             ("" if one_leg else f"{_leg_name(s):20s} ")
             + f"{s['n_solvent']:>3} "
@@ -441,16 +530,48 @@ def format_table(summaries):
             f"{_num(s.get('ensemble_energy_eV'), '.6f'):>15} "
             f"{s['mean_contacts']:>9.2f} "
             f"{100 * s['dissolved_fraction']:>9.0f}% "
-            f"{s['n_unique']:>5}")
+            f"{s['n_unique']:>5} "
+            + (f"{'-':>6}" if frac is None else f"{100 * frac:>5.0f}%"))
     lines.append(
         "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'contacts' = "
         "solvent\nmolecules touching the solute after optimisation; 'dissolved' "
-        "= fraction of\nunique candidates with no contact at all.\n"
+        "= fraction of\nunique candidates with no contact at all. 'wall' = "
+        "fraction of the sampling\ntrajectory's frames with a nonzero wall "
+        "energy.\n"
         "\nE(cluster) is Boltzmann-averaged over the same weights as E_int, and is "
         "here\nto sanity-check the magnitudes it came from. It is NOT comparable "
         "across rows\nof different n -- successive rows differ by a whole solvent "
         "molecule. Making\nthat comparison meaningful is exactly what E_int is "
         "for; subtract those\ninstead.")
+    return "\n".join(lines)
+
+
+def format_wall_diagnostic(summaries):
+    """The worst wall-active fraction in the sweep, and what it means.
+
+    A sweep is many runs, and the per-run footer in each `run.log` is exactly
+    where nobody looks after the fact. This puts the one number that says
+    whether any of these energies are contaminated next to the energies.
+    """
+    known = [(f, s) for s in summaries
+             if (f := _wall_fraction(s)) is not None]
+    if not known:
+        return None
+
+    worst_frac, worst = max(known, key=lambda pair: pair[0])
+    lines = ["Wall diagnostic", "---------------",
+             f"  max wall-active fraction   {100 * worst_frac:.1f}%  "
+             f"({worst.get('label', '?')} seed {worst.get('seed', '?')})"]
+
+    warning = wall_warning(worst_frac)
+    if warning:
+        lines += ["", warning]
+    else:
+        lines.append(
+            f"  Under the {100 * WALL_WARN_FRACTION:.0f}% threshold, so the wall "
+            "is a safety net rather than load-bearing.\n"
+            "  Reference regimes: 4-5% for gas-phase sampling of a self-bound "
+            "shell, 50-60%\n  for a shell the Hamiltonian is dissociating.")
     return "\n".join(lines)
 
 
@@ -463,6 +584,10 @@ def format_sweep_report(params, summaries):
 
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
                  + "-" * 58 + "\n" + format_table(summaries))
+
+    diagnostic = format_wall_diagnostic(summaries)
+    if diagnostic:
+        parts.append(diagnostic)
 
     zeros = [s for s in summaries if s.get("n_solvent") == 0]
     if zeros:
@@ -498,11 +623,12 @@ def render_run_dir(path):
     path = Path(path)
     written = []
 
+    energies_path = path / "energies.json"
+    records = _load(energies_path) if energies_path.exists() else []
+
     meta_path = path / "metadata.json"
     if meta_path.exists():
         meta = _load(meta_path)
-        energies_path = path / "energies.json"
-        records = _load(energies_path) if energies_path.exists() else []
         with RunLogger(path / "run.log", live=False) as log:
             log.header(meta)
             for record in records:
@@ -514,7 +640,8 @@ def render_run_dir(path):
 
     for scored in sorted(path.glob("scored*.json")):
         out = scored.with_suffix(".log")
-        out.write_text(format_scored_log(_load(scored), meta))
+        summary = backfill_wall_stats(_load(scored), records)
+        out.write_text(format_scored_log(summary, meta))
         written.append(out)
     return written
 
@@ -532,6 +659,11 @@ def render_sweep_dir(path):
             run_dir = Path(summary["run_dir"])
         if run_dir.is_dir():
             written += render_run_dir(run_dir)
+            # So a sweep run before the scorer recorded any of this still gets
+            # a wall column. In memory only -- `sweep.json` is not rewritten.
+            energies_path = run_dir / "energies.json"
+            if energies_path.exists():
+                backfill_wall_stats(summary, _load(energies_path))
 
     report = path / "report.txt"
     report.write_text(format_sweep_report(params, runs))

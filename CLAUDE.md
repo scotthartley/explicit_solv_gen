@@ -66,6 +66,12 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 `tail -f` instead of going silent until it exits. **The footer surfaces the
 wall diagnostic** -- wall-active fraction and max wall energy -- and warns
 above 20%, rather than leaving it buried in a 74 KB `energies.json` array.
+The same diagnostic now travels with the numbers it qualifies: a `wall` column
+and a **Wall diagnostic** section in `report.txt`, and in `scored.log` a
+provenance line plus a per-candidate `E_wall/eV` -- the wall energy of the
+sampling frame each candidate came from. `scored.json` carries it as
+`sampling_wall` / `n_scored_wall_active`, and older ones are backfilled from
+`energies.json` when re-rendered.
 
 Regenerate any of these from the JSON already on disk, no MD and no calculator:
 

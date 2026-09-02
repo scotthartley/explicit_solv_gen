@@ -37,6 +37,7 @@ from report import (
     boltzmann_weights,
     ensemble_energy,
     format_scored_log,
+    wall_stats,
 )
 from solvate_md import _vdw_radii_array, align_to_principal_axes, get_calculator
 
@@ -69,6 +70,12 @@ class Candidate:
     n_contacts: int
     n_solvent: int
     min_gap_A: float
+    # The confinement energy of the *sampling* frame this came from -- the
+    # scorer applies no wall. A nonzero value says this geometry was being
+    # squeezed by the wall when it was recorded, which is worth seeing beside
+    # the weight it carries. Defaulted and last so that a `scored.json` written
+    # before this existed still loads into `Candidate(**d)`.
+    wall_energy_eV: float = None
 
 
 def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
@@ -162,6 +169,13 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     aps = meta["atoms_per_solvent"]
     n_solvent = meta["n_solvent"]
 
+    # Trajectory dump i and energies[i] are written by the same `record()`
+    # closure in `solvate_md`, so a candidate's dump index reads its wall
+    # energy straight out of this list. Absent for an old or hand-made run
+    # directory, in which case every wall field below stays None.
+    energies_path = run_dir / "energies.json"
+    records = json.loads(energies_path.read_text()) if energies_path.exists() else []
+
     if references is None:
         references = reference_energies(
             meta["solute_path"], meta["solvent_path"], calculator, solvation,
@@ -193,6 +207,8 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
             n_contacts=int((gaps < CONTACT_GAP_A).sum()),
             n_solvent=n_solvent,
             min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
+            wall_energy_eV=(float(records[index]["wall_energy_eV"])
+                            if index < len(records) else None),
         ))
         geometries.append(opt_atoms)
 
@@ -232,6 +248,11 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         "dissolved_fraction":
             float(np.mean([c.n_contacts == 0 for c in unique])) if n_solvent else 1.0,
         "converged_fraction": float(np.mean([c.converged for c in candidates])),
+        # Named `sampling_*` because the scorer applies no wall: this qualifies
+        # the geometries, not the energies computed from them here.
+        "sampling_wall": wall_stats(records) if records else None,
+        "n_scored_wall_active": (
+            sum(1 for c in candidates if c.wall_energy_eV) if records else None),
         "candidates": [asdict(c) for c in unique],
     }
     (run_dir / out_name).write_text(json.dumps(summary, indent=2))
