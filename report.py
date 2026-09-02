@@ -355,7 +355,7 @@ def _candidate_table(candidates, temperature_K):
                                 temperature_K)
     lines = [f"{'frame':>7} {'E(cluster)/eV':>16} {'E_int/kcal':>12} "
              f"{'weight':>8} {'contacts':>9} {'min gap/A':>10} {'conv':>5} "
-             f"{'fmax':>7} {'gnorm':>9} {'E_wall/eV':>11}"]
+             f"{'fmax':>7} {'gnorm':>9} {'steps':>6} {'E_wall/eV':>11}"]
     for c, w in zip(candidates, weights):
         gap = c.get("min_gap_A")
         gap_s = "-" if gap is None or gap != gap else f"{gap:.3f}"
@@ -370,12 +370,16 @@ def _candidate_table(candidates, temperature_K):
         # gradient norm was recorded.
         gnorm = c.get("gnorm_Eh_bohr")
         gnorm_s = "" if gnorm is None else f"{gnorm:.2e}"
+        # Optimiser steps, so a slow sweep can be attributed to the tight fmax
+        # or to BFGS before anyone swaps optimisers on a guess.
+        steps = c.get("n_opt_steps")
+        steps_s = "" if steps is None else str(steps)
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
             f"{w:>8.3f} {c['n_contacts']:>9d} {gap_s:>10} "
             f"{'yes' if c['converged'] else 'NO':>5} {c['fmax']:>7.4f} "
-            f"{gnorm_s:>9} {wall_s:>11}".rstrip())
+            f"{gnorm_s:>9} {steps_s:>6} {wall_s:>11}".rstrip())
     return "\n".join(lines)
 
 

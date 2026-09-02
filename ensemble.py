@@ -31,6 +31,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
+from ase.calculators.calculator import all_properties
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read, write
 from ase.optimize import BFGS
 
@@ -129,6 +131,11 @@ class Candidate:
     # Eh/bohr, for comparison against `xtb --opt normal`'s 1e-3 threshold.
     # Defaulted and last for the same backward-compatibility reason.
     gnorm_Eh_bohr: float = None
+    # BFGS steps taken. Says whether the hour a sweep spends in the optimiser
+    # goes to the tight `fmax` or to BFGS being the wrong optimiser for a
+    # floppy cluster -- worth knowing before anyone tries swapping it on the
+    # hexamer. Defaulted and last for the same reason as the two above.
+    n_opt_steps: int = None
 
 
 def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
@@ -155,20 +162,58 @@ def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
     return gaps
 
 
+@dataclass
+class Relaxed:
+    """One finished optimisation, detached from the calculator that ran it.
+
+    `relax` runs in a pool worker, so its result has to cross a pickle. A live
+    tblite calculator cannot -- it holds a cffi handle -- so the geometry comes
+    back carrying a `SinglePointCalculator` with the same results dict instead.
+    That is not merely a workaround: it is what lets `best.xyz` and
+    `scored_candidates.xyz` keep their energy, forces and charges, written by
+    the parent from a geometry optimised in a worker.
+    """
+
+    atoms: object
+    energy_eV: float
+    converged: bool
+    fmax: float
+    gnorm_Eh_bohr: float
+    # How many BFGS steps this candidate took. The number that says whether
+    # the hour a sweep spends here goes to the tight `fmax` or to a poor
+    # optimiser choice, which is worth knowing before anyone tries swapping
+    # BFGS for LBFGS on the hexamer.
+    n_opt_steps: int
+
+
 def relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps):
-    """Optimise `atoms` in the scoring environment. No wall -- see module doc."""
+    """Optimise `atoms` in the scoring environment. No wall -- see module doc.
+
+    This is the unit of work the scoring grid fans out: one candidate, or one
+    of the two references, per call. It is a plain top-level function taking
+    picklable arguments for exactly that reason.
+    """
     a = atoms.copy()
     a.calc = get_calculator(calculator, solvation=solvation,
                             **(calculator_kwargs or {}))
     opt = BFGS(a, logfile=None)
     opt.run(fmax=fmax, steps=steps)
-    # Read both before anything else touches the geometry: `converged()`
-    # re-evaluates against current positions rather than reporting on the run.
+    # Read all of these before anything else touches the geometry:
+    # `converged()` re-evaluates against current positions rather than
+    # reporting on the run.
     converged = bool(opt.converged())
     forces = a.get_forces()
-    final_fmax = float(np.linalg.norm(forces, axis=1).max())
-    gnorm = float(np.linalg.norm(forces) / EV_A_PER_EH_BOHR)
-    return a, float(a.get_potential_energy()), converged, final_fmax, gnorm
+    energy = float(a.get_potential_energy())
+    results = {k: v for k, v in a.calc.results.items() if k in all_properties}
+    a.calc = SinglePointCalculator(a, **results)
+    return Relaxed(
+        atoms=a,
+        energy_eV=energy,
+        converged=converged,
+        fmax=float(np.linalg.norm(forces, axis=1).max()),
+        gnorm_Eh_bohr=float(np.linalg.norm(forces) / EV_A_PER_EH_BOHR),
+        n_opt_steps=int(opt.nsteps),
+    )
 
 
 def reference_energies(solute_path, solvent_path, calculator, solvation,
@@ -180,14 +225,13 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
     makes an interaction energy comparable between conformers.
     """
     solute = align_to_principal_axes(read(solute_path))
-    _, e_solute, _, _, _ = relax(solute, calculator, solvation,
-                                 calculator_kwargs, fmax, steps)
-    _, e_solvent, _, _, _ = relax(read(solvent_path), calculator, solvation,
-                                  calculator_kwargs, fmax, steps)
-    return e_solute, e_solvent
+    return (relax(solute, calculator, solvation,
+                  calculator_kwargs, fmax, steps).energy_eV,
+            relax(read(solvent_path), calculator, solvation,
+                  calculator_kwargs, fmax, steps).energy_eV)
 
 
-def dedupe(candidates, energy_tol_eV=1e-3):
+def dedupe(pairs, energy_tol_eV=1e-3):
     """Drop candidates that optimised into the same minimum.
 
     Consecutive MD frames mostly relax to the same structure, so without this
@@ -195,103 +239,101 @@ def dedupe(candidates, energy_tol_eV=1e-3):
     happened to loiter somewhere. Energy-based rather than RMSD-based: it
     cannot distinguish two genuinely different structures that happen to be
     isoenergetic, which for ranking purposes costs nothing.
+
+    Takes and returns `(candidate, geometry)` pairs, sorted lowest first. The
+    geometry rides along because the sort breaks the correspondence with the
+    input order, and the caller needs the kept structures to write them out.
     """
     kept = []
-    for c in sorted(candidates, key=lambda c: c.energy_eV):
-        if all(abs(c.energy_eV - k.energy_eV) > energy_tol_eV for k in kept):
-            kept.append(c)
+    for pair in sorted(pairs, key=lambda p: p[0].energy_eV):
+        if all(abs(pair[0].energy_eV - k.energy_eV) > energy_tol_eV
+               for k, _ in kept):
+            kept.append(pair)
     return kept
 
 
-def score_run(run_dir, solvation, scoring, calculator=None,
-              calculator_kwargs=None, references=None,
-              out_name="scored.json"):
-    """Rescore one `run_one_job` output directory in the continuum.
+def select_frames(run_dir, stride, max_frames):
+    """The frames of one run directory that will be scored, and their context.
 
-    Returns the parsed summary; also writes `<run_dir>/scored.json`, a
-    human-readable `<run_dir>/scored.log` beside it, the
-    lowest-interaction-energy geometry as `<run_dir>/best.xyz`, and every
-    other deduped candidate as a multi-frame `<run_dir>/scored_candidates.xyz`
-    -- frame i there is `summary["candidates"][i]`, so a structure of
-    interest in the JSON (an odd contact count, a low weight that's still
-    non-negligible) can be pulled back out rather than re-run from scratch.
+    Returns `(meta, records, indices, frames)`. Split out of `score_run` so
+    the parent can do it for every job in a sweep before any optimisation
+    starts: reading a trajectory is milliseconds, and doing it up front is
+    what turns a sweep into one flat list of independent candidate
+    optimisations rather than a handful of serial per-directory loops.
 
-    Both are named after `out_name`, so rescoring the same trajectory in a
-    second continuum gives `scored_acetone.json` / `scored_acetone.log` /
-    `scored_acetone_candidates.xyz` rather than appending to one growing
-    file.
+    `stride` and `max_frames` are not independent. `max_frames` selects by
+    `linspace` over the whole trajectory, so whenever it bites it discards
+    whatever thinning `stride` did -- which at the defaults is always.
     """
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "metadata.json").read_text())
-    calculator = calculator or meta["calculator"]
-    n_solute = meta["n_solute"]
-    aps = meta["atoms_per_solvent"]
-    n_solvent = meta["n_solvent"]
-
-    # Trajectory dump i and energies[i] are written by the same `record()`
+    # Trajectory dump i and records[i] are written by the same `record()`
     # closure in `solvate_md`, so a candidate's dump index reads its wall
-    # energy straight out of this list. Absent for an old or hand-made run
-    # directory, in which case every wall field below stays None.
-    energies_path = run_dir / "energies.json"
-    records = json.loads(energies_path.read_text()) if energies_path.exists() else []
+    # energy straight out of this list.
+    records = json.loads((run_dir / "energies.json").read_text())
 
-    if references is None:
-        references = reference_energies(
-            meta["solute_path"], meta["solvent_path"], calculator, solvation,
-            calculator_kwargs, scoring.fmax, scoring.opt_steps)
-    e_solute, e_solvent = references
-
-    frames = read(str(run_dir / "traj.xyz"), index=f"::{scoring.stride}")
+    frames = read(str(run_dir / "traj.xyz"), index=f"::{stride}")
     # Carried alongside so a candidate can name the dump it actually came
     # from. `i * stride` would index the subsampled list instead, and label a
     # 300-dump trajectory 0..70 as soon as `max_frames` bites.
-    indices = list(range(0, len(frames) * scoring.stride, scoring.stride))
-    if scoring.max_frames is not None and len(frames) > scoring.max_frames:
+    indices = list(range(0, len(frames) * stride, stride))
+    if max_frames is not None and len(frames) > max_frames:
         # Spread over the whole trajectory rather than taking a prefix.
-        sel = np.linspace(0, len(frames) - 1,
-                          scoring.max_frames).round().astype(int)
+        sel = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
         frames = [frames[i] for i in sel]
         indices = [indices[i] for i in sel]
+    return meta, records, indices, frames
 
-    candidates, geometries = [], []
-    for index, frame in zip(indices, frames):
-        opt_atoms, energy, converged, final_fmax, gnorm = relax(
-            frame, calculator, solvation, calculator_kwargs, scoring.fmax,
-            scoring.opt_steps)
-        gaps = solvent_molecule_gaps(opt_atoms, n_solute, aps)
-        candidates.append(Candidate(
+
+def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
+             calculator, scoring, out_name):
+    """Turn one run's optimised candidates into its summary and its files.
+
+    Everything after the optimisations, and nothing that needs a calculator:
+    contacts, dedupe, Boltzmann numbers, `best.xyz`,
+    `<out_name>_candidates.xyz`, `<out_name>` and its `.log`. Contacts are
+    microseconds of numpy, so this stays in the parent whether the
+    optimisations ran here or in a pool.
+    """
+    run_dir = Path(run_dir)
+    n_solute = meta["n_solute"]
+    aps = meta["atoms_per_solvent"]
+    n_solvent = meta["n_solvent"]
+    e_solute, e_solvent = references
+
+    pairs = []
+    for index, result in zip(indices, relaxed):
+        gaps = solvent_molecule_gaps(result.atoms, n_solute, aps)
+        pairs.append((Candidate(
             frame=index,
-            energy_eV=energy,
-            interaction_eV=energy - e_solute - n_solvent * e_solvent,
-            converged=converged,
-            fmax=final_fmax,
+            energy_eV=result.energy_eV,
+            interaction_eV=result.energy_eV - e_solute - n_solvent * e_solvent,
+            converged=result.converged,
+            fmax=result.fmax,
             n_contacts=int((gaps < CONTACT_GAP_A).sum()),
             n_solvent=n_solvent,
             min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
-            wall_energy_eV=(float(records[index]["wall_energy_eV"])
-                            if index < len(records) else None),
-            gnorm_Eh_bohr=gnorm,
-        ))
-        geometries.append(opt_atoms)
+            wall_energy_eV=float(records[index]["wall_energy_eV"]),
+            gnorm_Eh_bohr=result.gnorm_Eh_bohr,
+            n_opt_steps=result.n_opt_steps,
+        ), result.atoms))
 
-    # Keyed by frame rather than zipped positionally: `dedupe` sorts by
-    # energy, so `unique`'s order no longer matches `candidates`'/`geometries`'.
-    # `frame` is the trajectory dump index and unique per candidate.
-    geometry_by_frame = {c.frame: g for c, g in zip(candidates, geometries)}
-    unique = dedupe(candidates)
-    interactions = [c.interaction_eV for c in unique]
+    candidates = [c for c, _ in pairs]
+    unique = dedupe(pairs)
+    unique_candidates = [c for c, _ in unique]
+    interactions = [c.interaction_eV for c in unique_candidates]
     # Absolute energies over the same candidates. `boltzmann_weights`
     # subtracts the minimum before exponentiating and E_int differs from
     # E(cluster) only by the constant e_solute + n * e_solvent, so these two
     # averages carry identical weights and cannot disagree.
-    absolutes = [c.energy_eV for c in unique]
-    best = min(range(len(candidates)), key=lambda i: candidates[i].interaction_eV)
-    write(run_dir / "best.xyz", geometries[best])
+    absolutes = [c.energy_eV for c in unique_candidates]
+
+    best = min(range(len(pairs)), key=lambda i: pairs[i][0].interaction_eV)
+    write(run_dir / "best.xyz", pairs[best][1])
     # Same order as summary["candidates"] below, so the two can be zipped by
-    # index. write() to a multi-frame .xyz appends frames in list order, not
-    # dict order, hence building the list from `unique` rather than the dict.
+    # index: frame i there is candidates[i].
     write(run_dir / f"{Path(out_name).stem}_candidates.xyz",
-          [geometry_by_frame[c.frame] for c in unique])
+          [geometry for _, geometry in unique])
 
     summary = {
         "run_dir": str(run_dir),
@@ -314,24 +356,24 @@ def score_run(run_dir, solvation, scoring, calculator=None,
         "ensemble_interaction_kcal":
             ensemble_energy(interactions, scoring.temperature_K) * EV_TO_KCAL,
         "min_energy_eV": min(absolutes),
-        "ensemble_energy_eV": ensemble_energy(absolutes,
-                                              scoring.temperature_K),
-        "mean_contacts": float(np.mean([c.n_contacts for c in unique])),
-        "dissolved_fraction":
-            float(np.mean([c.n_contacts == 0 for c in unique])) if n_solvent else 1.0,
+        "ensemble_energy_eV": ensemble_energy(absolutes, scoring.temperature_K),
+        "mean_contacts": float(np.mean([c.n_contacts for c in unique_candidates])),
+        "dissolved_fraction": (
+            float(np.mean([c.n_contacts == 0 for c in unique_candidates]))
+            if n_solvent else 1.0),
         "converged_fraction": float(np.mean([c.converged for c in candidates])),
         # Counted over the unique candidates because those are the ones that
         # carry Boltzmann weight. A candidate left with residual force is
         # exactly the contamination the tight fmax exists to remove, so it is
         # surfaced rather than dropped -- dropping would bias the ensemble
         # toward whichever basins happen to relax easily.
-        "n_unconverged_unique": sum(1 for c in unique if not c.converged),
+        "n_unconverged_unique": sum(1 for c in unique_candidates
+                                    if not c.converged),
         # Named `sampling_*` because the scorer applies no wall: this qualifies
         # the geometries, not the energies computed from them here.
-        "sampling_wall": wall_stats(records) if records else None,
-        "n_scored_wall_active": (
-            sum(1 for c in candidates if c.wall_energy_eV) if records else None),
-        "candidates": [asdict(c) for c in unique],
+        "sampling_wall": wall_stats(records),
+        "n_scored_wall_active": sum(1 for c in candidates if c.wall_energy_eV),
+        "candidates": [asdict(c) for c in unique_candidates],
     }
     (run_dir / out_name).write_text(json.dumps(summary, indent=2))
     (run_dir / (Path(out_name).stem + ".log")).write_text(
@@ -339,36 +381,120 @@ def score_run(run_dir, solvation, scoring, calculator=None,
     return summary
 
 
-def score_run_grid(jobs, scoring, n_workers=None):
-    """Score many run directories at once, one single-threaded worker each.
+def score_run(run_dir, solvation, scoring, calculator=None,
+              calculator_kwargs=None, references=None, out_name="scored.json"):
+    """Rescore one `run_one_job` output directory in the continuum, serially.
 
-    Scoring is the expensive half of a sweep. Each candidate is a full
-    geometry optimisation to `fmax = 0.002`, and there are `max_frames` of
-    them per run directory against a single MD trajectory, so leaving this
-    loop serial made a sweep single-threaded in practice however many cores
-    the MD grid had just used.
+    Select, optimise, assemble. `score_run_grid` does the same three things
+    for many run directories at once with the middle one fanned out; this is
+    the one-directory path, for rescoring a trajectory by hand in a second
+    continuum.
 
-    The work is embarrassingly parallel -- each `score_run` reads and writes
-    only its own run directory, and every candidate is an independent
-    optimisation -- so there is nothing to coordinate. Results are unchanged
-    to within tblite's own run-to-run jitter, which is ~1e-11 eV.
+    Writes `<run_dir>/scored.json`, a human-readable `<run_dir>/scored.log`
+    beside it, the lowest-interaction-energy geometry as
+    `<run_dir>/best.xyz`, and every other deduped candidate as a multi-frame
+    `<run_dir>/scored_candidates.xyz` -- frame i there is
+    `summary["candidates"][i]`, so a structure of interest in the JSON (an odd
+    contact count, a low weight that's still non-negligible) can be pulled
+    back out rather than re-run from scratch.
 
-    `jobs` is a list of keyword dicts, rather than tuples of positional
-    arguments, so this does not have to restate `score_run`'s signature and
-    cannot fall behind it. `scoring` is shared by every job of a sweep and is
-    passed once rather than copied into each.
-
-    Hand the workers the `references` rather than letting each recompute them:
-    they are the same two optimisations for every job in a sweep, so
-    recomputing is both n_jobs times the work and a way for two rows of one
-    table to end up measured against slightly different zeros.
+    All of those are named after `out_name`, so rescoring the same trajectory
+    in a second continuum gives `scored_acetone.json` / `.log` /
+    `scored_acetone_candidates.xyz` rather than appending to one growing file.
     """
-    jobs = list(jobs)
+    meta, records, indices, frames = select_frames(
+        run_dir, scoring.stride, scoring.max_frames)
+    calculator = calculator or meta["calculator"]
+    if references is None:
+        references = reference_energies(
+            meta["solute_path"], meta["solvent_path"], calculator, solvation,
+            calculator_kwargs, scoring.fmax, scoring.opt_steps)
+    relaxed = [relax(frame, calculator, solvation, calculator_kwargs,
+                     scoring.fmax, scoring.opt_steps) for frame in frames]
+    return assemble(run_dir, meta, records, indices, relaxed, references,
+                    solvation, calculator, scoring, out_name)
+
+
+def score_run_grid(jobs, scoring, n_workers=None):
+    """Score many run directories at once, parallel over *candidates*.
+
+    Scoring is the expensive half of a sweep: every candidate is a full
+    geometry optimisation to `fmax = 0.002`, and at the defaults a four-point
+    sweep spends a few minutes on MD and the better part of an hour here.
+
+    The granularity matters as much as the parallelism. Fanning out over run
+    *directories* gives a default sweep twelve tasks (4 n x 3 seeds) on an
+    eighteen-core machine, and they are badly unequal -- n = 0 is a rigid
+    10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
+    start and the tail is one whole run directory long. Measured that way:
+    3.0x on 18 cores. Flattening to one task per candidate gives ~600
+    near-equal tasks instead, which is what the machine can actually balance,
+    and the tail shrinks to a single optimisation. It also scales the right
+    way with the solute, because `max_frames` fixes the task count regardless
+    of system size.
+
+    The two **references go into the same pool**, at the front of the task
+    list, rather than being computed serially in the parent between the two
+    phases: they are ordinary optimisations of the same shape and cost as any
+    candidate. They are computed once per distinct (solute, solvent,
+    calculator, continuum) rather than once per job -- recomputing per job
+    would be n_jobs times the work and a way for two rows of one table to end
+    up measured against slightly different zeros -- and a job that already
+    carries `references` skips them entirely.
+
+    `jobs` is a list of keyword dicts (`run_dir`, `solvation`, and optionally
+    `calculator`, `calculator_kwargs`, `references`, `out_name`) rather than
+    tuples of positional arguments, so this does not restate `score_run`'s
+    signature and cannot fall behind it.
+
+    Like every grid here the pool uses spawn, so a driver script must guard
+    its call with `if __name__ == "__main__":`. See `solvate_md.pool_map`.
+    """
+    jobs = [dict(job) for job in jobs]
     if not jobs:
         return []
-    return pool_map(score_run,
-                    [(job["run_dir"], job["solvation"], scoring,
-                      job.get("calculator"), job.get("calculator_kwargs"),
-                      job.get("references"), job.get("out_name", "scored.json"))
-                     for job in jobs],
-                    n_workers)
+
+    selections = [select_frames(job["run_dir"], scoring.stride,
+                                scoring.max_frames) for job in jobs]
+    for job, (meta, *_) in zip(jobs, selections):
+        job["calculator"] = job.get("calculator") or meta["calculator"]
+
+    def task(atoms, job):
+        return (atoms, job["calculator"], job["solvation"],
+                job.get("calculator_kwargs"), scoring.fmax, scoring.opt_steps)
+
+    # References first, so they are in flight before the candidates rather
+    # than behind them: `assemble` cannot run for any job until its pair
+    # lands.
+    tasks, reference_at = [], {}
+    for job, (meta, *_) in zip(jobs, selections):
+        if job.get("references") is not None:
+            continue
+        key = (meta["solute_path"], meta["solvent_path"], job["calculator"],
+               tuple(job["solvation"] or ()))
+        if key not in reference_at:
+            reference_at[key] = len(tasks)
+            tasks.append(task(align_to_principal_axes(
+                read(meta["solute_path"])), job))
+            tasks.append(task(read(meta["solvent_path"]), job))
+        job["references_at"] = reference_at[key]
+
+    starts = []
+    for job, (_meta, _records, _indices, frames) in zip(jobs, selections):
+        starts.append(len(tasks))
+        tasks += [task(frame, job) for frame in frames]
+
+    results = pool_map(relax, tasks, n_workers)
+
+    summaries = []
+    for job, selection, start in zip(jobs, selections, starts):
+        meta, records, indices, frames = selection
+        references = job.get("references")
+        if references is None:
+            at = job["references_at"]
+            references = (results[at].energy_eV, results[at + 1].energy_eV)
+        summaries.append(assemble(
+            job["run_dir"], meta, records, indices,
+            results[start:start + len(frames)], references, job["solvation"],
+            job["calculator"], scoring, job.get("out_name", "scored.json")))
+    return summaries

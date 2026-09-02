@@ -53,10 +53,11 @@ needs no special handling.
 
 import argparse
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 
-from ensemble import Scoring, reference_energies, score_run_grid
+from ensemble import Scoring, score_run_grid
 from report import format_sweep_report, git_commit, timestamp
 from report import format_table as format_table  # re-export; rendering lives in report
 from solvate_md import Condition, run_job_grid
@@ -102,29 +103,34 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
         for n in n_values
     ]
 
+    start = time.time()
     run_dirs = run_job_grid(conditions, n_seeds=n_seeds, out_root=out_root,
                             n_workers=n_workers)
-
-    # The references depend on the solute, the solvent and the continuum, all
-    # of which are fixed across the sweep -- and each is a full geometry
-    # optimisation, so do them once rather than once per n.
-    solvation = ("alpb", solvent)
-    references = reference_energies(
-        str(solute_path), str(solvent_path), conditions[0].calculator,
-        solvation, None, scoring.fmax, scoring.opt_steps)
+    elapsed_md = time.time() - start
 
     # Across all cores, like the MD grid above and for a stronger reason:
-    # scoring is now the expensive half of a sweep. At the default settings a
-    # 4-point pyrazine/chloroform sweep spends ~7 min in MD spread over every
-    # core and the better part of an hour optimising candidates.
+    # scoring is the expensive half of a sweep. At the default settings a
+    # 4-point pyrazine/chloroform sweep spends a few minutes in MD spread over
+    # every core and the better part of an hour optimising candidates.
     #
     # The run directories come from `run_job_grid` rather than being rebuilt
     # from `<label>_seed<n>` here, so that name is constructed in exactly one
-    # place.
-    jobs = [{"run_dir": run_dir, "solvation": solvation,
-             "references": references}
+    # place. The references are not computed here either: they are two more
+    # optimisations of the same shape as any candidate, so `score_run_grid`
+    # puts them in the same pool.
+    solvation = ("alpb", solvent)
+    jobs = [{"run_dir": run_dir, "solvation": solvation}
             for run_dir in run_dirs]
+    start = time.time()
     summaries = score_run_grid(jobs, scoring, n_workers=n_workers)
+    elapsed_scoring = time.time() - start
+
+    # Both halves, every time, so the next time anyone wonders where a sweep's
+    # hours went the measurement is already on stdout.
+    n_candidates = sum(s["n_frames_scored"] for s in summaries)
+    print(f"MD:      {len(run_dirs)} trajectories in {elapsed_md:.1f} s")
+    print(f"scoring: {n_candidates} candidates + 2 references in "
+          f"{elapsed_scoring:.1f} s")
 
     params = sweep_params(conditions[0], scoring, n_values, n_seeds, label)
     (out_root / "sweep.json").write_text(
