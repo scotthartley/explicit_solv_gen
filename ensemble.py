@@ -167,12 +167,17 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     """Rescore one `run_one_job` output directory in the continuum.
 
     Returns the parsed summary; also writes `<run_dir>/scored.json`, a
-    human-readable `<run_dir>/scored.log` beside it, and the
-    lowest-interaction-energy geometry as `<run_dir>/best.xyz`.
+    human-readable `<run_dir>/scored.log` beside it, the
+    lowest-interaction-energy geometry as `<run_dir>/best.xyz`, and every
+    other deduped candidate as a multi-frame `<run_dir>/scored_candidates.xyz`
+    -- frame i there is `summary["candidates"][i]`, so a structure of
+    interest in the JSON (an odd contact count, a low weight that's still
+    non-negligible) can be pulled back out rather than re-run from scratch.
 
-    The log is named after `out_name`, so rescoring the same trajectory in a
-    second continuum gives `scored_acetone.json` / `scored_acetone.log`
-    rather than appending to one growing file.
+    Both are named after `out_name`, so rescoring the same trajectory in a
+    second continuum gives `scored_acetone.json` / `scored_acetone.log` /
+    `scored_acetone_candidates.xyz` rather than appending to one growing
+    file.
     """
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "metadata.json").read_text())
@@ -225,6 +230,10 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
         ))
         geometries.append(opt_atoms)
 
+    # Keyed by frame rather than zipped positionally: `dedupe` sorts by
+    # energy, so `unique`'s order no longer matches `candidates`'/`geometries`'.
+    # `frame` is the trajectory dump index and unique per candidate.
+    geometry_by_frame = {c.frame: g for c, g in zip(candidates, geometries)}
     unique = dedupe(candidates)
     interactions = [c.interaction_eV for c in unique]
     # Absolute energies over the same candidates. `boltzmann_weights`
@@ -234,6 +243,11 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     absolutes = [c.energy_eV for c in unique]
     best = min(range(len(candidates)), key=lambda i: candidates[i].interaction_eV)
     write(run_dir / "best.xyz", geometries[best])
+    # Same order as summary["candidates"] below, so the two can be zipped by
+    # index. write() to a multi-frame .xyz appends frames in list order, not
+    # dict order, hence building the list from `unique` rather than the dict.
+    write(run_dir / f"{Path(out_name).stem}_candidates.xyz",
+          [geometry_by_frame[c.frame] for c in unique])
 
     summary = {
         "run_dir": str(run_dir),

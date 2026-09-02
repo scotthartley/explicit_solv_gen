@@ -60,6 +60,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | --- | --- | --- |
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
 | `scored.log` | `ensemble.score_run` | provenance, references, per-candidate table, result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
+| `scored_candidates.xyz` | `ensemble.score_run` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `report.txt` | `n_sweep.run_sweep` | params block + the `E_int(n)` table |
 
 `run.log` is flushed on every line, so a long run can be followed with
