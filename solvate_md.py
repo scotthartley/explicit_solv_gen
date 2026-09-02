@@ -719,32 +719,3 @@ def run_job_grid(conditions, n_seeds, out_root, n_workers=None):
             for condition in conditions
             for seed in range(n_seeds)]
     return pool_map(run_one_job, jobs, n_workers)
-
-
-if __name__ == "__main__":
-    examples_dir = Path(__file__).parent / "examples"
-
-    # Smoke test only. Real job lists (e.g. the AAA/BBB x chloroform/acetone
-    # grid, and the n_solvent convergence sweep that justifies whatever
-    # n_solvent it settles on) belong in a project driver script, not here.
-    toy_conditions = [
-        Condition(
-            solute_path=str(examples_dir / "solute_toy.xyz"),
-            solvent_path=str(examples_dir / "water.xyz"),
-            n_solvent=4,
-            solvent="water",
-            calculator="gfn2-xtb",
-            temperature_K=298.0,
-            timestep_fs=0.5,
-            n_equilibrate_steps=200,
-            n_steps=1000,
-            dump_interval=10,
-            label="toy_water",
-        ),
-    ]
-
-    out_root = Path(__file__).parent / "smoke_test_output"
-    results = run_job_grid(toy_conditions, n_seeds=1, out_root=out_root, n_workers=1)
-    print("Smoke test jobs written to:")
-    for r in results:
-        print(f"  {r}")

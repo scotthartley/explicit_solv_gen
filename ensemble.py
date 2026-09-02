@@ -36,13 +36,7 @@ from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read, write
 from ase.optimize import BFGS
 
-from report import (
-    EV_TO_KCAL,
-    boltzmann_weights,
-    ensemble_energy,
-    format_scored_log,
-    wall_stats,
-)
+from report import EV_TO_KCAL, ensemble_energy, format_scored_log, wall_stats
 from solvate_md import (
     _vdw_radii_array,
     align_to_principal_axes,
@@ -50,10 +44,10 @@ from solvate_md import (
     pool_map,
 )
 
-# EV_TO_KCAL and the two Boltzmann helpers live in `report` so that formatting
-# a number, or regenerating a log from JSON, never drags in ASE. They are
-# imported here so callers can keep taking them from `ensemble`, and so the
-# live and the regenerated logs weight identically by construction.
+# EV_TO_KCAL and the Boltzmann helpers live in `report` so that formatting a
+# number, or regenerating a log from JSON, never drags in ASE -- and so the
+# live and the regenerated logs weight identically by construction rather than
+# by comment.
 
 # A solvent molecule counts as touching the solute when some atom pair is
 # within this much of van der Waals contact. Generous on purpose: it is a
@@ -124,18 +118,16 @@ class Candidate:
     # The confinement energy of the *sampling* frame this came from -- the
     # scorer applies no wall. A nonzero value says this geometry was being
     # squeezed by the wall when it was recorded, which is worth seeing beside
-    # the weight it carries. Defaulted and last so that a `scored.json` written
-    # before this existed still loads into `Candidate(**d)`.
-    wall_energy_eV: float = None
+    # the weight it carries.
+    wall_energy_eV: float
     # The same convergence, in xtb's units: ||grad|| over all components, in
     # Eh/bohr, for comparison against `xtb --opt normal`'s 1e-3 threshold.
-    # Defaulted and last for the same backward-compatibility reason.
-    gnorm_Eh_bohr: float = None
+    gnorm_Eh_bohr: float
     # BFGS steps taken. Says whether the hour a sweep spends in the optimiser
     # goes to the tight `fmax` or to BFGS being the wrong optimiser for a
     # floppy cluster -- worth knowing before anyone tries swapping it on the
-    # hexamer. Defaulted and last for the same reason as the two above.
-    n_opt_steps: int = None
+    # hexamer.
+    n_opt_steps: int
 
 
 def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):

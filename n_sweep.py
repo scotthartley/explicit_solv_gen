@@ -59,7 +59,6 @@ from pathlib import Path
 
 from ensemble import Scoring, score_run_grid
 from report import format_sweep_report, git_commit, timestamp
-from report import format_table as format_table  # re-export; rendering lives in report
 from solvate_md import Condition, run_job_grid
 
 

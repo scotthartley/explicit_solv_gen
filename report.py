@@ -136,60 +136,58 @@ def format_run_header(meta, extra=None):
     record (`shell_fill`, `wall_slack`), and is omitted when regenerating.
     """
     extra = dict(extra or {})
-    n_solvent = meta.get("n_solvent", 0)
-    aps = meta.get("atoms_per_solvent")
-    axes = meta.get("shell_semi_axes") or []
-    padding = meta.get("shell_padding")
-    dump = meta.get("dump_interval") or 1
-    n_steps = meta.get("n_steps") or 0
-    dt = meta.get("timestep_fs")
+    n_solvent = meta["n_solvent"]
+    aps = meta["atoms_per_solvent"]
+    axes = meta["shell_semi_axes"]
+    padding = meta["shell_padding"]
+    dump = meta["dump_interval"]
+    n_steps = meta["n_steps"]
+    dt = meta["timestep_fs"]
 
-    parts = [banner(f"Explicit-solvent MD: {meta.get('label', '?')} "
-                    f"(seed {meta.get('seed', '?')})")]
+    parts = [banner(f"Explicit-solvent MD: {meta['label']} "
+                    f"(seed {meta['seed']})")]
 
     parts.append(kv_block("System", {
-        "solute": f"{meta.get('solute_path')}  ({meta.get('n_solute')} atoms)",
-        "solvent": f"{meta.get('solvent_path')}  ({aps} atoms x {n_solvent})",
-        "solvent name": meta.get("solvent"),
-        "total atoms": meta.get("n_atoms"),
+        "solute": f"{meta['solute_path']}  ({meta['n_solute']} atoms)",
+        "solvent": f"{meta['solvent_path']}  ({aps} atoms x {n_solvent})",
+        "solvent name": meta["solvent"],
+        "total atoms": meta["n_atoms"],
     }))
 
     packing = {
-        "solute semi-axes/A": "  ".join(f"{a:.3f}" for a in axes) or None,
-        "shell padding/A": _num(padding, ".3f"),
-        "region semi-axes/A": ("  ".join(f"{a + padding:.3f}" for a in axes)
-                               if axes and padding is not None else None),
-        "packmol tolerance/A": _num(meta.get("tolerance"), ".2f"),
+        "solute semi-axes/A": "  ".join(f"{a:.3f}" for a in axes),
+        "shell padding/A": f"{padding:.3f}",
+        "region semi-axes/A": "  ".join(f"{a + padding:.3f}" for a in axes),
+        "packmol tolerance/A": f"{meta['tolerance']:.2f}",
     }
     if "shell_fill" in extra:
-        packing["shell fill"] = _num(extra["shell_fill"], ".2f")
-    packing["wall distance/A"] = _num(meta.get("wall_distance"), ".3f")
+        packing["shell fill"] = f"{extra['shell_fill']:.2f}"
+    packing["wall distance/A"] = f"{meta['wall_distance']:.3f}"
     if "wall_slack" in extra:
         packing["wall slack"] = f"{extra['wall_slack']:.2f} solvent diameters"
-    packing["wall k/eV A^-2"] = _num(meta.get("wall_k"), ".3f")
+    packing["wall k/eV A^-2"] = f"{meta['wall_k']:.3f}"
     parts.append(kv_block("Packing", packing))
 
     parts.append(kv_block("Sampling Hamiltonian", {
-        "calculator": meta.get("calculator"),
-        "continuum": _solvation_str(meta.get("solvation")),
+        "calculator": meta["calculator"],
+        # None is a real value here -- gas-phase sampling -- not a missing one.
+        "continuum": _solvation_str(meta["solvation"]),
         "wall": "SolventShellWall on solvent atoms only",
     }))
 
     parts.append(kv_block("Pre-MD relaxation (clash relief, fmax 0.5)", {
-        "converged": {True: "yes", False: "no"}.get(meta.get("relax_converged")),
-        "final fmax/eV A^-1": _num(meta.get("relax_final_fmax"), ".4f"),
+        "converged": "yes" if meta["relax_converged"] else "no",
+        "final fmax/eV A^-1": f"{meta['relax_final_fmax']:.4f}",
     }))
 
     parts.append(kv_block("Molecular dynamics", {
         "ensemble": "Langevin NVT, FixCom",
-        "temperature/K": _num(meta.get("temperature_K"), ".1f"),
-        "timestep/fs": _num(dt, ".2f"),
-        "friction": _num(meta.get("friction"), ".4f"),
-        "equilibration": (f"{meta.get('n_equilibrate_steps')} steps"
-                          + (f" ({meta['n_equilibrate_steps'] * dt / 1000:.2f} ps)"
-                             if dt and meta.get("n_equilibrate_steps") else "")),
-        "production": (f"{n_steps} steps"
-                       + (f" ({n_steps * dt / 1000:.2f} ps)" if dt else "")),
+        "temperature/K": f"{meta['temperature_K']:.1f}",
+        "timestep/fs": f"{dt:.2f}",
+        "friction": f"{meta['friction']:.4f}",
+        "equilibration": (f"{meta['n_equilibrate_steps']} steps "
+                          f"({meta['n_equilibrate_steps'] * dt / 1000:.2f} ps)"),
+        "production": f"{n_steps} steps ({n_steps * dt / 1000:.2f} ps)",
         "dump interval": f"{dump} steps ({n_steps // dump} frames expected)",
     }))
 
@@ -357,23 +355,19 @@ def _candidate_table(candidates, temperature_K):
              f"{'weight':>8} {'contacts':>9} {'min gap/A':>10} {'conv':>5} "
              f"{'fmax':>7} {'gnorm':>9} {'steps':>6} {'E_wall/eV':>11}"]
     for c, w in zip(candidates, weights):
-        gap = c.get("min_gap_A")
-        gap_s = "-" if gap is None or gap != gap else f"{gap:.3f}"
-        # Of the *sampling* frame this candidate came from -- the scorer
-        # applies no wall. Blank rather than 0 when the run predates the
-        # records being carried through, so "not known" cannot read as "zero".
-        wall = c.get("wall_energy_eV")
-        wall_s = "" if wall is None else f"{wall:.6f}"
+        # NaN when there is no solvent to measure a gap to, i.e. at n = 0.
+        gap = c["min_gap_A"]
+        gap_s = "-" if gap != gap else f"{gap:.3f}"
         # fmax and gnorm are the same convergence in ASE's and xtb's units:
         # per-atom max force in eV/A, and the norm over all components in
-        # Eh/bohr. Blank rather than 0 for a `scored.json` written before the
-        # gradient norm was recorded.
-        gnorm = c.get("gnorm_Eh_bohr")
-        gnorm_s = "" if gnorm is None else f"{gnorm:.2e}"
+        # Eh/bohr.
+        gnorm_s = f"{c['gnorm_Eh_bohr']:.2e}"
         # Optimiser steps, so a slow sweep can be attributed to the tight fmax
         # or to BFGS before anyone swaps optimisers on a guess.
-        steps = c.get("n_opt_steps")
-        steps_s = "" if steps is None else str(steps)
+        steps_s = str(c["n_opt_steps"])
+        # Of the *sampling* frame this candidate came from -- the scorer
+        # applies no wall.
+        wall_s = f"{c['wall_energy_eV']:.6f}"
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
@@ -385,93 +379,59 @@ def _candidate_table(candidates, temperature_K):
 
 def _sampling_wall_str(summary):
     """One-line summary of the wall during the MD that produced these frames."""
-    wall = summary.get("sampling_wall")
-    if not wall or wall.get("wall_active_fraction") is None:
+    # None only when the run dumped no frames at all, which `wall_stats`
+    # reports rather than guessing at.
+    wall = summary["sampling_wall"]
+    if wall["wall_active_fraction"] is None:
         return None
-    line = (f"active in {100 * wall['wall_active_fraction']:.1f}% of "
+    return (f"active in {100 * wall['wall_active_fraction']:.1f}% of "
             f"{wall['n_frames']} frames "
-            f"(max {wall['max_wall_energy_eV']:.6f} eV)")
-    n_scored_active = summary.get("n_scored_wall_active")
-    if n_scored_active is not None:
-        line += (f"; {n_scored_active} of {summary.get('n_frames_scored')} "
-                 "scored frames affected")
-    return line
+            f"(max {wall['max_wall_energy_eV']:.6f} eV)"
+            f"; {summary['n_scored_wall_active']} of "
+            f"{summary['n_frames_scored']} scored frames affected")
 
 
-def backfill_wall_stats(summary, records):
-    """Fill a scored summary's wall diagnostic from the run's `energies.json`.
-
-    For `scored.json` files written before the scorer recorded any of this.
-    Only ever fills what is missing, so a summary written by the current code
-    re-renders to exactly the log it was first written with -- and
-    `n_scored_wall_active`, which needs to know which frames were scored,
-    stays absent rather than being guessed at from the unique candidates.
-
-    Mutates and returns `summary`. The caller does not write it back:
-    regenerating a log renders text, it does not rewrite results.
-    """
-    if not records:
-        return summary
-    if summary.get("sampling_wall") is None:
-        summary["sampling_wall"] = wall_stats(records)
-    # Trajectory dump i and energies[i] come from the same `record()` closure
-    # in `solvate_md`, and `Candidate.frame` is the true dump index, so the
-    # records index directly.
-    for candidate in summary.get("candidates") or []:
-        frame = candidate.get("frame")
-        if (candidate.get("wall_energy_eV") is None
-                and frame is not None and 0 <= frame < len(records)):
-            candidate["wall_energy_eV"] = float(records[frame]["wall_energy_eV"])
-    return summary
-
-
-def format_scored_log(summary, meta=None):
+def format_scored_log(summary, meta):
     """The scoring section: provenance, references, candidates, result."""
-    n = summary.get("n_solvent", 0)
-    T = summary.get("temperature_K", 298.0)
-    e_solute = summary.get("e_solute_ref_eV")
-    e_solvent = summary.get("e_solvent_ref_eV")
-    candidates = summary.get("candidates") or []
+    n = summary["n_solvent"]
+    T = summary["temperature_K"]
+    e_solute = summary["e_solute_ref_eV"]
+    e_solvent = summary["e_solvent_ref_eV"]
+    candidates = summary["candidates"]
 
-    parts = [banner(f"Continuum rescoring: {summary.get('label', '?')} "
-                    f"(seed {summary.get('seed', '?')})")]
+    parts = [banner(f"Continuum rescoring: {summary['label']} "
+                    f"(seed {summary['seed']})")]
 
-    stride = summary.get("stride")
-    max_frames = summary.get("max_frames")
-    provenance = {
-        "run directory": summary.get("run_dir"),
-        "trajectory": (f"traj.xyz, every {stride}th frame"
-                       if stride else "traj.xyz")
-                      + (f", at most {max_frames}" if max_frames else "")
-                      + f"  ->  {summary.get('n_frames_scored')} scored",
+    max_frames = summary["max_frames"]
+    parts.append(kv_block("Provenance", {
+        "run directory": summary["run_dir"],
+        "trajectory": (f"traj.xyz, every {summary['stride']}th frame"
+                       + (f", at most {max_frames}" if max_frames else "")
+                       + f"  ->  {summary['n_frames_scored']} scored"),
         "sampling Hamiltonian": (
-            f"{summary.get('calculator')}, "
-            f"{_solvation_str(summary.get('sampling_solvation'))}"),
+            f"{summary['calculator']}, "
+            f"{_solvation_str(summary['sampling_solvation'])}"),
         # The frames scored below were drawn from a walled trajectory, so how
         # hard that wall was working qualifies every energy in this file.
         "sampling wall": _sampling_wall_str(summary),
-    }
-    if meta:
-        dt = meta.get("timestep_fs")
-        provenance["sampling MD"] = (
-            f"{meta.get('n_steps')} steps x {dt} fs at "
-            f"{meta.get('temperature_K')} K, dumped every "
-            f"{meta.get('dump_interval')}")
-    parts.append(kv_block("Provenance", provenance))
+        "sampling MD": (f"{meta['n_steps']} steps x {meta['timestep_fs']} fs "
+                        f"at {meta['temperature_K']} K, dumped every "
+                        f"{meta['dump_interval']}"),
+    }))
 
     # `best.xyz` is the geometry relaxed here, so state the surface it was
     # relaxed on: reproducing it in the xtb binary needs the same continuum,
     # and the two codes converge on criteria that are not comparable by eye.
-    solvation = summary.get("scoring_solvation") or []
+    solvation = summary["scoring_solvation"] or []
     alpb = f" --alpb {solvation[1]}" if len(solvation) > 1 and solvation[1] else ""
     parts.append(kv_block("Scoring", {
-        "calculator": summary.get("calculator"),
-        "continuum": _solvation_str(summary.get("scoring_solvation")),
-        "optimiser": (f"BFGS, fmax {summary.get('opt_fmax', '?')} eV/A "
+        "calculator": summary["calculator"],
+        "continuum": _solvation_str(summary["scoring_solvation"]),
+        "optimiser": (f"BFGS, fmax {summary['opt_fmax']} eV/A "
                       "(ASE: largest per-atom force). xtb's"),
         "": ("`--opt normal` instead stops at a gradient norm of 1e-3 Eh/a "
              "-- see"),
-        " ": f"the gnorm column. Max {summary.get('opt_steps', '?')} steps",
+        " ": f"the gnorm column. Max {summary['opt_steps']} steps",
         "reproduce": f"xtb best.xyz --gfn 2{alpb} --sp",
         "  ": ("best.xyz was relaxed WITH the continuum -- omitting "
                + (f"--alpb {solvation[1]}" if alpb else "it")),
@@ -481,13 +441,11 @@ def format_scored_log(summary, meta=None):
                  "continuum contributes ~0 to E_int"),
     }))
 
-    offset = (None if e_solute is None or e_solvent is None
-              else e_solute + n * e_solvent)
+    offset = e_solute + n * e_solvent
     parts.append(kv_block("References (each relaxed in the scoring environment)", {
-        "E(solute)/eV": _num(e_solute, ".6f"),
-        "E(solvent)/eV": _num(e_solvent, ".6f"),
-        "offset/eV": (f"E(solute) + {n} x E(solvent) = {offset:.6f}"
-                      if offset is not None else None),
+        "E(solute)/eV": f"{e_solute:.6f}",
+        "E(solvent)/eV": f"{e_solvent:.6f}",
+        "offset/eV": f"E(solute) + {n} x E(solvent) = {offset:.6f}",
     }))
 
     if candidates:
@@ -495,24 +453,21 @@ def format_scored_log(summary, meta=None):
                      "----------------------------------------\n"
                      + _candidate_table(candidates, T))
 
-    dissolved = summary.get("dissolved_fraction")
-    converged = summary.get("converged_fraction")
     result = {
         "E_int      (Boltzmann)": (
-            f"{_num(summary.get('ensemble_interaction_kcal'), '.2f')} kcal/mol"
+            f"{summary['ensemble_interaction_kcal']:.2f} kcal/mol"
             "     <- the reported number"),
-        "E_int      (minimum)": (
-            f"{_num(summary.get('min_interaction_kcal'), '.2f')} kcal/mol"),
-        "E(cluster) (Boltzmann)": f"{_num(summary.get('ensemble_energy_eV'), '.6f')} eV",
-        "E(cluster) (minimum)": f"{_num(summary.get('min_energy_eV'), '.6f')} eV",
-        "references": (f"E(solute) {_num(e_solute, '.6f')} eV, "
-                       f"{n} x E(solvent) {_num(e_solvent, '.6f')} eV"),
-        "frames scored": (f"{summary.get('n_frames_scored')} "
-                          f"({summary.get('n_unique')} unique, "
-                          f"{_num(None if converged is None else 100 * converged, '.0f')}"
+        "E_int      (minimum)": f"{summary['min_interaction_kcal']:.2f} kcal/mol",
+        "E(cluster) (Boltzmann)": f"{summary['ensemble_energy_eV']:.6f} eV",
+        "E(cluster) (minimum)": f"{summary['min_energy_eV']:.6f} eV",
+        "references": (f"E(solute) {e_solute:.6f} eV, "
+                       f"{n} x E(solvent) {e_solvent:.6f} eV"),
+        "frames scored": (f"{summary['n_frames_scored']} "
+                          f"({summary['n_unique']} unique, "
+                          f"{100 * summary['converged_fraction']:.0f}"
                           "% converged)"),
-        "mean contacts": _num(summary.get("mean_contacts"), ".2f"),
-        "dissolved": (f"{_num(None if dissolved is None else 100 * dissolved, '.0f')}"
+        "mean contacts": f"{summary['mean_contacts']:.2f}",
+        "dissolved": (f"{100 * summary['dissolved_fraction']:.0f}"
                       "% of unique candidates"),
     }
     parts.append(kv_block("Result", result) + f"""
@@ -529,14 +484,13 @@ def format_scored_log(summary, meta=None):
 
     # After the Result block rather than up in Provenance: these are the
     # energies the confinement contaminated.
-    warning = wall_warning((summary.get("sampling_wall")
-                            or {}).get("wall_active_fraction"))
+    warning = wall_warning(summary["sampling_wall"]["wall_active_fraction"])
     if warning:
         parts.append(warning)
     # Same reason, one line up the stack: these are the energies a residual
     # force contaminated.
-    warning = unconverged_warning(summary.get("n_unconverged_unique"),
-                                  summary.get("n_unique"))
+    warning = unconverged_warning(summary["n_unconverged_unique"],
+                                  summary["n_unique"])
     if warning:
         parts.append(warning)
     return "\n\n".join(parts)
@@ -548,44 +502,35 @@ def format_scored_log(summary, meta=None):
 
 def _wall_fraction(summary):
     """Wall-active fraction of the run behind this summary, or None."""
-    return (summary.get("sampling_wall") or {}).get("wall_active_fraction")
+    return summary["sampling_wall"]["wall_active_fraction"]
 
 
-def _leg_name(summary):
-    """What this row is: which solute, scored in which continuum."""
-    solvation = summary.get("scoring_solvation") or [None, None]
-    solvent = (solvation[1] if len(solvation) > 1 else None) or "gas"
-    return f"{summary.get('solute_label') or summary['label']}/{solvent}"
+def _row_order(summary):
+    """Sort key for every per-run table: by n, then by seed."""
+    return summary["n_solvent"], summary["seed"]
 
 
-def format_table(summaries):
+def format_table(params, summaries):
     """E_int vs n, with the dissolution diagnostics and a raw cluster energy.
 
-    One sweep is one solute in one solvent, so the leg is normally a constant
-    and is stated once above the table rather than repeated down a column. The
-    column comes back only when it is actually carrying information -- when
-    summaries from several sweeps have been pooled by hand, which is how a
-    double difference gets assembled now.
+    One sweep is one solute in one solvent, so what is being measured is
+    stated once above the table rather than repeated down a column of
+    identical values. It comes from `params`, which is also why no summary
+    carries a `solute_label` of its own.
     """
-    legs = sorted({_leg_name(s) for s in summaries})
-    one_leg = len(legs) == 1
-
-    lines = [f"leg: {legs[0]}", ""] if one_leg else []
-    leg_head = "" if one_leg else f"{'leg':20s} "
-    lines += [f"{leg_head}{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
-              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
-              f"{'uniq':>5} {'wall':>6}",
-              "-" * (83 if one_leg else 104)]
-    for s in sorted(summaries, key=lambda s: (_leg_name(s), s["n_solvent"],
-                                              s.get("seed", 0))):
+    lines = [f"leg: {params['solute_label']}/{params['solvent']}", "",
+             f"{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
+             f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
+             f"{'uniq':>5} {'wall':>6}",
+             "-" * 83]
+    for s in sorted(summaries, key=_row_order):
         frac = _wall_fraction(s)
         lines.append(
-            ("" if one_leg else f"{_leg_name(s):20s} ")
-            + f"{s['n_solvent']:>3} "
-            f"{s.get('seed', 0):>4} "
+            f"{s['n_solvent']:>3} "
+            f"{s['seed']:>4} "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
-            f"{_num(s.get('ensemble_energy_eV'), '.6f'):>15} "
+            f"{s['ensemble_energy_eV']:>15.6f} "
             f"{s['mean_contacts']:>9.2f} "
             f"{100 * s['dissolved_fraction']:>9.0f}% "
             f"{s['n_unique']:>5} "
@@ -697,21 +642,16 @@ def format_sampling_convergence(summaries):
     if not rows:
         return None
 
-    one_leg = len({_leg_name(s) for s in summaries}) == 1
-    leg_head = "" if one_leg else f"{'leg':20s} "
     lines = ["Sampling convergence", "--------------------",
-             f"{leg_head}{'n':>3} {'seed':>4} {'best found at':>14} "
+             f"{'n':>3} {'seed':>4} {'best found at':>14} "
              f"{'late gain':>10} {'verdict':>16}",
-             "-" * (52 if one_leg else 73)]
+             "-" * 52]
 
-    for s, conv in sorted(rows, key=lambda r: (_leg_name(r[0]),
-                                               r[0]["n_solvent"],
-                                               r[0].get("seed", 0))):
+    for s, conv in sorted(rows, key=lambda r: _row_order(r[0])):
         gain = conv["late_gain_kcal"]
         lines.append(
-            ("" if one_leg else f"{_leg_name(s):20s} ")
-            + f"{s['n_solvent']:>3} "
-            f"{s.get('seed', 0):>4} "
+            f"{s['n_solvent']:>3} "
+            f"{s['seed']:>4} "
             f"{100 * conv['best_at']:>13.0f}% "
             + (f"{'-':>10} " if gain is None else f"{gain:>10.2f} ")
             + f"{'STILL FALLING' if conv['still_improving'] else 'settled':>16}")
@@ -755,7 +695,7 @@ def format_seed_spread(summaries):
     """
     groups = {}
     for s in summaries:
-        groups.setdefault((_leg_name(s), s["n_solvent"]), []).append(s)
+        groups.setdefault(s["n_solvent"], []).append(s)
 
     if not groups:
         return None
@@ -769,20 +709,17 @@ def format_seed_spread(summaries):
             "  subtracting two sweeps from each other -- a double difference is",
             "  four of these numbers, and it inherits the error of all four."])
 
-    one_leg = len({leg for leg, _ in groups}) == 1
-    leg_head = "" if one_leg else f"{'leg':20s} "
-    lines += [f"{leg_head}{'n':>3} {'seeds':>6} {'E_int(ens)':>22} "
+    lines += [f"{'n':>3} {'seeds':>6} {'E_int(ens)':>22} "
               f"{'E_int(min)':>22}",
-              "-" * (56 if one_leg else 77)]
+              "-" * 56]
 
     worst = 0.0
-    for (leg, n), group in sorted(groups.items()):
+    for n, group in sorted(groups.items()):
         ens = [g["ensemble_interaction_kcal"] for g in group]
         mins = [g["min_interaction_kcal"] for g in group]
         worst = max(worst, max(ens) - min(ens), max(mins) - min(mins))
         lines.append(
-            ("" if one_leg else f"{leg:20s} ")
-            + f"{n:>3} {len(group):>6} "
+            f"{n:>3} {len(group):>6} "
             f"{_mean(ens):>10.2f} +/- {(max(ens) - min(ens)) / 2:<7.2f} "
             f"{_mean(mins):>10.2f} +/- {(max(mins) - min(mins)) / 2:<7.2f}")
 
@@ -806,7 +743,7 @@ def format_sweep_report(params, summaries):
     parts.append(kv_block("Parameters", shown))
 
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
-                 + "-" * 58 + "\n" + format_table(summaries))
+                 + "-" * 58 + "\n" + format_table(params, summaries))
 
     for section in (format_sampling_convergence(summaries),
                     format_seed_spread(summaries),
@@ -814,13 +751,10 @@ def format_sweep_report(params, summaries):
         if section:
             parts.append(section)
 
-    zeros = [s for s in summaries if s.get("n_solvent") == 0]
+    zeros = [s for s in summaries if s["n_solvent"] == 0]
     if zeros:
-        one_leg = len({_leg_name(s) for s in summaries}) == 1
-        values = ", ".join(
-            (f"{s['ensemble_interaction_kcal']:.2f}" if one_leg else
-             f"{_leg_name(s)} {s['ensemble_interaction_kcal']:.2f}")
-            for s in sorted(zeros, key=_leg_name))
+        values = ", ".join(f"{s['ensemble_interaction_kcal']:.2f}"
+                           for s in sorted(zeros, key=_row_order))
         parts.append(
             "Self-consistency check\n"
             "----------------------\n"
@@ -843,30 +777,24 @@ def _load(path):
 def render_run_dir(path):
     """Rewrite `run.log`, and a `.log` for every scored summary, from JSON.
 
-    No MD and no calculator: everything comes off disk.
+    No MD and no calculator: everything comes off disk. Both JSON files are
+    required -- `run_one_job` always writes both, and a directory missing one
+    is a broken run rather than an old one.
     """
     path = Path(path)
-    written = []
+    meta = _load(path / "metadata.json")
+    records = _load(path / "energies.json")
 
-    energies_path = path / "energies.json"
-    records = _load(energies_path) if energies_path.exists() else []
-
-    meta_path = path / "metadata.json"
-    if meta_path.exists():
-        meta = _load(meta_path)
-        with RunLogger(path / "run.log", live=False) as log:
-            log.header(meta)
-            for record in records:
-                log.md_row(record)
-            log.footer()
-        written.append(path / "run.log")
-    else:
-        meta = None
+    with RunLogger(path / "run.log", live=False) as log:
+        log.header(meta)
+        for record in records:
+            log.md_row(record)
+        log.footer()
+    written = [path / "run.log"]
 
     for scored in sorted(path.glob("scored*.json")):
         out = scored.with_suffix(".log")
-        summary = backfill_wall_stats(_load(scored), records)
-        out.write_text(format_scored_log(summary, meta))
+        out.write_text(format_scored_log(_load(scored), meta))
         written.append(out)
     return written
 
@@ -879,16 +807,13 @@ def render_sweep_dir(path):
 
     written = []
     for summary in runs:
-        run_dir = path / f"{summary['label']}_seed{summary.get('seed', 0)}"
-        if not run_dir.is_dir():
-            run_dir = Path(summary["run_dir"])
+        # By name under the sweep directory rather than by the absolute path
+        # recorded at write time, so a sweep that has been moved or copied
+        # still re-renders -- but the name itself still comes from the
+        # summary, so it is never rebuilt from `<label>_seed<n>` here.
+        run_dir = path / Path(summary["run_dir"]).name
         if run_dir.is_dir():
             written += render_run_dir(run_dir)
-            # So a sweep run before the scorer recorded any of this still gets
-            # a wall column. In memory only -- `sweep.json` is not rewritten.
-            energies_path = run_dir / "energies.json"
-            if energies_path.exists():
-                backfill_wall_stats(summary, _load(energies_path))
 
     report = path / "report.txt"
     report.write_text(format_sweep_report(params, runs))
