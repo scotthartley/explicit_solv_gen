@@ -33,9 +33,9 @@ and two solvents -- a double difference such as
 module to know that a difference is what you eventually want. What that gives
 up is the guarantee that both halves ran under identical settings, so each
 sweep writes a **params block** into `sweep.json` recording the whole
-`Condition` it ran under plus the git commit -- cheap insurance, given that
-`wall_slack` has already changed meaning once (at c429f8a) without changing
-its name.
+`Condition` it ran under plus the package version and git commit -- cheap
+insurance, given that `wall_slack` has already changed meaning once (at
+c429f8a) without changing its name.
 
 Run one from the command line:
 
@@ -59,7 +59,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ensemble import Scoring, score_run_grid
-from report import format_sweep_report, git_commit, timestamp
+from report import VERSION, format_sweep_report, git_commit, timestamp
 from solvate_md import Condition, run_job_grid
 
 
@@ -155,6 +155,7 @@ def sweep_params(condition, scoring, n_values, n_seeds, label):
         "solute_label": label,
         "n_values": list(n_values),
         "n_seeds": n_seeds,
+        "version": VERSION,
         "git_commit": git_commit(),
         "timestamp": timestamp(),
     })

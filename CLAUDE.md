@@ -56,8 +56,9 @@ script, and imposed a shape real sweeps did not have.
 What that gives up is the guarantee that both halves of a difference ran under
 identical settings, so every sweep now records a **params block**: the whole
 `Condition` (via `asdict`, so new fields are picked up automatically) plus the
-git commit and a timestamp. Given `wall_slack` silently changed meaning at
-`c429f8a`, this is cheap insurance -- check it before subtracting two sweeps.
+package version (`report.VERSION`), the git commit, and a timestamp. Given
+`wall_slack` silently changed meaning at `c429f8a`, this is cheap insurance --
+check it before subtracting two sweeps.
 
 ## Artefacts
 

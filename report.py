@@ -33,6 +33,11 @@ from pathlib import Path
 
 import numpy as np
 
+# Bump on any change to the pipeline's numerics or output shapes -- it lands
+# in every sweep's params block via `n_sweep.sweep_params`, so a report can be
+# matched back to the code that produced it.
+VERSION = "0.1.0"
+
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
 EV_TO_KCAL = 23.060548
