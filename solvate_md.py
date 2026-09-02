@@ -1,8 +1,6 @@
+import single_thread  # noqa: F401  -- must precede numpy; see its docstring
+
 import os
-
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-
 import json
 import multiprocessing
 import subprocess
@@ -127,7 +125,13 @@ class Condition:
     # Much shorter and the "production" run is still equilibrating.
     n_equilibrate_steps: int = 10000
     n_steps: int = 20000
-    dump_interval: int = 10
+    # 100 steps = 50 fs. Sized against how fast the shell actually decorrelates
+    # rather than against the timestep: the solvent-COM autocorrelation in the
+    # solute frame, measured on pyrazine + 3 CHCl3, falls to 1/e in 550 fs, so
+    # dumping every 5 fs recorded the same configuration ~100 times over and
+    # made `energies.json` large for no extra information. Expect this to grow
+    # with the solute -- a hexamer's shell rearranges more slowly still.
+    dump_interval: int = 100
     # Fraction of the packing shell filled by solvent at bulk density. Sets
     # how thick the shell is for a given n_solvent -- see `shell_padding`.
     shell_fill: float = 0.5
@@ -665,7 +669,6 @@ def run_job_grid(conditions, n_seeds, out_root, n_workers=None):
     Without the guard every worker re-runs the whole grid on import, which
     forks recursively until the machine gives out.
     """
-    n_workers = n_workers or os.cpu_count()
     out_root = Path(out_root)
 
     jobs = []
@@ -673,6 +676,15 @@ def run_job_grid(conditions, n_seeds, out_root, n_workers=None):
         for seed in range(n_seeds):
             job_dir = out_root / f"{condition.label}_seed{seed}"
             jobs.append((condition, seed, job_dir))
+
+    if not jobs:
+        return []
+    # Capped at the job count, as in `ensemble.score_run_grid`. A spawn pool
+    # builds every worker up front, and a worker that never receives a job
+    # still pays for an interpreter and a full numpy/ASE/tblite import --
+    # ~100 MB of resident memory each. A 4-point sweep at 3 seeds is 12 jobs
+    # on an 18-core machine, so six of them were pure overhead.
+    n_workers = min(n_workers or os.cpu_count(), len(jobs))
 
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=n_workers) as pool:

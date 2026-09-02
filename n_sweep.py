@@ -56,16 +56,16 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from ensemble import reference_energies, score_run
+from ensemble import reference_energies, score_run_grid
 from report import format_sweep_report, git_commit, timestamp
 from report import format_table as format_table  # re-export; rendering lives in report
 from solvate_md import Condition, run_job_grid
 
 
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
-              n_seeds=1, n_workers=None, calculator="gfn2-xtb",
-              temperature_K=298.0, n_equilibrate_steps=2000, n_steps=6000,
-              dump_interval=20, stride=5, max_frames=20, fmax=0.002,
+              n_seeds=3, n_workers=None, calculator="gfn2-xtb",
+              temperature_K=298.0, n_equilibrate_steps=None, n_steps=None,
+              dump_interval=None, stride=1, max_frames=50, fmax=0.002,
               opt_steps=1000, label=None, condition_kwargs=None):
     """Generate and score one solute in one solvent at every n and seed.
 
@@ -73,6 +73,14 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
     reliably finds contact geometries. Override it with
     `condition_kwargs={"sample_in_continuum": True}`; scoring happens in
     ALPB(`solvent`) either way.
+
+    The three MD-length arguments default to **None, meaning "whatever
+    `Condition` says"**, rather than to numbers of their own. They used to
+    carry literals -- 1 ps of equilibration and 3 ps of production -- which
+    silently shadowed `Condition`'s documented 5 ps and 10 ps for every run
+    started from here, i.e. for every run. Since the params block is built
+    from the `Condition` that actually ran, the override was invisible in
+    `report.txt` too. One default, in one place, is the fix.
 
     Writes `<out_root>/sweep.json` -- `{"params": ..., "runs": [...]}` -- and
     a human-readable `<out_root>/report.txt`, and returns the summaries.
@@ -83,6 +91,17 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
         raise ValueError("n_values is empty; nothing to sweep.")
     label = label or Path(solute_path).stem
     condition_kwargs = dict(condition_kwargs or {})
+    # Only the lengths actually asked for; the rest fall through to
+    # `Condition`. Merged into `condition_kwargs` rather than passed
+    # alongside it so that setting one of these both ways is an override
+    # rather than a duplicate-keyword TypeError.
+    condition_kwargs.update({
+        key: value for key, value in (
+            ("n_equilibrate_steps", n_equilibrate_steps),
+            ("n_steps", n_steps),
+            ("dump_interval", dump_interval),
+        ) if value is not None
+    })
 
     conditions = [
         Condition(
@@ -92,9 +111,6 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
             solvent=solvent,
             calculator=calculator,
             temperature_K=temperature_K,
-            n_equilibrate_steps=n_equilibrate_steps,
-            n_steps=n_steps,
-            dump_interval=dump_interval,
             label=f"{label}_{solvent}_n{n}",
             **condition_kwargs,
         )
@@ -112,24 +128,31 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
         str(solute_path), str(solvent_path), calculator, solvation,
         fmax=fmax, steps=opt_steps)
 
-    summaries = []
-    for condition in conditions:
-        for seed in range(n_seeds):
-            summary = score_run(
-                out_root / f"{condition.label}_seed{seed}",
-                solvation=solvation,
-                calculator=calculator,
-                stride=stride,
-                max_frames=max_frames,
-                fmax=fmax,
-                steps=opt_steps,
-                temperature_K=temperature_K,
-                references=references,
-            )
-            # Names the solute independently of the run label, so a table can
-            # be built without re-parsing "<label>_<solvent>_n<n>".
-            summary["solute_label"] = label
-            summaries.append(summary)
+    # Across all cores, like the MD grid above and for a stronger reason:
+    # scoring is now the expensive half of a sweep. At the default settings a
+    # 4-point pyrazine/chloroform sweep spends ~7 min in MD spread over every
+    # core and ~56 min optimising candidates, so leaving this loop serial made
+    # the whole thing single-threaded in practice.
+    jobs = [
+        {
+            "run_dir": out_root / f"{condition.label}_seed{seed}",
+            "solvation": solvation,
+            "calculator": calculator,
+            "stride": stride,
+            "max_frames": max_frames,
+            "fmax": fmax,
+            "steps": opt_steps,
+            "temperature_K": temperature_K,
+            "references": references,
+        }
+        for condition in conditions
+        for seed in range(n_seeds)
+    ]
+    summaries = score_run_grid(jobs, n_workers=n_workers)
+    for summary in summaries:
+        # Names the solute independently of the run label, so a table can
+        # be built without re-parsing "<label>_<solvent>_n<n>".
+        summary["solute_label"] = label
 
     params = sweep_params(conditions[0], n_values, n_seeds, stride, max_frames,
                           fmax, opt_steps, label)
@@ -165,6 +188,16 @@ def sweep_params(condition, n_values, n_seeds, stride, max_frames, fmax,
     return params
 
 
+def condition_default(name):
+    """A `Condition` field's default, for the CLI to advertise as its own.
+
+    Read off the dataclass rather than restated, so `--steps` and friends
+    cannot drift away from the values `Condition` documents -- which is
+    exactly what had happened.
+    """
+    return Condition.__dataclass_fields__[name].default
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Sweep n for one solute in one solvent.",
@@ -179,25 +212,48 @@ def main(argv=None):
                         required=True, metavar="N",
                         help="explicit solvent counts to sweep, e.g. 0 1 2 3")
     parser.add_argument("--out", required=True, help="output directory")
-    parser.add_argument("--seeds", type=int, default=1,
-                        help="independent MD seeds per n (default: %(default)s)")
+    parser.add_argument("--seeds", type=int, default=3,
+                        help="independent MD seeds per n. Seed-to-seed scatter "
+                             "is the only error bar this pipeline produces, so "
+                             "one seed reports a number with no uncertainty "
+                             "attached; the report says so when it sees one "
+                             "(default: %(default)s)")
     parser.add_argument("--workers", type=int, default=None,
                         help="parallel MD workers (default: all cores)")
     parser.add_argument("--calculator", default="gfn2-xtb",
                         help="default: %(default)s")
-    parser.add_argument("--steps", type=int, default=6000,
-                        help="production MD steps (default: %(default)s)")
-    parser.add_argument("--equilibrate", type=int, default=2000,
-                        help="equilibration steps before recording "
+    parser.add_argument("--steps", type=int,
+                        default=condition_default("n_steps"),
+                        help="production MD steps. At the default 0.5 fs "
+                             "timestep this is 10 ps; the shell's "
+                             "configuration decorrelates in ~0.55 ps on "
+                             "pyrazine + 3 CHCl3, so it buys ~18 independent "
+                             "shell configurations (default: %(default)s)")
+    parser.add_argument("--equilibrate", type=int,
+                        default=condition_default("n_equilibrate_steps"),
+                        help="equilibration steps before recording. The "
+                             "default is 5 ps, ~5 Langevin relaxation times "
+                             "at the default friction (default: %(default)s)")
+    parser.add_argument("--dump-interval", type=int,
+                        default=condition_default("dump_interval"),
+                        help="MD steps between trajectory frames "
                              "(default: %(default)s)")
     parser.add_argument("--temperature", type=float, default=298.0,
                         help="K, for both MD and the Boltzmann weights "
                              "(default: %(default)s)")
-    parser.add_argument("--stride", type=int, default=5,
-                        help="score every Nth dump (default: %(default)s)")
-    parser.add_argument("--max-frames", type=int, default=20,
-                        help="cap on frames scored per run, spread over the "
-                             "whole trajectory (default: %(default)s)")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="score every Nth dump. Redundant with "
+                             "--max-frames whenever that cap bites, which at "
+                             "the defaults it always does, so it is 1 unless "
+                             "you want to score a prefix-thinned trajectory "
+                             "specifically (default: %(default)s)")
+    parser.add_argument("--max-frames", type=int, default=50,
+                        help="cap on frames scored per run, spread evenly over "
+                             "the whole trajectory. This, not --stride, is "
+                             "what sets scoring cost, and it is independent of "
+                             "run length -- a longer trajectory is scored at "
+                             "wider spacing for the same price "
+                             "(default: %(default)s)")
     parser.add_argument("--fmax", type=float, default=0.002,
                         help="scoring optimiser convergence, eV/A per-atom max "
                              "force. xtb's `--opt normal` stops at a gradient "
@@ -220,6 +276,7 @@ def main(argv=None):
         temperature_K=args.temperature,
         n_equilibrate_steps=args.equilibrate,
         n_steps=args.steps,
+        dump_interval=args.dump_interval,
         stride=args.stride,
         max_frames=args.max_frames,
         fmax=args.fmax,

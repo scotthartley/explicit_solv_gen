@@ -33,6 +33,7 @@ argument. That is the entry point -- there is no driver script.
 
 | file | role |
 | --- | --- |
+| `single_thread.py` | pins the numeric stack to one thread per process. Must be imported **before numpy**; see its docstring. |
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimised frames in a continuum. The **scorer**. |
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
@@ -61,7 +62,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
 | `scored.log` | `ensemble.score_run` | provenance, references, per-candidate table, result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.score_run` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
-| `report.txt` | `n_sweep.run_sweep` | params block + the `E_int(n)` table |
+| `report.txt` | `n_sweep.run_sweep` | params block, the `E_int(n)` table, and the sampling diagnostics below |
 
 `run.log` is flushed on every line, so a long run can be followed with
 `tail -f` instead of going silent until it exits. **The footer surfaces the
@@ -163,12 +164,92 @@ Cost on pyrazine + 2 chloroform: 4.5 s vs 1.3 s per candidate, ~90 s vs ~26 s
 per run directory. Negligible at this size; revisit when the hexamer arrives,
 which is why it is a flag and not a constant.
 
+## How much sampling? The defaults are production defaults now
+
+They were not. `run_sweep` carried its own MD-length literals -- 1 ps of
+equilibration, 3 ps of production -- that **shadowed `Condition`'s documented
+5 ps and 10 ps for every run started from the CLI**, i.e. for every run. The
+params block is built from the `Condition` that actually ran, so the override
+did not show up in `report.txt` either. The three length arguments now default
+to `None`, meaning "whatever `Condition` says", and the CLI reads its
+`--steps` / `--equilibrate` / `--dump-interval` defaults off the dataclass via
+`condition_default`, so the two cannot drift apart again.
+
+What sets them, measured rather than assumed:
+
+| quantity | value | why |
+| --- | --- | --- |
+| Langevin relaxation time | 1.02 ps | `friction = 0.01` ASE^-1 is 0.98 ps^-1 |
+| shell decorrelation | **0.55 ps** | solvent-COM autocorrelation (1/e) in the solute frame, pyrazine + 3 CHCl3 |
+| equilibration | 5 ps | ~5 relaxation times. The old 1 ps was **one** |
+| production | 10 ps | ~18 independent shell configurations. The old 3 ps was ~5 |
+| dump interval | 100 steps = 50 fs | 11 dumps per decorrelation time. The old 5 fs recorded each configuration ~100 times |
+| seeds | 3 | see below |
+
+Expect all of these to grow with the solute; re-measure the decorrelation time
+on the hexamer rather than carrying 0.55 ps over.
+
+### Both halves of a sweep are parallel
+
+`run_job_grid` fans the MD out across cores and `score_run_grid` does the same
+for the scoring, because scoring is the expensive half now: at the defaults a
+4-point sweep spends a few minutes on MD and the better part of an hour on
+candidate optimisations. Both use spawn, so the `if __name__ == "__main__":`
+guard below covers both. `run_sweep` computes the references **once, in the
+parent**, and hands them to the workers -- recomputing per job would be
+n_jobs times the work and a way for two rows of one table to end up measured
+against slightly different zeros.
+
+`--stride` and `--max-frames` are not independent: `max_frames` selects by
+`linspace` over the whole trajectory, so **whenever it bites, `stride` does
+nothing at all**. `max_frames` alone sets scoring cost, and that cost is
+independent of run length -- a longer trajectory is scored at wider spacing
+for the same price. So `stride` is 1 and `max_frames` is 50.
+
+### The two diagnostics that say whether the sampling was enough
+
+`E_int(min)` is a running minimum over candidates, so it can only fall. That
+makes *when it last fell* a convergence test, and `report.txt` now runs it:
+
+- **Sampling convergence** -- per run, how far into the trajectory the best
+  candidate was found and what the last 25% took off `E_int(min)`. A minimum
+  found at 100% is an upper bound, not a converged value; a minimum found
+  early and never beaten is evidence the sampling saturated.
+- **Seed spread** -- mean over seeds +/- half the full range, at fixed n.
+  Independent seeds differ only in packing and initial velocities, so anything
+  they disagree about is sampling error rather than chemistry. **This is the
+  only error bar the pipeline produces**, and a single-seed sweep says so in
+  place of the table rather than leaving the absence to read as precision.
+  A double difference is four of these numbers and inherits the error of all
+  four.
+
+Both are computed from the candidate list already in `scored.json`, so
+`python -m report <dir>` backfills them onto anything on disk -- no MD, no
+calculator. Run on the existing pyrazine sweep they immediately separate its
+two failures: n = 3 chcl3 still falling on the final frame, n = 2 chcl3 stuck
+in the basin it started in.
+
 ## Gotchas
 
-- `run_job_grid` uses spawn, so **every script calling it needs an
-  `if __name__ == "__main__":` guard** or workers re-run the grid on import
-  and fork until the machine dies. `n_sweep.main()` is already under one, so
-  the command line above is safe; a hand-written driver is not automatically.
+- Sampling lengths live on `Condition` and **only** on `Condition`. Do not
+  give `run_sweep` or the CLI a literal default for one; that is exactly the
+  shadowing that made every run so far 3 ps when the docs said 10.
+- **`import single_thread` first, above every other import, in any module that
+  imports numpy.** The OpenMP runtime numpy loads reads `OMP_NUM_THREADS`
+  once, when it loads; setting it afterwards is silently ignored. `solvate_md`
+  used to set it at its own module top, which was too late for every caller
+  that reached numpy first -- `ensemble` imports numpy, ASE and `report`
+  before it gets to `solvate_md`, and `n_sweep` imports `ensemble`. Cost was
+  2.5x on anything scoring in the parent process (65.8 s -> 25.8 s on one
+  n = 2 job, with system time going 230 s -> 0.4 s). Spawned workers were
+  never affected: they inherit an environment where the variable is already
+  set, so it lands before *their* numpy import. That asymmetry is the tell if
+  it ever comes back.
+- `run_job_grid` and `score_run_grid` both use spawn, so **every script
+  calling either needs an `if __name__ == "__main__":` guard** or workers
+  re-run the grid on import and fork until the machine dies. `n_sweep.main()`
+  is already under one, so the command line above is safe; a hand-written
+  driver is not automatically. `run_sweep` now spawns twice, once per half.
 - Sampling is **gas phase by default**: `Condition.sample_in_continuum` is
   `False`, and scoring applies the continuum regardless. It was called
   `implicit_solvent` and defaulted to `True` -- the opposite of the documented
@@ -219,9 +300,12 @@ Not yet established:
 - **No real AAA/BBB structures exist anywhere on this machine.** Every hexamer
   number quoted so far is from a spherocylinder/lattice model. These are the
   missing input for both `shell_capacity.py` and a real sweep.
-- The pyrazine sweep is **under-sampled** (one seed, 15 frames, 3 ps). The
-  signature is non-monotonic contact counts -- n = 2 chcl3 had *fewer*
-  contacts than n = 1. Production runs want 3-5 seeds and longer sampling.
+- The pyrazine sweep is **under-sampled** (one seed, 15 frames, 3 ps) and
+  predates the defaults below. The signature is non-monotonic contact counts
+  -- n = 2 chcl3 had *fewer* contacts than n = 1, which the two diagnostics
+  now diagnose as two different failures side by side: n = 3 chcl3 found its
+  minimum on the *last* frame (still falling, late gain -2.20 kcal/mol) while
+  n = 2 found its on frame 2 of 15 and never left that basin.
 - `E_int` **conflates solute-solvent with solvent-solvent** at n >= 2: two
   chloroforms binding each other counts as solvation. Largely cancels in the
   double difference (same solvent, same n, different conformer) but it does

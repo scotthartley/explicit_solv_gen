@@ -23,6 +23,8 @@ Regenerate logs for anything already on disk, without running any MD:
     python -m report pyrazine_sweep_output/
 """
 
+import single_thread  # noqa: F401  -- must precede numpy; see its docstring
+
 import json
 import subprocess
 import time
@@ -101,6 +103,10 @@ def ensemble_energy(energies_eV, temperature_K=298.0):
 
 def _num(value, spec):
     return "-" if value is None else format(value, spec)
+
+
+def _mean(values):
+    return sum(values) / len(values)
 
 
 def _solvation_str(solvation):
@@ -623,6 +629,171 @@ def format_wall_diagnostic(summaries):
     return "\n".join(lines)
 
 
+# A minimum first found in the last quarter of the trajectory, or a
+# last-quarter gain bigger than this, means the run was still turning up new
+# basins when it stopped. 0.25 kcal/mol is far under the ~3 kcal/mol signal
+# this pipeline exists to resolve, and well over the noise a converged
+# optimisation leaves behind.
+LATE_TRAJECTORY_FRACTION = 0.75
+LATE_GAIN_WARN_KCAL = 0.25
+
+
+def sampling_convergence(summary):
+    """Where in the trajectory `E_int(min)` was found, and what arrived late.
+
+    `E_int(min)` is a running minimum over candidates, so it can only ever
+    fall as sampling continues. That makes *when* it last fell a usable
+    convergence test: a minimum found in the middle of a trajectory that then
+    ran on without improving is evidence the sampling saturated, and a
+    minimum found on the last frame is evidence it did not -- the reported
+    number is an upper bound and a longer run would beat it.
+
+    Computed from the candidate list already in `scored.json`, so it costs no
+    MD and no calculator. `dedupe` drops only energy-duplicates, and a
+    duplicate cannot move a running minimum by more than the dedup tolerance,
+    so working from the deduped list is safe.
+
+    Returns None when there is nothing to say: too few candidates to see a
+    trend, or a summary too old to carry frame indices.
+    """
+    candidates = summary.get("candidates") or []
+    if len(candidates) < 4:
+        return None
+    frames = [c.get("frame") for c in candidates]
+    if any(f is None for f in frames):
+        return None
+    last = max(frames)
+    if last <= 0:
+        return None
+
+    cut = LATE_TRAJECTORY_FRACTION * last
+    best = min(candidates, key=lambda c: c["interaction_eV"])
+    early = [c["interaction_eV"] for c in candidates if c["frame"] <= cut]
+    late = [c["interaction_eV"] for c in candidates if c["frame"] > cut]
+    # Undefined rather than zero when the trajectory has no candidates on one
+    # side of the cut: there was nothing there to improve on. Clamped at zero
+    # because the quantity being reported is a *running* minimum, which cannot
+    # rise -- a late quarter that found nothing better improved it by nothing,
+    # and printing how much worse its own best was would only invite reading
+    # the sign backwards.
+    gain = (min(min(late) - min(early), 0.0) * EV_TO_KCAL
+            if early and late else None)
+    return {
+        "best_at": best["frame"] / last,
+        "late_gain_kcal": gain,
+        "still_improving": (best["frame"] > cut
+                            or (gain is not None
+                                and gain < -LATE_GAIN_WARN_KCAL)),
+    }
+
+
+def format_sampling_convergence(summaries):
+    """Per-run: was `E_int(min)` still falling when the trajectory stopped?"""
+    rows = [(s, conv) for s in summaries if (conv := sampling_convergence(s))]
+    if not rows:
+        return None
+
+    one_leg = len({_leg_name(s) for s in summaries}) == 1
+    leg_head = "" if one_leg else f"{'leg':20s} "
+    lines = ["Sampling convergence", "--------------------",
+             f"{leg_head}{'n':>3} {'seed':>4} {'best found at':>14} "
+             f"{'late gain':>10} {'verdict':>16}",
+             "-" * (52 if one_leg else 73)]
+
+    for s, conv in sorted(rows, key=lambda r: (_leg_name(r[0]),
+                                               r[0]["n_solvent"],
+                                               r[0].get("seed", 0))):
+        gain = conv["late_gain_kcal"]
+        lines.append(
+            ("" if one_leg else f"{_leg_name(s):20s} ")
+            + f"{s['n_solvent']:>3} "
+            f"{s.get('seed', 0):>4} "
+            f"{100 * conv['best_at']:>13.0f}% "
+            + (f"{'-':>10} " if gain is None else f"{gain:>10.2f} ")
+            + f"{'STILL FALLING' if conv['still_improving'] else 'settled':>16}")
+
+    lines.append(
+        "\n  'best found at' = how far into the sampling trajectory the "
+        "lowest-E_int\n  candidate was found. 'late gain' = what the final "
+        f"{100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% of the trajectory\n  "
+        "took off E_int(min), in kcal/mol; negative means it was still "
+        "finding\n  better geometries at the end.")
+
+    unsettled = [s for s, conv in rows if conv["still_improving"]]
+    if unsettled:
+        lines.append(
+            "\n" + "\n".join("  " + line for line in (
+                f"** WARNING: {len(unsettled)} of {len(rows)} runs were still "
+                "improving E_int(min)",
+                f"** in the last {100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% "
+                "of their trajectory. Those rows are upper bounds, not",
+                "** converged values, and the amount by which they are wrong "
+                "is unknown --",
+                "** it is bounded below by the late gain, not by it. Raise "
+                "--steps until",
+                "** the minima stop moving, and add seeds: an independent "
+                "trajectory finds",
+                "** a different basin, where a longer one may only sit in the "
+                "same well.",
+            )))
+    return "\n".join(lines)
+
+
+def format_seed_spread(summaries):
+    """Run-to-run scatter of E_int at fixed n -- the only error bar here.
+
+    Independent seeds differ only in their packing and initial velocities, so
+    anything they disagree about is sampling error rather than chemistry.
+    That makes the spread the honest uncertainty on every number in the table
+    above, and it is worth stating loudly that a single-seed sweep has none:
+    an absence of error bars reads as precision unless something says
+    otherwise.
+    """
+    groups = {}
+    for s in summaries:
+        groups.setdefault((_leg_name(s), s["n_solvent"]), []).append(s)
+
+    if not groups:
+        return None
+
+    lines = ["Seed spread", "-----------"]
+    if max(len(g) for g in groups.values()) < 2:
+        return "\n".join(lines + [
+            "  Single seed: no error bar. Every E_int above is one trajectory's",
+            "  answer, and the difference between two such answers at the same n",
+            "  has been measured at whole kcal/mol. Re-run with --seeds 3 before",
+            "  subtracting two sweeps from each other -- a double difference is",
+            "  four of these numbers, and it inherits the error of all four."])
+
+    one_leg = len({leg for leg, _ in groups}) == 1
+    leg_head = "" if one_leg else f"{'leg':20s} "
+    lines += [f"{leg_head}{'n':>3} {'seeds':>6} {'E_int(ens)':>22} "
+              f"{'E_int(min)':>22}",
+              "-" * (56 if one_leg else 77)]
+
+    worst = 0.0
+    for (leg, n), group in sorted(groups.items()):
+        ens = [g["ensemble_interaction_kcal"] for g in group]
+        mins = [g["min_interaction_kcal"] for g in group]
+        worst = max(worst, max(ens) - min(ens), max(mins) - min(mins))
+        lines.append(
+            ("" if one_leg else f"{leg:20s} ")
+            + f"{n:>3} {len(group):>6} "
+            f"{_mean(ens):>10.2f} +/- {(max(ens) - min(ens)) / 2:<7.2f} "
+            f"{_mean(mins):>10.2f} +/- {(max(mins) - min(mins)) / 2:<7.2f}")
+
+    lines.append(
+        "\n  Mean over seeds +/- half the full range, kcal/mol. Half-range "
+        "rather than\n  a standard deviation because three seeds do not "
+        "estimate one, and the\n  quantity that matters is how far apart two "
+        "runs of the same thing can land."
+        f"\n\n  Widest spread in this sweep: {worst:.2f} kcal/mol. Any "
+        "difference you go on\n  to take between sweeps has to clear that, "
+        "and a double difference of four\n  such numbers accumulates it four "
+        "times.")
+    return "\n".join(lines)
+
+
 def format_sweep_report(params, summaries):
     """Params block plus the E_int(n) table."""
     parts = [banner("n-sweep report")]
@@ -633,9 +804,11 @@ def format_sweep_report(params, summaries):
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
                  + "-" * 58 + "\n" + format_table(summaries))
 
-    diagnostic = format_wall_diagnostic(summaries)
-    if diagnostic:
-        parts.append(diagnostic)
+    for section in (format_sampling_convergence(summaries),
+                    format_seed_spread(summaries),
+                    format_wall_diagnostic(summaries)):
+        if section:
+            parts.append(section)
 
     zeros = [s for s in summaries if s.get("n_solvent") == 0]
     if zeros:

@@ -24,7 +24,11 @@ specific interaction, and the interaction energy below is constructed so that
 such a molecule contributes exactly zero.
 """
 
+import single_thread  # noqa: F401  -- must precede numpy; see its docstring
+
 import json
+import multiprocessing
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -292,3 +296,55 @@ def score_run(run_dir, solvation, calculator=None, calculator_kwargs=None,
     (run_dir / (Path(out_name).stem + ".log")).write_text(
         format_scored_log(summary, meta))
     return summary
+
+
+def _score_run_worker(kwargs):
+    return score_run(**kwargs)
+
+
+def score_run_grid(jobs, n_workers=None):
+    """Score many run directories at once, one single-threaded worker each.
+
+    Scoring is the expensive half of a sweep. Each candidate is a full
+    geometry optimisation to `fmax = 0.002`, and there are `max_frames` of
+    them per run directory against a single MD trajectory, so leaving this
+    loop serial made a sweep single-threaded in practice however many cores
+    the MD grid had just used. Measured on a 9-run pyrazine/chloroform sweep,
+    scoring serially took 108.8 s against 35.8 s here, a 3.0x wall-clock win
+    on a job mix dominated by its three largest runs.
+
+    The work is embarrassingly parallel -- each `score_run` reads and writes
+    only its own run directory, and every candidate is an independent
+    optimisation -- so there is nothing to coordinate. Results are unchanged
+    to within tblite's own run-to-run jitter, which is ~1e-11 eV and shows up
+    equally in the references computed serially in the parent.
+
+    `jobs` is a list of keyword dicts for `score_run`, rather than a tuple of
+    positional arguments, so this does not have to restate that signature and
+    cannot fall behind it.
+
+    Hand the workers the `references` rather than letting each recompute them:
+    they are the same two optimisations for every job in a sweep, so
+    recomputing is both n_jobs times the work and a way for two rows of one
+    table to end up measured against slightly different zeros.
+
+    Like `run_job_grid`, the pool uses "spawn", so each worker re-imports the
+    calling module and **a driver script must guard its call** with
+    `if __name__ == "__main__":`. `n_sweep.main()` already is.
+    """
+    jobs = list(jobs)
+    if not jobs:
+        return []
+    n_workers = min(n_workers or os.cpu_count(), len(jobs))
+    # One job, or one worker, in this process: spawning an interpreter to run
+    # a single job costs more than it saves, and an exception arrives with a
+    # useful traceback instead of a pickled one.
+    if n_workers == 1:
+        return [score_run(**job) for job in jobs]
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=n_workers) as pool:
+        # `map` preserves input order, so the summaries come back in the same
+        # order the serial loop produced them and the report tables are
+        # unchanged.
+        return pool.map(_score_run_worker, jobs)
