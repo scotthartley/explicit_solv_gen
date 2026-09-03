@@ -60,6 +60,19 @@ package version (`report.VERSION`), the git commit, and a timestamp. Given
 `wall_slack` silently changed meaning at `c429f8a`, this is cheap insurance --
 check it before subtracting two sweeps.
 
+### Versioning
+
+`report.VERSION` is that package version. **Bump it, in the same commit, on
+any change to the pipeline's numerics or output shapes** -- it is what
+distinguishes two sweeps whose `Condition`s are identical but whose code was
+not, and the bump is manual, so nothing catches a forgotten one. Doc-only and
+refactor-only commits leave it alone.
+
+| version | what changed |
+| --- | --- |
+| 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
+| 0.1.1 | `report.txt` gained the `dE_int` column, so an 0.1.0 report has one fewer column and no increment. The docs' claim that `E_int(n)` plateaus was corrected in the same commit -- see below |
+
 ## Artefacts
 
 Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
