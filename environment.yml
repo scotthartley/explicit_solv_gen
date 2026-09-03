@@ -9,6 +9,7 @@ dependencies:
   - tblite
   - tblite-python
   - numpy
-  - pip
-  - pip:
-      - mace-torch
+  # dftd4 4.2.0 segfaults in get_polarizabilities on this cluster (SIGSEGV
+  # inside libdftd4's OpenMP region, reproducible even single-threaded, with
+  # tblite 0.6.0); pin <4 until upstream fixes it.
+  - dftd4<4
