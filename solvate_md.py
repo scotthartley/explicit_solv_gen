@@ -66,6 +66,122 @@ def _unit_sphere_points(n):
                  np.cos(phi)]
 
 
+def _repel_on_sphere(points, n_iter=500, step=0.05):
+    """Relax points on the unit sphere under mutual Coulomb repulsion.
+
+    `_unit_sphere_points` is a golden spiral, which is an even *covering* but
+    not a maximum-minimum-separation set at the counts that matter here: it
+    puts two points 143 degrees apart rather than antipodal, and three in a
+    band rather than on a great circle. Relaxing them fixes that for every
+    small n at once -- 2/3/4 come out antipodal, equilateral, tetrahedral --
+    without a hardcoded table of special cases.
+
+    The step is taken in the tangent plane and the result renormalised, so a
+    configuration already at equilibrium is a fixed point rather than drifting.
+    """
+    p = np.asarray(points, dtype=float).copy()
+    p /= np.linalg.norm(p, axis=1, keepdims=True)
+    if len(p) < 2:
+        return p
+    for _ in range(n_iter):
+        offsets = p[:, None, :] - p[None, :, :]
+        d2 = np.sum(offsets**2, axis=2)
+        np.fill_diagonal(d2, np.inf)
+        force = np.sum(offsets / d2[:, :, None] ** 1.5, axis=1)
+        force -= np.sum(force * p, axis=1)[:, None] * p  # tangential part only
+        p += step * force / (1.0 + np.linalg.norm(force, axis=1, keepdims=True))
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+    return p
+
+
+def _random_rotation(rng):
+    """A uniformly distributed rotation matrix, from a random unit quaternion.
+
+    Four Gaussians normalised are uniform on the unit 3-sphere, which is
+    exactly Haar measure on SO(3) once read as a quaternion. numpy only --
+    `environment.yml` has no scipy, and this is the whole of what
+    `Rotation.random` would have been used for.
+    """
+    w, x, y, z = rng.normal(size=4)
+    n = (w * w + x * x + y * y + z * z) ** 0.5
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _rotate_toward(d, focus, fraction):
+    """Rotate the unit vector `d` toward `focus` by `fraction` of their angle.
+
+    `fraction = 0` returns `d` and `fraction = 1` returns `focus`, so it
+    interpolates the whole spread-to-clustered range with one parameter.
+    Done as a Rodrigues rotation about the common perpendicular rather than
+    as a normalised linear blend, because the blend is undefined for the
+    antipodal case -- which is not a corner case here but the commonest one,
+    since `n = 2` at `clustering = 0` is exactly two opposed directions.
+    """
+    d = np.asarray(d, dtype=float) / np.linalg.norm(d)
+    focus = np.asarray(focus, dtype=float) / np.linalg.norm(focus)
+    angle = np.arccos(np.clip(float(d @ focus), -1.0, 1.0)) * fraction
+    if angle < 1e-12:
+        return d
+
+    axis = np.cross(d, focus)
+    if np.linalg.norm(axis) < 1e-12:
+        # Antipodal: every plane containing the two is equivalent, so any
+        # perpendicular axis rotates d onto focus just as well.
+        helper = np.array([0.0, 1.0, 0.0]) if abs(d[0]) > 0.9 else np.array([1.0, 0.0, 0.0])
+        axis = np.cross(d, helper)
+    axis /= np.linalg.norm(axis)
+
+    return (d * np.cos(angle)
+            + np.cross(axis, d) * np.sin(angle)
+            + axis * float(axis @ d) * (1.0 - np.cos(angle)))
+
+
+def hemisphere_directions(n, clustering, rng):
+    """`n` unit vectors whose spread is set by `clustering` in [0, 1].
+
+    One direction per solvent molecule; `pack_solvent` turns each into an
+    `over plane` constraint, confining that molecule to the hemisphere around
+    it. What this buys is arrangement diversity for a fixed budget of
+    packings: drawing every molecule independently and uniformly from the
+    shell samples the *degree of clustering* by chance, and at the counts
+    microsolvation uses that chance is poor. On pyrazine + 2 CHCl3, a first
+    shell holds ~13 molecules, so a uniform draw puts one chloroform on each
+    nitrogen about 1.3% of the time -- and once packed, a 5.7 kcal/mol
+    contact does not detach and migrate around the ring within 10 ps of
+    gas-phase Langevin, so the packing is effectively the answer.
+
+    `clustering = 0` spreads the directions as far apart as they go
+    (antipodal, equilateral, tetrahedral at n = 2, 3, 4), `clustering = 1`
+    collapses them all onto one random focus, and in between each is rotated
+    that fraction of the way toward the focus. Stratifying the seeds across
+    this axis covers opposite-faces / perpendicular / same-face deliberately
+    instead of by chance.
+
+    This is emphatically **not** an assumption that the solvent spreads out.
+    The clustered end of the range is how "both molecules on one face,
+    sharing a Cl...Cl contact" gets sampled at all, and that is a real
+    arrangement -- the same solvent-solvent cohesion that gives `E_int(n)` a
+    nonzero asymptotic slope. Only the *whole* set of directions is rigidly
+    rotated by a random rotation, so nothing here assumes an orientation
+    relative to the solute either: no site is named and no chemistry is used.
+
+    The mechanism self-attenuates with n, which is why it needs no cutoff.
+    Two hemispheres are disjoint, three at 120 degrees overlap somewhat, four
+    tetrahedral overlap so heavily that a molecule is barely confined, and by
+    n ~ 8 the constraint is vacuous -- fading out over exactly the range where
+    a random draw stops being the bottleneck, and long before n approaches a
+    monolayer.
+    """
+    base = _repel_on_sphere(_unit_sphere_points(n)) @ _random_rotation(rng).T
+    focus = rng.normal(size=3)
+    return np.array([_rotate_toward(d, focus, clustering) for d in base])
+
+
 def _vdw_volume(atoms):
     """Rough molecular volume from a sum of non-overlapping vdW spheres.
 
@@ -153,6 +269,14 @@ class Condition:
     # here -- gas-phase MD forms the contacts within a few ps from a 2.0 start
     # -- but lower it if you need contact geometries straight out of packing.
     tolerance: float = 2.0
+    # Stratify the solvent arrangement across seeds rather than drawing every
+    # packing from one distribution: seed s constrains each molecule to a
+    # hemisphere, with the hemispheres antipodal at s = 0 and coincident at
+    # s = n_seeds - 1. Does NOT force an even distribution -- the clustered end
+    # of the range is exactly how "both molecules on one face" gets sampled.
+    # See `hemisphere_directions`, and note it self-attenuates: by n ~ 8 a
+    # hemisphere constrains nothing at all.
+    pack_stratified: bool = True
     label: str = "condition"
     calculator_kwargs: dict = field(default_factory=dict)
 
@@ -367,6 +491,11 @@ class Packing:
     padding: float
     wall_distance: float
     atoms_per_solvent: int
+    # The per-molecule hemisphere axes the packing was constrained to, or
+    # None when it was a single unconstrained block. Provenance: the
+    # arrangement is the thing this varies across seeds, so it travels into
+    # metadata.json rather than being recoverable only from the seed.
+    directions: object
 
 
 def pack_solvent(
@@ -379,6 +508,7 @@ def pack_solvent(
     wall_slack,
     tolerance,
     seed,
+    clustering,
 ):
     """Pack n_solvent copies of solvent_path into a shell around the solute.
 
@@ -399,6 +529,15 @@ def pack_solvent(
     Note there is no inner exclusion region: Packmol's `tolerance` already
     keeps solvent off the fixed solute, and it does so following the true
     molecular surface rather than any primitive we could write down.
+
+    `clustering` in [0, 1] stratifies the *arrangement*: each molecule gets
+    its own `structure` block confined to a hemisphere, and the hemispheres
+    range from maximally separated at 0 to coincident at 1 (see
+    `hemisphere_directions` for why a fixed budget of packings covers that
+    axis far better by design than by chance). Pass None -- or any n_solvent
+    below 2, where there is no mutual arrangement to speak of -- for the
+    single unconstrained block, which is byte-for-byte the input file this
+    wrote before stratification existed.
     """
     solute = align_to_principal_axes(read(solute_path))
     solvent_unit = read(solvent_path)
@@ -422,6 +561,14 @@ def pack_solvent(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # At n = 1 packmol already randomises the single molecule's site, and
+    # there is no mutual arrangement for a hemisphere to say anything about.
+    directions = (
+        hemisphere_directions(n_solvent, clustering,
+                              np.random.default_rng(seed + 2_000_000))
+        if clustering is not None and n_solvent >= 2 else None
+    )
+
     if n_solvent == 0:
         # The continuum-only reference point of an n-sweep. Nothing to pack,
         # and packmol rejects `number 0`, so short-circuit.
@@ -433,6 +580,7 @@ def pack_solvent(
             padding=padding,
             wall_distance=wall_distance,
             atoms_per_solvent=len(solvent_unit),
+            directions=directions,
         )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -446,6 +594,27 @@ def pack_solvent(
         # `inside ellipsoid xc yc zc a b c d` constrains atoms to
         # ((x-xc)/a)^2 + ((y-yc)/b)^2 + ((z-zc)/c)^2 <= d^2, so with d = 1 the
         # a/b/c are the semi-axes directly.
+        region_line = (f"  inside ellipsoid 0. 0. 0. {region[0]:.4f} "
+                       f"{region[1]:.4f} {region[2]:.4f} 1.0")
+        if directions is None:
+            solvent_blocks = (f"structure {solvent_xyz}\n"
+                              f"  number {n_solvent}\n"
+                              f"{region_line}\n"
+                              "end structure\n")
+        else:
+            # `over plane a b c d` is a*x + b*y + c*z - d > 0, so d = 0 makes
+            # it the hemisphere around (a, b, c). A hemisphere is a large,
+            # soft region: it never crowds packmol the way an anchor sphere
+            # would, and it needs no radius to tune against an anisotropic
+            # solute.
+            solvent_blocks = "\n".join(
+                f"structure {solvent_xyz}\n"
+                "  number 1\n"
+                f"{region_line}\n"
+                f"  over plane  {d[0]:.6f} {d[1]:.6f} {d[2]:.6f}  0.\n"
+                "end structure\n"
+                for d in directions)
+
         inp_path = tmpdir / "pack.inp"
         inp_text = f"""\
 seed {seed}
@@ -458,11 +627,7 @@ structure {solute_xyz}
   fixed 0. 0. 0. 0. 0. 0.
 end structure
 
-structure {solvent_xyz}
-  number {n_solvent}
-  inside ellipsoid 0. 0. 0. {region[0]:.4f} {region[1]:.4f} {region[2]:.4f} 1.0
-end structure
-"""
+{solvent_blocks}"""
         inp_path.write_text(inp_text)
 
         with open(inp_path) as stdin:
@@ -488,7 +653,11 @@ end structure
         raise RuntimeError(
             "packmol did not converge; the shell is probably too tight. Lower "
             "shell_fill (which thickens the shell) or use fewer solvent "
-            f"molecules.\n{result.stdout}"
+            "molecules. A strongly clustered packing "
+            f"(clustering={clustering}) can also do it, since it asks one "
+            "hemisphere to hold every molecule -- but only once n is above "
+            "roughly half the monolayer capacity, which no microsolvation "
+            f"sweep reaches.\n{result.stdout}"
         )
 
     write(out_path, packed)
@@ -499,10 +668,17 @@ end structure
         padding=padding,
         wall_distance=wall_distance,
         atoms_per_solvent=len(solvent_unit),
+        directions=directions,
     )
 
 
-def run_one_job(condition, seed, out_dir):
+def run_one_job(condition, seed, out_dir, clustering):
+    """One packing plus one trajectory.
+
+    `clustering` is passed rather than derived from `seed`, because the value
+    depends on how many seeds this n got and only `run_job_grid` knows that.
+    None means the unstratified single-block packing.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -516,6 +692,7 @@ def run_one_job(condition, seed, out_dir):
         wall_slack=condition.wall_slack,
         tolerance=condition.tolerance,
         seed=seed,
+        clustering=clustering,
     )
     atoms = packing.atoms
 
@@ -569,6 +746,15 @@ def run_one_job(condition, seed, out_dir):
         "dump_interval": condition.dump_interval,
         "shell_semi_axes": packing.semi_axes.tolist(),
         "shell_padding": packing.padding,
+        # None for an unstratified packing, and for n < 2 where there is no
+        # arrangement to stratify. Recorded because it is the one thing that
+        # deliberately differs between the seeds at a given n.
+        # Reported as None whenever no constraint was actually applied, so
+        # the two fields can never disagree about whether one was.
+        "pack_clustering": (clustering if packing.directions is not None
+                            else None),
+        "pack_directions": (None if packing.directions is None
+                            else packing.directions.tolist()),
         "wall_distance": packing.wall_distance,
         "wall_k": condition.wall_k,
         "relax_converged": relax_converged,
@@ -704,19 +890,41 @@ def pool_map(func, arg_tuples, n_workers=None):
         return pool.starmap(func, arg_tuples, chunksize=1)
 
 
-def run_job_grid(conditions, n_seeds, out_root, n_workers=None):
+def run_job_grid(conditions, seeds_per_condition, out_root, n_workers=None):
     """Run every (condition, seed) pair, one single-threaded worker each.
 
     Returns the run directories in order, which is also the only place their
     names are built -- the scorer takes them from here rather than rebuilding
     `<label>_seed<n>` for itself.
 
+    `seeds_per_condition` is a sequence aligned with `conditions`, not a
+    scalar: the seed budget is spread unevenly across n (see
+    `n_sweep.allocate_seeds`), and a sequence-or-int union would only hide
+    which of the two a caller meant.
+
+    The stratification rule lives here because `clustering` depends on the
+    seed count *at this n* and on nothing else, and nothing further down needs
+    to know how the budget was divided. Seed s of m gets
+    `(s + 0.5) / m` -- three packings give 0.17 / 0.50 / 0.83, i.e.
+    hemispheres subtending roughly 150 / 90 / 30 degrees -- so the seeds cover
+    the spread-to-clustered axis evenly and neither endpoint, which is a
+    degenerate arrangement rather than a representative one, is spent on.
+
     One trajectory is inherently sequential, so the parallelism is over jobs
     and its ceiling is the job count; see `pool_map` for the `__main__` guard
     a caller has to provide.
     """
     out_root = Path(out_root)
-    jobs = [(condition, seed, out_root / f"{condition.label}_seed{seed}")
-            for condition in conditions
-            for seed in range(n_seeds)]
+    jobs = []
+    for condition, n_seeds in zip(conditions, seeds_per_condition, strict=True):
+        for seed in range(n_seeds):
+            # n < 2 has no mutual arrangement, so it stays None and says so
+            # in metadata.json rather than recording a constraint that was
+            # never applied.
+            clustering = ((seed + 0.5) / n_seeds
+                          if condition.pack_stratified and condition.n_solvent >= 2
+                          else None)
+            jobs.append((condition, seed,
+                         out_root / f"{condition.label}_seed{seed}",
+                         clustering))
     return pool_map(run_one_job, jobs, n_workers)

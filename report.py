@@ -28,6 +28,7 @@ import single_thread  # noqa: F401  -- must precede numpy; see its docstring
 import json
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -36,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -126,6 +127,20 @@ def _mean(values):
     return sum(values) / len(values)
 
 
+def _half_range(values):
+    """`mean +/- half-range`, or the mean and a dash when there is only one.
+
+    A single-packing row has no spread to report, and printing `+/- 0.00`
+    for it would read as perfect agreement rather than as no measurement.
+    `allocate_seeds` gives n = 0 exactly one packing, so this is the ordinary
+    case now rather than an edge one.
+    """
+    if len(values) < 2:
+        return f"{_mean(values):>10.2f} {'-':<11}"
+    return (f"{_mean(values):>10.2f} +/- "
+            f"{(max(values) - min(values)) / 2:<7.2f}")
+
+
 def _solvation_str(solvation):
     if not solvation:
         return "gas phase (no continuum)"
@@ -179,6 +194,14 @@ def format_run_header(meta, extra=None):
     }
     if "shell_fill" in extra:
         packing["shell fill"] = f"{extra['shell_fill']:.2f}"
+    if meta["pack_directions"]:
+        packing["arrangement"] = (
+            f"stratified, clustering {meta['pack_clustering']:.2f} "
+            "(0 = spread, 1 = one face)")
+        packing["hemisphere axes"] = "\n".join(
+            "  ".join(f"{x:+.3f}" for x in d) for d in meta["pack_directions"])
+    else:
+        packing["arrangement"] = "unconstrained (one packmol block)"
     packing["wall distance/A"] = f"{meta['wall_distance']:.3f}"
     if "wall_slack" in extra:
         packing["wall slack"] = f"{extra['wall_slack']:.2f} solvent diameters"
@@ -561,17 +584,21 @@ def format_table(params, summaries):
     carries a `solute_label` of its own.
     """
     deltas = _increments(summaries)
-    lines = [f"leg: {params['solute_label']}/{params['solvent']}", "",
-             f"{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
+    capacity = params["monolayer_capacity"]
+    lines = [f"leg: {params['solute_label']}/{params['solvent']}",
+             f"full first shell: ~{capacity:.0f} solvent molecules", "",
+             f"{'n':>3} {'seed':>4} {'cover':>6} {'E_int(ens)':>12} "
+             f"{'E_int(min)':>12} "
              f"{'dE_int':>10} {'E(cluster)/eV':>15} {'contacts':>9} "
              f"{'dissolved':>10} {'uniq':>5} {'wall':>6}",
-             "-" * 95]
+             "-" * 102]
     for s in sorted(summaries, key=_row_order):
         frac = _wall_fraction(s)
         delta = deltas.get((s["n_solvent"], s["seed"]))
         lines.append(
             f"{s['n_solvent']:>3} "
             f"{s['seed']:>4} "
+            f"{100 * s['n_solvent'] / capacity:>5.0f}% "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
             + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
@@ -580,17 +607,24 @@ def format_table(params, summaries):
             f"{100 * s['dissolved_fraction']:>9.0f}% "
             f"{s['n_unique']:>5} "
             + (f"{'-':>6}" if frac is None else f"{100 * frac:>5.0f}%"))
+    pairs = ", ".join(
+        f"n = {n}: {count}"
+        for n, count in sorted(Counter(n for n, _ in deltas).items()))
     lines.append(
-        "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'contacts' = "
-        "solvent\nmolecules touching the solute after optimisation; 'dissolved' "
-        "= fraction of\nunique candidates with no contact at all. 'wall' = "
-        "fraction of the sampling\ntrajectory's frames with a nonzero wall "
-        "energy.\n"
+        "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'cover' = n "
+        "as a\npercentage of a full first-shell monolayer; well under 100% is "
+        "targeted\nmicrosolvation, where every explicit molecule sits at the "
+        "continuum boundary.\n'contacts' = solvent molecules touching the "
+        "solute after optimisation;\n'dissolved' = fraction of unique "
+        "candidates with no contact at all. 'wall' =\nfraction of the sampling "
+        "trajectory's frames with a nonzero wall energy.\n"
         "\ndE_int = E_int(ens) at this n minus E_int(ens) at n - 1, same seed: "
         "what the\nnth molecule was worth. Seeds are independent packings rather "
         "than one\ntrajectory continued, so the seeds at a given n are repeat "
         "estimates of that\nincrement, not a history -- their scatter is the "
-        "error bar on the step.\n"
+        "error bar on the step. It\npairs only over seeds present at *both* n, "
+        "so an n with more packings than\nits predecessor leaves the surplus "
+        f"rows without one ({pairs or 'no pairs'}).\n"
         "\nRead the increment, not the level: E_int(n) does not plateau. "
         "Every added\nmolecule also collects the continuum's per-molecule bias "
         "(measured at ~1\nkcal/mol for chloroform, and of either sign -- see the "
@@ -749,7 +783,7 @@ def format_sampling_convergence(summaries):
     return "\n".join(lines)
 
 
-def format_seed_spread(summaries):
+def format_seed_spread(params, summaries):
     """Run-to-run scatter of E_int at fixed n -- the only error bar here.
 
     Independent seeds differ only in their packing and initial velocities, so
@@ -758,6 +792,14 @@ def format_seed_spread(summaries):
     above, and it is worth stating loudly that a single-seed sweep has none:
     an absence of error bars reads as precision unless something says
     otherwise.
+
+    Under stratified packing the seeds at one n are no longer draws from one
+    distribution -- they are deliberately different arrangements -- so the
+    spread mixes sampling noise with designed differences and reads as a
+    conservative upper bound on the error rather than as an estimate of it.
+    That is said in the text, not corrected for: the alternative is many more
+    packings per arrangement, which is the compute this reallocation exists
+    to avoid spending.
     """
     groups = {}
     for s in summaries:
@@ -783,21 +825,34 @@ def format_seed_spread(summaries):
     for n, group in sorted(groups.items()):
         ens = [g["ensemble_interaction_kcal"] for g in group]
         mins = [g["min_interaction_kcal"] for g in group]
-        worst = max(worst, max(ens) - min(ens), max(mins) - min(mins))
+        if len(group) > 1:
+            worst = max(worst, max(ens) - min(ens), max(mins) - min(mins))
         lines.append(
-            f"{n:>3} {len(group):>6} "
-            f"{_mean(ens):>10.2f} +/- {(max(ens) - min(ens)) / 2:<7.2f} "
-            f"{_mean(mins):>10.2f} +/- {(max(mins) - min(mins)) / 2:<7.2f}")
+            f"{n:>3} {len(group):>6} {_half_range(ens)} "
+            f"{_half_range(mins)}".rstrip())
 
     lines.append(
         "\n  Mean over seeds +/- half the full range, kcal/mol. Half-range "
         "rather than\n  a standard deviation because three seeds do not "
         "estimate one, and the\n  quantity that matters is how far apart two "
-        "runs of the same thing can land."
+        "runs of the same thing can land.\n  A row of one packing gets no "
+        "spread at all, and prints '-' rather than a\n  zero that would read "
+        "as agreement."
         f"\n\n  Widest spread in this sweep: {worst:.2f} kcal/mol. Any "
         "difference you go on\n  to take between sweeps has to clear that, "
         "and a double difference of four\n  such numbers accumulates it four "
         "times.")
+
+    if params["pack_stratified"]:
+        lines.append(
+            "\n  Packing was stratified across the seeds at each n (see the "
+            "params block),\n  so these seeds are not repeat draws from one "
+            "distribution: they are\n  deliberately different solvent "
+            "arrangements, spread and clustered. The\n  spread above "
+            "therefore mixes sampling noise with designed differences "
+            "between\n  packings, which makes it a conservative upper bound "
+            "on the error rather than\n  a clean estimate of it. A difference "
+            "still has to clear it.")
     return "\n".join(lines)
 
 
@@ -812,7 +867,7 @@ def format_sweep_report(params, summaries):
                  + "-" * 58 + "\n" + format_table(params, summaries))
 
     for section in (format_sampling_convergence(summaries),
-                    format_seed_spread(summaries),
+                    format_seed_spread(params, summaries),
                     format_wall_diagnostic(summaries)):
         if section:
             parts.append(section)

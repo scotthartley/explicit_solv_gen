@@ -66,6 +66,17 @@ sweep writes a **params block** into `sweep.json` recording the whole
 insurance, given that `wall_slack` has already changed meaning once (at
 c429f8a) without changing its name.
 
+At small n the packing *is* the answer -- a chloroform bound to a pyrazine
+nitrogen does not detach, migrate around the ring and rebind at the far one
+within 10 ps of Langevin -- and packmol's unconstrained draw is badly biased
+toward putting the molecules together (measured: 83% same-face at n = 2 on
+pyrazine/chloroform, 4% opposed). So the seeds at each n are not repeats:
+`solvate_md.run_job_grid` stratifies them over the degree of clustering, and
+`allocate_seeds` below spreads a fixed total of packings over n by monolayer
+coverage rather than giving each n the same number. `--seeds` is the
+*average* per n, and the seed spread is correspondingly a conservative upper
+bound on the error rather than a clean estimate of it.
+
 Run one from the command line:
 
     python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
@@ -81,15 +92,27 @@ The `main()` below is under such a guard already, so the command line above
 needs no special handling.
 """
 
+import single_thread  # noqa: F401  -- must precede numpy; see its docstring
+
 import argparse
 import json
 import time
 from dataclasses import asdict
 from pathlib import Path
 
+from ase.io import read
+
 from ensemble import Scoring, score_run_grid
 from report import VERSION, format_sweep_report, git_commit, timestamp
+from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
+
+# Every n >= 1 keeps at least this many packings, because the seed spread is
+# the only error bar the pipeline produces and a row without one reads as
+# precision. When the budget cannot pay for it everywhere, the allocation
+# falls back to uniform rather than quietly stripping the error bar off some
+# rows.
+MIN_SEEDS_PER_N = 2
 
 
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
@@ -109,6 +132,12 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
     reliably finds contact geometries. Override it with
     `condition_kwargs={"sample_in_continuum": True}`; scoring happens in
     ALPB(`solvent`) either way.
+
+    `n_seeds` is the *average* number of packings per n, not the number at
+    each: the total `n_seeds * len(n_values)` is spread by
+    `allocate_seeds`, which spends less of it on n = 0 (nothing to arrange)
+    and on the n closest to a full monolayer (least room to arrange it
+    differently).
 
     Writes `<out_root>/sweep.json` -- `{"params": ..., "runs": [...]}` -- and
     a human-readable `<out_root>/report.txt`, and returns the summaries.
@@ -132,9 +161,18 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
         for n in n_values
     ]
 
+    # Once per sweep, not once per job: the capacity depends only on the
+    # solute and the solvent, both of which are fixed for a sweep by
+    # construction. It sets the budget split below and the `cover` column in
+    # the report.
+    _, _, capacity = monolayer_capacity(read(solute_path), solvent)
+    seeds_per_n = allocate_seeds(n_values, n_seeds, capacity)
+
     start = time.time()
-    run_dirs = run_job_grid(conditions, n_seeds=n_seeds, out_root=out_root,
-                            n_workers=n_workers)
+    run_dirs = run_job_grid(conditions,
+                            seeds_per_condition=[seeds_per_n[n]
+                                                 for n in n_values],
+                            out_root=out_root, n_workers=n_workers)
     elapsed_md = time.time() - start
 
     # Across all cores, like the MD grid above and for a stronger reason:
@@ -161,7 +199,8 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
     print(f"scoring: {n_candidates} candidates + 2 references in "
           f"{elapsed_scoring:.1f} s")
 
-    params = sweep_params(conditions[0], scoring, n_values, n_seeds, label)
+    params = sweep_params(conditions[0], scoring, n_values, n_seeds, label,
+                          capacity, [seeds_per_n[n] for n in n_values])
     (out_root / "sweep.json").write_text(
         json.dumps({"params": params, "runs": summaries}, indent=2))
     (out_root / "report.txt").write_text(
@@ -169,7 +208,54 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
     return summaries
 
 
-def sweep_params(condition, scoring, n_values, n_seeds, label):
+def allocate_seeds(n_values, n_seeds, capacity):
+    """Spread a fixed packing budget over n, unevenly, by how much room to arrange.
+
+    The budget is `n_seeds * len(n_values)` -- the same compute a uniform
+    `n_seeds` everywhere would have cost -- and the point is that the seeds
+    are not all worth the same. At n = 0 there is no solvent to arrange, so
+    every packing is the same packing and one is enough. At n close to a
+    monolayer there is little freedom in where the molecules go, so the seeds
+    differ mostly in velocities. The room to arrange, and therefore the value
+    of another packing, is largest at small nonzero n -- which is exactly
+    where the arrangement problem bites: on pyrazine + 2 CHCl3, one
+    chloroform on each nitrogen is 1.3% of uniform draws.
+
+    So n = 0 takes one, and the rest are weighted by `1 - n/capacity` and
+    handed out by largest remainder over a floor of `MIN_SEEDS_PER_N`. If the
+    budget cannot meet that floor -- notably `--seeds 1` -- the split is
+    abandoned rather than fudged, and every n gets `n_seeds`, so a
+    single-seed sweep still reports no error bar and says so.
+
+    Returns `{n: packings}`.
+    """
+    n_values = list(n_values)
+    arranged = [n for n in n_values if n >= 1]
+    # n = 0 is one packing of a bare solute; the rest of its share is better
+    # spent where there is something to arrange.
+    budget = n_seeds * len(n_values) - (len(n_values) - len(arranged))
+    if not arranged or budget < MIN_SEEDS_PER_N * len(arranged):
+        return {n: n_seeds for n in n_values}
+
+    weights = [1.0 - min(n / capacity, 1.0) for n in arranged]
+    if sum(weights) <= 0.0:  # every n at or past a monolayer: nothing to prefer
+        weights = [1.0] * len(arranged)
+
+    extra = budget - MIN_SEEDS_PER_N * len(arranged)
+    shares = [w / sum(weights) * extra for w in weights]
+    counts = [MIN_SEEDS_PER_N + int(s) for s in shares]
+    # Largest remainder, so the total is exactly the budget rather than
+    # whatever rounding leaves.
+    order = sorted(range(len(shares)), key=lambda i: int(shares[i]) - shares[i])
+    for i in order[:extra - sum(int(s) for s in shares)]:
+        counts[i] += 1
+
+    allocation = dict(zip(arranged, counts))
+    return {n: allocation.get(n, 1) for n in n_values}
+
+
+def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
+                 seeds_per_n):
     """Everything needed to reproduce the sweep, recorded with its results.
 
     Built from `asdict` of the real `Condition` and `Scoring` rather than
@@ -184,6 +270,13 @@ def sweep_params(condition, scoring, n_values, n_seeds, label):
         "solute_label": label,
         "n_values": list(n_values),
         "n_seeds": n_seeds,
+        # Molecules in a complete first shell, from `shell_capacity`. The
+        # report turns it into the `cover` column, which is what says whether
+        # a row is targeted microsolvation or a real shell.
+        "monolayer_capacity": capacity,
+        # Aligned with `n_values`: the budget was spread, so `n_seeds` alone
+        # no longer says how many packings any given row had.
+        "seeds_per_n": list(seeds_per_n),
         "version": VERSION,
         "git_commit": git_commit(),
         "timestamp": timestamp(),
@@ -216,11 +309,13 @@ def main(argv=None):
                         help="explicit solvent counts to sweep, e.g. 0 1 2 3")
     parser.add_argument("--out", required=True, help="output directory")
     parser.add_argument("--seeds", type=int, default=3,
-                        help="independent MD seeds per n. Seed-to-seed scatter "
-                             "is the only error bar this pipeline produces, so "
-                             "one seed reports a number with no uncertainty "
-                             "attached; the report says so when it sees one "
-                             "(default: %(default)s)")
+                        help="*average* independent packings per n: the total, "
+                             "N x len(--n), is spread by monolayer coverage, so "
+                             "n = 0 gets one and small nonzero n get more than "
+                             "N. Seed-to-seed scatter is the only error bar "
+                             "this pipeline produces, so one seed reports a "
+                             "number with no uncertainty attached; the report "
+                             "says so when it sees one (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=None,
                         help="parallel workers, for both halves "
                              "(default: all cores)")

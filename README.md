@@ -156,17 +156,21 @@ python -m report path/to/sweep_or_run_dir/
 E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 ----------------------------------------------------------
 leg: pyrazine/chcl3
+full first shell: ~13 solvent molecules
 
-  n seed   E_int(ens)   E_int(min)     dE_int   E(cluster)/eV  contacts  dissolved  uniq   wall
------------------------------------------------------------------------------------------------
-  0    0         0.02        -0.01          -     -446.914347      0.00       100%     3     5%
-  1    0        -5.59        -5.93      -5.61     -890.403421      0.92         8%    12     4%
-  2    0        -6.62        -7.00      -1.03    -1333.694375      0.58        50%    12     5%
-  3    0       -12.47       -12.77      -5.85    -1777.194312      1.79         0%    14     4%
+  n seed  cover   E_int(ens)   E_int(min)     dE_int   E(cluster)/eV  contacts  dissolved  uniq   wall
+------------------------------------------------------------------------------------------------------
+  0    0     0%         0.02        -0.01          -     -446.914347      0.00       100%     3     5%
+  1    0    15%        -5.59        -5.93      -5.61     -890.403421      0.92         8%    12     4%
+  2    0    23%        -6.62        -7.00      -1.03    -1333.694375      0.58        50%    12     5%
+  3    0    31%       -12.47       -12.77      -5.85    -1777.194312      1.79         0%    14     4%
 ```
 
-`E_int` is in kcal/mol and absolute energies in eV (ASE's native unit); the
-mix is deliberate. `E_int(ens)` is Boltzmann-averaged over the unique minima,
+`cover` is `n` as a percentage of a full first-shell monolayer — well under
+100% is targeted microsolvation, the regime where every explicit molecule sits
+at the continuum boundary. `E_int` is in kcal/mol and absolute energies in eV
+(ASE's native unit); the mix is deliberate.
+`E_int(ens)` is Boltzmann-averaged over the unique minima,
 `E_int(min)` is the lowest, and `dE_int` is the per-molecule increment against
 the same seed at `n − 1` — the column to read for convergence, per the section
 above. (This particular sweep is one seed, 15 frames and 3 ps, all well under
@@ -175,6 +179,43 @@ do not settle because the sampling never did.) `E(cluster)` is shown beside
 them to give the large numbers the small differences came from — it is *not*
 comparable across rows of different `n`, which is precisely what `E_int` is
 for.
+
+## Packing: the seeds are stratified, not repeated
+
+At small `n` the packing *is* the answer. A chloroform hydrogen-bonded to a
+pyrazine nitrogen at ~5.7 kcal/mol will not detach, migrate around the ring
+and rebind at the far nitrogen within 10 ps of gas-phase Langevin — so if the
+packing did not put one molecule at each nitrogen, the trajectory will not
+find that geometry. And packmol's unconstrained draw is badly biased toward
+putting them together: measured on pyrazine + 2 CHCl3 over 24 packings, 83%
+came out same-face and only 4% opposed.
+
+So the seeds are not repeats. Each one constrains every solvent molecule to
+its own hemisphere of the shell, and the hemispheres are spread across the
+seeds — maximally separated for the first, coincident for the last, rotated
+by a random rotation so no orientation relative to the solute is assumed. A
+fixed budget of packings then covers opposite-faces / perpendicular /
+same-face **by design** rather than by chance: opposed arrangements go from 4%
+to 29%, which over the four packings `n = 2` gets is a ~70% chance of at least
+one, against ~15% before.
+
+This is *not* an assumption that the solvent spreads out. The clustered end of
+the range is exactly how "both molecules on one face, sharing a Cl···Cl
+contact" gets sampled at all — a real arrangement, and the same solvent–solvent
+cohesion that gives `E_int(n)` its nonzero slope. The mechanism also fades on
+its own as `n` grows: two hemispheres are disjoint, four tetrahedral ones
+overlap so heavily a molecule is barely confined, and by `n ≈ 8` the
+constraint says nothing — which is the range over which random packing stops
+being the bottleneck anyway.
+
+`--seeds` is therefore the **average** number of packings per `n`, not the
+count at each. The total, `--seeds × len(--n)`, is spread by monolayer
+coverage: `n = 0` has no solvent to arrange and takes one, and the rest are
+weighted toward small nonzero `n` where the room to arrange is largest, with a
+floor of two so every row keeps an error bar. With `--seeds 3 --n 0 1 2 3` and
+a 13-molecule shell that is 1 / 4 / 4 / 3 rather than 3 / 3 / 3 / 3 — the same
+compute, better spent. `--seeds 1` falls back to one everywhere, so a
+single-seed sweep still reports no error bar and says so.
 
 ## The three diagnostics
 
@@ -202,7 +243,11 @@ velocities, so anything they disagree about is sampling error rather than
 chemistry. This is the **only error bar the pipeline produces**, and a
 single-seed sweep says so in place of the table rather than leaving the
 absence to read as precision. A difference between two sweeps has to clear
-that spread; a double difference of four inherits it four times.
+that spread; a double difference of four inherits it four times. Since the
+packings are now stratified, the seeds at one `n` are deliberately different
+arrangements as well as different draws, so the spread mixes sampling noise
+with designed differences — read it as a conservative upper bound on the
+error rather than as a clean estimate of it. The report says so.
 
 ## Choosing `n`
 
@@ -269,6 +314,11 @@ behind every default and a list of gotchas worth reading before changing one.
   that imports numpy. The OpenMP runtime reads `OMP_NUM_THREADS` once, when it
   loads; setting it afterwards is silently ignored, and getting this wrong
   cost 2.5× on in-process scoring.
+- Stratified packing changes the packing for **every `n ≥ 2` run**, so sweeps
+  from either side of it are not comparable. The `version` (`0.2.0`) and
+  `pack_stratified` fields in the params block are what distinguish them, and
+  `metadata.json` records the `pack_clustering` and `pack_directions` each run
+  was drawn at.
 - Packmol's `tolerance` (default 2.0 Å) forbids hydrogen-bond contacts at
   *t* = 0, since H···O/N sit at 1.8–2.0 Å. Harmless — gas-phase MD forms them
   within a few ps — but a packed structure never starts bonded.

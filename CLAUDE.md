@@ -72,6 +72,7 @@ refactor-only commits leave it alone.
 | --- | --- |
 | 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
 | 0.1.1 | `report.txt` gained the `dE_int` column, so an 0.1.0 report has one fewer column and no increment. The docs' claim that `E_int(n)` plateaus was corrected in the same commit -- see below |
+| 0.2.0 | stratified packing: the arrangement of the solvent now varies by design across the seeds at each n, and the seed budget is spread unevenly over n. Changes the packing for **every n >= 2 run**, so sweeps either side of it are not comparable. `report.txt` gained a `cover` column and `metadata.json` two fields |
 
 ## Artefacts
 
@@ -84,6 +85,14 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `report.txt` | `n_sweep.run_sweep` | params block, the `E_int(n)` table, and the sampling diagnostics below |
+
+`metadata.json` also carries `pack_clustering` and `pack_directions` -- the
+stratification parameter this packing was drawn at and the per-molecule
+hemisphere axes it was constrained to, both `null` for an unstratified
+packing and for `n < 2`. They are the one thing that deliberately differs
+between the seeds at a given n, so they travel with the run rather than being
+recoverable only by re-deriving them from the seed. `run.log`'s Packing block
+prints both.
 
 `run.log` is flushed on every line, so a long run can be followed with
 `tail -f` instead of going silent until it exits. **The footer surfaces the
@@ -108,7 +117,10 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
 (Anything scored before `n_opt_steps` and the mandatory wall fields no longer
 re-renders, since the readers no longer default a missing field. Rescore it
-rather than re-reporting it.)
+rather than re-reporting it. The same now applies to the 0.2.0 packing fields:
+a `metadata.json` without `pack_directions`, or a `sweep.json` params block
+without `monolayer_capacity`, raises rather than rendering a report that
+silently omits a column.)
 
 `E_int` stays the reported number, because it alone is comparable across n.
 `E(cluster)` is now shown beside it everywhere: within a run the two differ
@@ -258,11 +270,125 @@ What sets them, measured rather than assumed:
 | equilibration | 5 ps | ~5 relaxation times. The old 1 ps was **one** |
 | production | 10 ps | ~18 independent shell configurations. The old 3 ps was ~5 |
 | dump interval | 100 steps = 50 fs | 11 dumps per decorrelation time. The old 5 fs recorded each configuration ~100 times |
-| seeds | 3 | see below |
+| seeds | 3 | now the *average* per n, not the count at each: the total is `--seeds x len(--n)` and `allocate_seeds` spends it by coverage. See below |
 
 Expect all of these to grow with the solute. Re-measure the decorrelation time
 on your own system rather than carrying 0.55 ps over -- it is the one number
 here that is a property of the system rather than of the integrator.
+
+### Stratified packing: spend the seed budget on arrangement diversity
+
+At n = 2 on pyrazine/chloroform the lowest geometry is almost certainly one
+chloroform H-bonded to each nitrogen. The sweep finds it easily at n = 3 and
+n = 4 and *not* at n = 2, and `report.txt` correctly said STILL FALLING.
+
+The cause was the packing, not the MD. `pack_solvent` wrote one packmol block
+for all n molecules, so every molecule was placed independently, and nothing
+downstream rescues a bad draw: a CHCl3 bound to N at ~5.7 kcal/mol does not
+detach, migrate around the ring and rebind at the far N within 10 ps of
+gas-phase Langevin. **At n = 2 the starting geometry effectively is the
+answer.** Brute force cannot fix it either -- `shell_capacity.py` puts
+pyrazine's solvent-centre surface at 457 A^2, a full first shell at ~13
+molecules, so n = 2 is 15% of a monolayer, n = 3 is 23%, n = 4 is 31%. Read as
+13 sites, a random packing occupies both N sites 1.3% of the time at n = 2,
+3.8% at n = 3, 7.7% at n = 4: ~176 packings for 90% confidence at n = 2. (Note
+this also says the n = 3/4 successes are combinatorial rather than a coverage
+effect -- at 31% of a monolayer nothing is forcing an even distribution
+there.)
+
+So stop drawing every seed from one distribution and stratify them over the
+**degree of clustering** instead. `hemisphere_directions(n, c, rng)` returns n
+unit vectors, and `pack_solvent` emits one `structure` block per molecule --
+same ellipsoid, plus `over plane dx dy dz 0.`, i.e. the hemisphere around that
+vector. `c = 0` puts the directions as far apart as they go (antipodal,
+equilateral, tetrahedral at n = 2/3/4, from a Coulomb relaxation rather than a
+table -- the golden spiral is not a max-min-separation set at tiny n), `c = 1`
+collapses them all onto one random focus, and in between each is rotated that
+fraction of the way toward it. The whole set is rigidly rotated by a random
+rotation first, so no orientation relative to the solute is assumed; no site
+is named and no chemistry is used. `run_job_grid` sets
+`c = (seed + 0.5) / n_seeds_at_this_n`, so three packings give 0.17 / 0.50 /
+0.83, and applies it only for `n_solvent >= 2` (at n = 1 there is no mutual
+arrangement, and packmol already randomises the single site).
+
+**This is not an assumption that the solvent spreads out.** The clustered end
+is exactly how "both molecules on one face, sharing a Cl...Cl contact" gets
+sampled -- a live arrangement at n = 2, and the same solvent-solvent cohesion
+blamed above for `E_int`'s nonzero slope.
+
+**It self-attenuates, which is why there is no coverage cutoff.** Two
+hemispheres are disjoint (maximally restrictive, exactly where it is needed);
+three at 120 deg overlap somewhat; four tetrahedral overlap so heavily a
+molecule is barely confined; by n ~ 8 the constraint is vacuous. The fade
+covers n = 2..6, the range where the problem is observed to disappear, and it
+happens long before any solute approaches a monolayer.
+
+Measured on pyrazine + 2 CHCl3, 24 packings per column, as the dot product
+between the two solvent centroid directions -- so `opposed` is roughly the
+both-nitrogens arrangement and `same face` its opposite:
+
+| packing | mean dot | opposed (< -0.5) | same face (> +0.5) |
+| --- | --- | --- | --- |
+| unstratified | +0.64 | **4%** | 83% |
+| c = 0.00 | -0.13 | **29%** | 21% |
+| c = 0.17 | -0.09 | 29% | 8% |
+| c = 0.50 | -0.12 | 21% | 8% |
+| c = 0.83 | +0.10 | 12% | 17% |
+| c = 1.00 | +0.19 | 8% | 38% |
+
+Two things to read off it. First, **packmol's unstratified draw is far more
+biased than the 13-site estimate above** -- 83% same-face against a 1.3%
+site-combinatoric prediction for the opposed one -- so the n = 2 failure is
+sharper than the combinatorics alone suggest, and the stratification is
+correspondingly more valuable: opposed goes 4% -> 29%, and with the 4 packings
+n = 2 now gets, the chance of at least one opposed packing goes from ~15% to
+~70%. Second, **a hemisphere is soft and the gradient across `c` is gentler
+than the idealised description** -- `c = 0` gives 29% opposed, not ~100%,
+because a molecule may sit right against the dividing plane and point almost
+anywhere from the solute centre. The constraint itself is satisfied every time
+(the centroid's projection on its own axis is positive in every packing); it
+is just a weaker statement than "on that face". Softness was the point -- it
+never crowds packmol and needs no radius tuned against an anisotropic solute
+-- but do not read `c` as a hard placement.
+
+#### The seed budget is spread over n, not shared equally
+
+The seeds are not all worth the same. At n = 0 there is no solvent to arrange,
+so every packing is the same packing. Near a monolayer there is little freedom
+in where the molecules go. The room to arrange, and so the value of another
+packing, is largest at small nonzero n -- which is where the problem is. So
+`n_sweep.allocate_seeds` spends a **fixed total** of `n_seeds * len(n_values)`
+unevenly: n = 0 takes 1, the rest are weighted by `1 - min(n/capacity, 1)` and
+handed out by largest remainder over a floor of 2 packings, so every n >= 1
+keeps an error bar. Capacity comes from `shell_capacity.monolayer_capacity`,
+computed once per sweep, and lands in the params block as
+`monolayer_capacity` alongside `seeds_per_n`.
+
+    capacity 13, budget 3 x 4 = 12
+      n=0 -> 1   (was 3)      n=2 -> 4   (was 3)
+      n=1 -> 4   (was 3)      n=3 -> 3   (was 3)
+
+Same compute, better spent. When the budget cannot meet the floor of 2 --
+notably `--seeds 1` -- the split is abandoned rather than fudged and every n
+gets `n_seeds`, so a single-seed sweep still reports no error bar and says so.
+`--seeds` is therefore the *average* packings per n now, not the count at
+each. Both report sections that assume seeds degrade gracefully:
+`format_seed_spread` groups by n, and the `dE_int` pairing uses
+`by_key.get((n-1, seed))` so it simply yields fewer pairs -- `report.txt`
+prints how many each n got.
+
+**The seed spread is now a conservative upper bound, not a clean error bar.**
+Independent seeds used to differ only in packing and velocities; they now
+differ by design as well, so the spread mixes sampling noise with deliberate
+arrangement differences. `report.txt` says so under Seed spread rather than
+correcting for it -- the correction is more packings per arrangement, which is
+the compute this reallocation exists to avoid spending. A difference still has
+to clear it.
+
+`report.txt` also gained a **`cover` column**, `n / monolayer_capacity` as a
+percent, which is what says whether a row is targeted microsolvation or a real
+shell. It is read from `params` with no default, so a pre-0.2.0 sweep no
+longer re-renders.
 
 ### Both halves of a sweep are parallel, and scoring is parallel per candidate
 
@@ -381,6 +507,17 @@ in the basin it was packed into).
   `implicit_solvent` and defaulted to `True` -- the opposite of the documented
   design -- until this commit, and the `metadata.json` key changed with it, so
   older run directories carry `implicit_solvent` instead.
+- `run_job_grid` takes `seeds_per_condition`, a sequence aligned with
+  `conditions`, not an `n_seeds` scalar -- the budget is spread unevenly over
+  n, and an int-or-sequence union would only hide which a caller meant. It is
+  also where the stratification rule lives, because `c` depends on the seed
+  count at that n and nothing else needs to know it. `run_one_job` and
+  `pack_solvent` take `clustering` as a required argument, with no default,
+  the same as every other packing parameter.
+- The packing RNG is `np.random.default_rng(seed + 2_000_000)` -- a third
+  independent stream alongside the initial velocities (`seed`) and the
+  thermostat (`seed + 1_000_000`), and independent of packmol's own `seed`
+  line, which still varies placement *within* the constraints.
 - Packmol's `tolerance` (default 2.0) forbids hydrogen-bond contacts at t = 0
   (H...O/N sit at 1.8-2.0 A). Harmless here -- gas MD forms them within a few
   ps -- but it means a packed structure never starts bonded.
@@ -438,7 +575,12 @@ Known limitations:
 - `n_solvent` is a real choice, not a default to accept. Run
   `shell_capacity.py` first: a count well under a monolayer is targeted
   microsolvation, and that is the regime where *every* explicit molecule sits
-  at the continuum boundary.
+  at the continuum boundary. The sweep now prints the same fraction as the
+  `cover` column, so a sweep says which regime each of its rows is in.
+- Stratified packing improves the odds of the right arrangement; it does not
+  guarantee it. At n = 2 the measured chance of at least one opposed packing
+  in the 4 the reallocation buys is ~70%, not 100%. A run that still says
+  STILL FALLING at small n is asking for more packings, not more steps.
 - MACE-OFF23 as a generator is **untested** here. It needs a model download,
   and it cannot share a process with tblite (see the file boundary above).
 - GFN2 likely **over-binds** the C-H...N contact -- 1.91 A is short against a
