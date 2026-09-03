@@ -129,6 +129,10 @@ Binding of one solvent molecule, GFN2-xTB, gas -> ALPB (kcal/mol):
 | pyrazine...HCCl3 in ALPB(chcl3) | -5.7 | **-6.6** | -0.9 |
 | pyrazine...acetone in ALPB(acetone) | -2.1 | **-3.5** | -1.3 |
 
+The `bias` column is not a curiosity: it is the per-molecule drift that stops
+`E_int(n)` from plateauing, so it is worth measuring on a new solvent before
+reading a sweep in it.
+
 **Water-in-water is pathological; it is not the general case.** ALPB(water)
 reproduces a water's full hydration free energy, so a departing water loses
 nothing and dissociation is downhill. The weaker continua *stabilize* the
@@ -159,8 +163,51 @@ so a dissolved shell lands back on the n = 0 answer. That is what makes
 dissolution a usable *null result* rather than a failure mode: if solvent
 drifts away, there was no specific interaction to capture.
 
-Departure from `E_int(0)` is exactly "what the continuum was missing"; the
-plateau in n is where enough explicit solvent has been added.
+Departure from `E_int(0)` is exactly "what the continuum was missing".
+
+### It does not plateau, so read the increment
+
+The docs claimed a plateau in n and that was wrong. The reference
+`E(solvent)` is one solvent molecule relaxed in the same continuum --
+approximately a molecule of bulk liquid -- so the intent was that moving a
+molecule from bulk into a bulk-like site in the shell costs nothing, leaving
+only the specific sites able to move `E_int`. That cancellation is not clean.
+Two terms survive it, both roughly linear in n, neither switching off once the
+specific sites are filled:
+
+- **the continuum's per-molecule bias** -- the `bias` column of the binding
+  table above. -0.9 kcal/mol for pyrazine...HCCl3, +6.2 for a water in
+  ALPB(water): not fixed in sign, and a property of the solvent/continuum
+  pair rather than of the chemistry being measured;
+- **solvent-solvent cohesion** from n = 2 on, already in Known limitations
+  below, since what `E_int` subtracts is *isolated* solvent molecules.
+
+Add that `E_int` is a potential energy, with no entropic penalty for
+condensing a molecule out of the continuum, and that `E_int(min)` is a running
+minimum over a configuration space that grows with n, and the curve tends to a
+line of nonzero slope rather than to a flat.
+
+So `report.txt` carries a **`dE_int` column** -- `E_int(ens)` at this n minus
+`E_int(ens)` at n - 1, paired within a seed. Paired within a seed rather than
+across the seed mean so that the seeds at one n read as repeat estimates of
+one increment and the scatter is visible; it is not a history, since seed 0 at
+n = 2 is an independent packing rather than seed 0 at n = 1 with a molecule
+added. Convergence is the increment settling to a **constant**, not to zero,
+and a step counts only if it clears the seed spread.
+
+The quantity that does plateau is a **difference at fixed n** between two legs
+-- two conformers, two tautomers, bound and free, one solute in two solvents.
+Both legs carry n molecules in comparable environments, so the bias and the
+cohesion largely cancel. That is also the quantity a cluster-continuum study
+reports, which is the other reason one sweep is one leg. `mean_contacts` and
+`dissolved_fraction` are the remaining honest convergence indicators: the
+monolayer capacity bounds them, so they saturate where `E_int` cannot.
+
+A solute-free background leg, `E(n solvent) - n E(solvent)` in the same
+continuum, would isolate the bias-plus-cohesion drift directly. Considered and
+deliberately not built: the geometries are not comparable to the solvated
+ones, and a difference between two real legs already cancels the same terms
+without a second sweep to maintain.
 
 Every term has to be relaxed *to convergence*, not merely to a stationary-ish
 geometry. The scoring optimizer therefore runs to `fmax = 0.002` eV/A
@@ -370,9 +417,11 @@ the two diagnostics were written to catch, and did.
 Known limitations:
 
 - `E_int` **conflates solute-solvent with solvent-solvent** at n >= 2: two
-  chloroforms binding each other counts as solvation. It largely cancels in a
-  difference taken at the same solvent and the same n, but it does contaminate
-  reading convergence in n directly.
+  chloroforms binding each other counts as solvation. With the continuum's
+  per-molecule bias this is why `E_int(n)` has a nonzero asymptotic slope and
+  cannot be read for a plateau -- see the `dE_int` discussion above. Both
+  terms largely cancel in a difference taken at the same solvent and the same
+  n, which is the form to report.
 - `n_solvent` is a real choice, not a default to accept. Run
   `shell_capacity.py` first: a count well under a monolayer is targeted
   microsolvation, and that is the regime where *every* explicit molecule sits

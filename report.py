@@ -36,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -531,6 +531,27 @@ def _row_order(summary):
     return summary["n_solvent"], summary["seed"]
 
 
+def _increments(summaries):
+    """`dE_int(n) = E_int(n) - E_int(n-1)` at fixed seed, keyed by (n, seed).
+
+    The increment is the readable quantity in an n-sweep, because the level
+    is not: see the note under the table for why `E_int(n)` tends to a line
+    rather than to a plateau.
+
+    Paired within a seed rather than across the seed mean, so that the seeds
+    at one n show up as repeat estimates of the same increment and the
+    scatter is on the page. The pairing is not a history -- seed 0 at n = 2
+    is not seed 0 at n = 1 with a molecule added, it is an independent
+    packing -- which is exactly why the spread across seeds is the error bar
+    on the step.
+    """
+    by_key = {(s["n_solvent"], s["seed"]): s["ensemble_interaction_kcal"]
+              for s in summaries}
+    return {(n, seed): value - previous
+            for (n, seed), value in by_key.items()
+            if (previous := by_key.get((n - 1, seed))) is not None}
+
+
 def format_table(params, summaries):
     """E_int vs n, with the dissolution diagnostics and a raw cluster energy.
 
@@ -539,19 +560,22 @@ def format_table(params, summaries):
     identical values. It comes from `params`, which is also why no summary
     carries a `solute_label` of its own.
     """
+    deltas = _increments(summaries)
     lines = [f"leg: {params['solute_label']}/{params['solvent']}", "",
              f"{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
-             f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
-             f"{'uniq':>5} {'wall':>6}",
-             "-" * 83]
+             f"{'dE_int':>10} {'E(cluster)/eV':>15} {'contacts':>9} "
+             f"{'dissolved':>10} {'uniq':>5} {'wall':>6}",
+             "-" * 95]
     for s in sorted(summaries, key=_row_order):
         frac = _wall_fraction(s)
+        delta = deltas.get((s["n_solvent"], s["seed"]))
         lines.append(
             f"{s['n_solvent']:>3} "
             f"{s['seed']:>4} "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
-            f"{s['ensemble_energy_eV']:>15.6f} "
+            + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
+            + f"{s['ensemble_energy_eV']:>15.6f} "
             f"{s['mean_contacts']:>9.2f} "
             f"{100 * s['dissolved_fraction']:>9.0f}% "
             f"{s['n_unique']:>5} "
@@ -562,6 +586,27 @@ def format_table(params, summaries):
         "= fraction of\nunique candidates with no contact at all. 'wall' = "
         "fraction of the sampling\ntrajectory's frames with a nonzero wall "
         "energy.\n"
+        "\ndE_int = E_int(ens) at this n minus E_int(ens) at n - 1, same seed: "
+        "what the\nnth molecule was worth. Seeds are independent packings rather "
+        "than one\ntrajectory continued, so the seeds at a given n are repeat "
+        "estimates of that\nincrement, not a history -- their scatter is the "
+        "error bar on the step.\n"
+        "\nRead the increment, not the level: E_int(n) does not plateau. "
+        "Every added\nmolecule also collects the continuum's per-molecule bias "
+        "(measured at ~1\nkcal/mol for chloroform, and of either sign -- see the "
+        "binding table in the\ndocs) and, from n = 2 on, solvent-solvent "
+        "cohesion, and neither term switches\noff once the specific sites are "
+        "filled. So the curve tends to a line with a\nnonzero slope, not to a "
+        "flat. Convergence is dE_int settling to a *constant*:\nthe specific "
+        "interaction is exhausted and each further molecule is only being\n"
+        "condensed out of the continuum into a bulk-like site. A step is real "
+        "only if\nit clears the seed spread below.\n"
+        "\nWhat does plateau is a difference taken at fixed n between two legs "
+        "-- two\nconformers, two tautomers, bound and free, one solute in two "
+        "solvents. Both\nlegs carry n molecules in comparable environments, so "
+        "the bias and the cohesion\nlargely cancel and what is left is the "
+        "specific interaction. Judge 'how much\nexplicit solvent is enough' on "
+        "that difference, not on one leg's E_int(n).\n"
         "\nE(cluster) is Boltzmann-averaged over the same weights as E_int, and is "
         "here\nto sanity-check the magnitudes it came from. It is NOT comparable "
         "across rows\nof different n -- successive rows differ by a whole solvent "

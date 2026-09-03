@@ -24,10 +24,8 @@ The usual objection is that `n` is arbitrary. It does not have to be:
     E_int(n) = E(solute + n solvent) − E(solute) − n·E(solvent)
 
 with every term relaxed in the same continuum. `E_int(0)` is zero by
-construction. If explicit solvent is capturing something the continuum cannot,
-`E_int` departs from zero and then plateaus — the departure is exactly *what
-the continuum was missing*, and the plateau is the answer to "how much is
-enough". If it never departs, the continuum was already sufficient.
+construction, and a departure from it is exactly *what the continuum was
+missing*. If it never departs, the continuum was already sufficient.
 
 Two properties make this work. `E_int` is comparable across `n`, because whole
 solvent molecules are subtracted off. And a solvent molecule that optimizes
@@ -35,6 +33,45 @@ away into the continuum contributes ≈ 0, so a run whose shell dissolves lands
 back on the `n = 0` answer rather than on an arbitrary offset. "The shell
 dissolved" and "there was no explicit shell" agree, which makes dissolution a
 usable null result instead of a failure mode.
+
+### `E_int(n)` does not plateau — read the increment
+
+The obvious objection to the paragraph above is that `E_int` should just keep
+falling as you add molecules, and it does. The reference `E(solvent)` is one
+solvent molecule relaxed in the same continuum — approximately a molecule of
+bulk liquid — so the intent was that moving a molecule from bulk into a
+bulk-like site in the shell costs nothing, leaving only the specific sites
+able to move `E_int`. That cancellation is not clean. Two terms survive it,
+both roughly linear in `n`, and neither switches off once the specific sites
+are filled:
+
+- **the continuum's per-molecule bias** — the difference between binding one
+  solvent molecule in the gas phase and binding it in the continuum. Measured
+  on this repo's examples at GFN2: −0.9 kcal/mol for pyrazine···HCCl₃ in
+  ALPB(chcl3), and +6.2 for a water in ALPB(water). Not even fixed in sign,
+  and worth measuring on your own system;
+- **solvent–solvent cohesion** from `n = 2` on, which `E_int` scores as
+  solvation, because what it subtracts is *isolated* solvent molecules.
+
+Add that `E_int` is a potential energy — no entropic penalty for condensing
+molecules out of the continuum — and that `E_int(min)` is a running minimum
+over a configuration space that grows with `n`, and the curve tends to a line
+of nonzero slope rather than to a flat.
+
+So read the **increment**, `dE_int(n) = E_int(n) − E_int(n−1)`, which
+`report.txt` prints as a column. Convergence is the increment settling to a
+*constant* — the specific interaction exhausted, every further molecule merely
+condensed into a bulk-like site — not to zero, and a step counts only if it
+clears the seed spread.
+
+Better still, judge "how much is enough" on a **difference at fixed `n`**
+between two legs: two conformers, two tautomers, bound and free, one solute in
+two solvents. Both legs carry `n` molecules in comparable environments, so the
+bias and the cohesion largely cancel and what is left does plateau. That is
+also the quantity a cluster–continuum study reports in the first place, which
+is why one sweep is one leg. `contacts` and `dissolved` are the other honest
+convergence indicators — the monolayer capacity bounds them, so they saturate
+where `E_int` cannot.
 
 ## Install
 
@@ -118,19 +155,26 @@ python -m report path/to/sweep_or_run_dir/
 ```
 E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 ----------------------------------------------------------
-leg                    n   E_int(ens)   E_int(min)   E(cluster)/eV  contacts  dissolved  uniq
---------------------------------------------------------------------------------------------
-pyrazine/chcl3         0         0.02        -0.01     -446.914347      0.00       100%     3
-pyrazine/chcl3         1        -5.59        -5.93     -890.403421      0.92         8%    12
-pyrazine/chcl3         2        -6.62        -7.00    -1333.694375      0.58        50%    12
-pyrazine/chcl3         3       -12.47       -12.77    -1777.194312      1.79         0%    14
+leg: pyrazine/chcl3
+
+  n seed   E_int(ens)   E_int(min)     dE_int   E(cluster)/eV  contacts  dissolved  uniq   wall
+-----------------------------------------------------------------------------------------------
+  0    0         0.02        -0.01          -     -446.914347      0.00       100%     3     5%
+  1    0        -5.59        -5.93      -5.61     -890.403421      0.92         8%    12     4%
+  2    0        -6.62        -7.00      -1.03    -1333.694375      0.58        50%    12     5%
+  3    0       -12.47       -12.77      -5.85    -1777.194312      1.79         0%    14     4%
 ```
 
 `E_int` is in kcal/mol and absolute energies in eV (ASE's native unit); the
 mix is deliberate. `E_int(ens)` is Boltzmann-averaged over the unique minima,
-`E_int(min)` is the lowest. `E(cluster)` is shown beside them to give the
-large numbers the small differences came from — it is *not* comparable across
-rows of different `n`, which is precisely what `E_int` is for.
+`E_int(min)` is the lowest, and `dE_int` is the per-molecule increment against
+the same seed at `n − 1` — the column to read for convergence, per the section
+above. (This particular sweep is one seed, 15 frames and 3 ps, all well under
+the current defaults, so its increments are dominated by sampling noise: they
+do not settle because the sampling never did.) `E(cluster)` is shown beside
+them to give the large numbers the small differences came from — it is *not*
+comparable across rows of different `n`, which is precisely what `E_int` is
+for.
 
 ## The three diagnostics
 
@@ -247,9 +291,12 @@ behind every default and a list of gotchas worth reading before changing one.
 ## Limitations
 
 - `E_int` **conflates solute–solvent with solvent–solvent** at `n ≥ 2`: two
-  solvent molecules binding each other counts as solvation. It largely cancels
-  in a difference taken at the same solvent and the same `n`, but it does
-  contaminate reading convergence in `n` directly.
+  solvent molecules binding each other counts as solvation. Together with the
+  continuum's per-molecule bias this is why `E_int(n)` has a nonzero
+  asymptotic slope and cannot be read for a plateau — see
+  [`E_int(n)` does not plateau](#e_intn-does-not-plateau--read-the-increment).
+  Both terms largely cancel in a difference taken at the same solvent and the
+  same `n`, which is the form to report.
 - Semi-empirical Hamiltonians can over-bind close contacts, so absolute
   magnitudes may be too strong even where signs and orderings are robust.
   Check your interaction against a higher level of theory before quoting a

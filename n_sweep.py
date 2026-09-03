@@ -7,11 +7,9 @@ preference: compute the interaction energy
     E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 
 with every term relaxed in the same continuum, and look at how it moves with
-n. E_int(0) is zero by construction. If explicit solvent is capturing
-something ALPB cannot, E_int departs from zero and then plateaus; the plateau
-is the answer and the departure is exactly "what the continuum was missing".
-If it never departs, the continuum was already sufficient and the explicit
-shell is not what your model is missing.
+n. E_int(0) is zero by construction, and a departure from it is exactly "what
+the continuum was missing". If it never departs, the continuum was already
+sufficient and the explicit shell is not what your model is missing.
 
 Two properties of E_int make this work. It is comparable across n, because
 whole solvent molecules are subtracted off. And a solvent molecule that
@@ -19,6 +17,37 @@ optimises away into the continuum contributes ~0 to it, so a run where the
 shell dissolves lands back on the n = 0 answer rather than on some arbitrary
 offset -- "the shell dissolved" and "there was no explicit shell" agree, which
 is what makes dissolution a usable null result rather than a failure mode.
+
+**E_int(n) does not plateau**, and this docstring claimed for a long time that
+it did. The reference E(solvent) is one solvent molecule relaxed in the same
+continuum -- approximately a molecule of bulk liquid -- so the intent was that
+moving a molecule from bulk into a bulk-like site in the shell costs nothing,
+leaving only the specific sites able to move E_int. That cancellation is not
+clean. Two terms survive it, both roughly linear in n, neither of which
+switches off once the specific sites are filled:
+
+  - the continuum's per-molecule bias, which is what the gas -> ALPB binding
+    table in the docs measures: -0.9 kcal/mol for pyrazine...HCCl3, and +6.2
+    for a water in ALPB(water), so not even fixed in sign; and
+  - solvent-solvent cohesion from n = 2 on, which E_int scores as solvation
+    because what it subtracts is isolated solvent molecules.
+
+Add that E_int is a potential energy, with no entropic penalty for condensing
+molecules out of the continuum, and that E_int(min) is a running minimum over
+a configuration space that grows with n, and the curve tends to a line of
+nonzero slope rather than to a flat.
+
+Read the *increment* instead, dE_int(n) = E_int(n) - E_int(n-1), which
+`report.txt` prints as a column. Convergence is the increment settling to a
+constant -- the specific interaction exhausted, every further molecule merely
+being condensed into a bulk-like site -- rather than to zero, and a step
+counts only if it clears the seed spread. Better, judge "how much is enough"
+on a difference at fixed n between two legs (two conformers, bound and free,
+one solute in two solvents): both legs carry n molecules in comparable
+environments, so the bias and the cohesion largely cancel and what is left
+does plateau. `mean_contacts` and `dissolved_fraction` are the other honest
+convergence indicators, because the monolayer capacity bounds them and so
+they saturate where E_int cannot.
 
 Sampling is gas-phase by default and scoring is in the continuum: see the
 module docstring of `ensemble.py` for why those are separated. Sampling is
