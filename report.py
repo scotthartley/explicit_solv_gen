@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -619,11 +619,15 @@ def pool_by_n(summaries):
 
     pooled = []
     for n, group in sorted(groups.items()):
-        candidates = [c for s in group for c in s["candidates"]]
-        keep = [candidates[i] for i in
-                dedupe_energies([c["energy_eV"] for c in candidates])]
-        interactions = [c["interaction_eV"] for c in keep]
-        absolutes = [c["energy_eV"] for c in keep]
+        # Deterministic ties: `dedupe_energies` sorts by energy before
+        # keeping anything, so this ordering never changes which candidates
+        # survive -- only which packing gets the credit when several tie.
+        group = sorted(group, key=_row_order)
+        tagged = [(s, c) for s in group for c in s["candidates"]]
+        keep = [tagged[i] for i in
+                dedupe_energies([c["energy_eV"] for _, c in tagged])]
+        interactions = [c["interaction_eV"] for _, c in keep]
+        absolutes = [c["energy_eV"] for _, c in keep]
         e_min = min(interactions)
         temperature = group[0]["temperature_K"]
         # A seed "found" the pooled minimum when its own best candidate is the
@@ -631,6 +635,13 @@ def pool_by_n(summaries):
         seed_minima = [min(c["interaction_eV"] for c in s["candidates"])
                        for s in group]
         walls = [f for s in group if (f := _wall_fraction(s)) is not None]
+        # `dedupe_energies` sorts ascending, so `keep[0]` is not just *a*
+        # minimum -- it is the pooled minimum, and therefore its own
+        # packing's minimum too: that packing's `best.xyz` is the geometry
+        # behind `e_int_min_kcal` below.
+        weights = boltzmann_weights([c["energy_eV"] for _, c in keep],
+                                    temperature)
+        s_best, c_best = keep[0]
         pooled.append({
             "n_solvent": n,
             "n_seeds": len(group),
@@ -644,20 +655,24 @@ def pool_by_n(summaries):
             "found_by": sum(1 for m in seed_minima
                             if abs(m - e_min) <= DEDUPE_TOL_EV),
             "seed_minima_kcal": [m * EV_TO_KCAL for m in seed_minima],
-            "mean_contacts": float(np.mean([c["n_contacts"] for c in keep])),
+            "mean_contacts": float(np.mean([c["n_contacts"] for _, c in keep])),
             # At n = 0 there is no solvent to dissolve, and `assemble` calls
             # that 1.0 rather than dividing by zero.
             "dissolved_fraction": (
-                float(np.mean([c["n_contacts"] == 0 for c in keep]))
+                float(np.mean([c["n_contacts"] == 0 for _, c in keep]))
                 if n else 1.0),
             # The worst of the seeds, matching `format_wall_diagnostic`: the
             # question is whether any of the pooled energies is contaminated.
             "wall": max(walls) if walls else None,
+            "best": {"run": Path(s_best["run_dir"]).name,
+                     "seed": s_best["seed"],
+                     "weight": float(weights[0]),
+                     "candidate": c_best},
         })
     return pooled
 
 
-def format_table(params, summaries):
+def format_table(params, pooled):
     """E_int vs n over the pooled candidates, with the search effort behind it.
 
     One sweep is one solute in one solvent, so what is being measured is
@@ -665,7 +680,6 @@ def format_table(params, summaries):
     identical values. It comes from `params`, which is also why no summary
     carries a `solute_label` of its own.
     """
-    pooled = pool_by_n(summaries)
     deltas = _increments(pooled)
     capacity = params["monolayer_capacity"]
     header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'E_int(ens)':>12} "
@@ -741,7 +755,65 @@ def format_table(params, summaries):
     return "\n".join(lines)
 
 
-def format_seed_detail(summaries):
+def format_best_geometry(pooled):
+    """Where the answer lives: the file behind each n's pooled minimum.
+
+    `pool_by_n` already worked out that its `keep[0]` -- the pooled minimum --
+    is necessarily that candidate's own packing's minimum too, so this is
+    pure formatting of the `best` block it attached: no new computation, no
+    filesystem access. It exists because the report otherwise names a number
+    at each n without ever saying which geometry produced it, which used to
+    mean grepping every `scored.json` in the sweep by hand.
+    """
+    header = (f"{'n':>3} {'E_int(min)':>12} {'weight':>7} {'contacts':>9} "
+             f"{'min gap/A':>10} {'frame':>6} {'E_wall/eV':>11} {'packing'}")
+    lines = ["Best geometry at each n", "-----------------------",
+             header, "-" * len(header)]
+    for p in pooled:
+        best = p["best"]
+        c = best["candidate"]
+        # NaN when there is no solvent to measure a gap to, i.e. at n = 0.
+        gap = c["min_gap_A"]
+        gap_s = "-" if gap != gap else f"{gap:.3f}"
+        lines.append(
+            f"{p['n_solvent']:>3} "
+            f"{p['e_int_min_kcal']:>12.2f} "
+            f"{best['weight']:>7.3f} "
+            f"{c['n_contacts']:>9d} "
+            f"{gap_s:>10} "
+            f"{c['frame']:>6d} "
+            f"{c['wall_energy_eV']:>11.6f} "
+            f"{best['run']}")
+    lines.append(
+        "\n  The geometry is <packing>/best.xyz above, and equivalently frame "
+        "0 of that\n  packing's scored_candidates.xyz: the pooled minimum at "
+        "an n is necessarily that\n  packing's own minimum, since "
+        "dedupe_energies sorts lowest first. 'weight' is\n  the candidate's "
+        "Boltzmann weight within the pooled set at this n -- near 1 means\n  "
+        "E_int(min) is effectively the ensemble, small means it is one of "
+        "several\n  comparable minima and E_int(ens) is the number to read "
+        "instead. 'frame' is the\n  MD dump index into that packing's "
+        "traj.xyz / energies.json, in the same sense\n  the candidate table "
+        "and sampling convergence use it -- not an index into any xyz\n  of "
+        "candidates. 'E_wall/eV' is that sampling frame's wall energy: "
+        "nonzero means\n  the wall was holding this particular geometry "
+        "together, the one row where the\n  wall diagnostic bites on the "
+        "reported number itself rather than on an average.\n  best.xyz is "
+        "not named after out_name, so a second continuum scored into the "
+        "same\n  run directories overwrites it -- it reflects the most "
+        "recent scoring pass.\n\n  The same geometry is also copied to "
+        "best_n<N>.xyz in the sweep directory, with\n  sweep_n=, "
+        "sweep_E_int_kcal=, and sweep_packing= appended to its comment "
+        "line.\n  That is one file per n, not one file for the whole sweep, "
+        "because the frames\n  differ in atom count as n grows and a "
+        "viewer that reads a multi-frame xyz as a\n  trajectory -- Avogadro, "
+        "VMD, most others -- takes the first frame's atom count\n  and "
+        "applies it to the rest, silently dropping every n after the "
+        "first.")
+    return "\n".join(lines)
+
+
+def format_seed_detail(summaries, pooled):
     """Per packing, under the pooled table: what each search on its own found.
 
     These rows used to be the report's primary table, back when the reported
@@ -752,16 +824,23 @@ def format_seed_detail(summaries):
     quantity now, and a per-packing one would be pairing independent searches
     by index.
     """
-    header = (f"{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
-              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
-              f"{'uniq':>5} {'wall':>6}")
+    tol_kcal = DEDUPE_TOL_EV * EV_TO_KCAL
+    best_by_n = {p["n_solvent"]: p["e_int_min_kcal"] for p in pooled}
+    header = (f"{'n':>3} {'seed':>4} {'best':>4} {'E_int(ens)':>12} "
+              f"{'E_int(min)':>12} {'E(cluster)/eV':>15} {'contacts':>9} "
+              f"{'dissolved':>10} {'uniq':>5} {'wall':>6}")
     lines = ["Per-packing detail", "------------------", header,
              "-" * len(header)]
     for s in sorted(summaries, key=_row_order):
         frac = _wall_fraction(s)
+        e_min = best_by_n.get(s["n_solvent"])
+        star = ("*" if e_min is not None
+                and abs(s["min_interaction_kcal"] - e_min) <= tol_kcal
+                else "")
         lines.append(
             f"{s['n_solvent']:>3} "
             f"{s['seed']:>4} "
+            f"{star:>4} "
             f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
             f"{s['ensemble_energy_eV']:>15.6f} "
@@ -774,7 +853,11 @@ def format_seed_detail(summaries):
         "average over them,\n  and 'uniq' its own count of distinct minima. "
         "These do not average to the table\n  above and are not meant to -- "
         "the pooled minimum is the lowest of the\n  E_int(min) column, not "
-        "the mean of it.")
+        f"the mean of it. 'best' marks a packing within {1000 * DEDUPE_TOL_EV:.0f} "
+        "meV of\n  the pooled minimum at its n -- the same test 'found by' "
+        "counts, so the number\n  of '*' at an n equals its 'found by' "
+        "numerator. The Best geometry section\n  above names the one of "
+        "these whose file to open when several tie.")
     return "\n".join(lines)
 
 
@@ -912,7 +995,7 @@ def format_sampling_convergence(summaries):
     return "\n".join(lines)
 
 
-def format_search_convergence(params, summaries):
+def format_search_convergence(params, pooled):
     """Do the independent packings at each n agree on the minimum?
 
     A packing is a search, not a replica, so the useful question about a set
@@ -930,9 +1013,8 @@ def format_search_convergence(params, summaries):
     packing has none of this evidence at all and must say so, rather than
     leaving the absence to read as precision.
     """
-    if not summaries:
+    if not pooled:
         return None
-    pooled = pool_by_n(summaries)
 
     lines = ["Search convergence", "------------------"]
     if max(p["n_seeds"] for p in pooled) < 2:
@@ -1011,19 +1093,29 @@ def format_search_convergence(params, summaries):
 
 
 def format_sweep_report(params, summaries):
-    """Params block plus the E_int(n) table."""
+    """Params block plus the E_int(n) table.
+
+    `pooled` is computed once here and threaded through every section that
+    needs it, rather than each calling `pool_by_n(summaries)` on its own --
+    they would recompute the same dedupe over the same candidates three times
+    over.
+    """
     parts = [banner("n-sweep report")]
 
     shown = {k: ("-" if v is None else v) for k, v in params.items()}
     parts.append(kv_block("Parameters", shown))
 
-    parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
-                 + "-" * 58 + "\n" + format_table(params, summaries))
+    pooled = pool_by_n(summaries)
 
-    parts.append(format_seed_detail(summaries))
+    parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
+                 + "-" * 58 + "\n" + format_table(params, pooled))
+
+    parts.append(format_best_geometry(pooled))
+
+    parts.append(format_seed_detail(summaries, pooled))
 
     for section in (format_sampling_convergence(summaries),
-                    format_search_convergence(params, summaries),
+                    format_search_convergence(params, pooled),
                     format_wall_diagnostic(summaries)):
         if section:
             parts.append(section)
@@ -1041,6 +1133,56 @@ def format_sweep_report(params, summaries):
             "  optimisations and the n = 0 run landed in different minima, and\n"
             "  every other row is offset by that much.")
     return "\n\n".join(parts) + "\n"
+
+
+def write_best_geometries(sweep_dir, pooled):
+    """Copy each n's winning `best.xyz` to a sweep-level `best_n<N>.xyz`.
+
+    The deliverable of a sweep, not just its report: `pooled` already knows,
+    per n, which packing's `best.xyz` is the pooled minimum (see `pool_by_n`),
+    so this only has to read those files and copy them out, one per n.
+
+    One file per n, not one multi-frame xyz, because a sweep's frames differ
+    in atom count -- n = 0..k goes 10, 15, 20, ... atoms for a fixed solute
+    and solvent -- and a multi-frame xyz has no way to say "these frames are
+    unrelated". A viewer reads it as a trajectory, takes the first frame's
+    atom count, and applies it to the rest, so Avogadro (and VMD, and most
+    others) render only n = 0 and silently drop every row after it. A set of
+    chemically distinct clusters is not a trajectory, and no single-file XYZ
+    shape expresses that it isn't one.
+
+    Pure text handling -- no ASE, keeping this module's import list at module
+    scope unchanged -- because every field needed is already a line of text:
+    the natoms line, the comment line, and the coordinate block. Each frame's
+    comment line (extended-xyz's `key=value` line) gains `sweep_n=`,
+    `sweep_E_int_kcal=`, and `sweep_packing=` (the run directory name, plain
+    `[A-Za-z0-9_]` so it needs no quoting), appended after whatever ASE
+    already wrote there (`Properties=...`, `energy=...`), which xtb reads
+    back and this does not disturb. `sweep_packing=` is what still says which
+    packing produced a file once it has been lifted out of the sweep
+    directory.
+
+    Skips an n whose run directory or `best.xyz` is missing -- a `sweep.json`
+    copied without its run directories, say -- and returns an empty list if
+    none are present.
+    """
+    sweep_dir = Path(sweep_dir)
+    written = []
+    for p in pooled:
+        run = p["best"]["run"]
+        best_xyz = sweep_dir / run / "best.xyz"
+        if not best_xyz.is_file():
+            continue
+        lines = best_xyz.read_text().splitlines()
+        if len(lines) < 2:
+            continue
+        lines[1] = (f"{lines[1].rstrip()} sweep_n={p['n_solvent']} "
+                    f"sweep_E_int_kcal={p['e_int_min_kcal']:.6f} "
+                    f"sweep_packing={run}")
+        out = sweep_dir / f"best_n{p['n_solvent']}.xyz"
+        out.write_text("\n".join(lines) + "\n")
+        written.append(out)
+    return written
 
 
 # --------------------------------------------------------------------------
@@ -1095,6 +1237,8 @@ def render_sweep_dir(path):
     report = path / "report.txt"
     report.write_text(format_sweep_report(params, runs))
     written.append(report)
+
+    written += write_best_geometries(path, pool_by_n(runs))
     return written
 
 

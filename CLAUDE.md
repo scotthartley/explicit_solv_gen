@@ -70,6 +70,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.3.1 | `report.txt` gained a Best geometry at each n section and a `best` marker in the per-packing detail table; the sweep directory gained one `best_n<N>.xyz` per n. `report.py` only, so 0.3.0 sweeps re-render |
 | 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
 | 0.1.1 | `report.txt` gained the `dE_int` column, so an 0.1.0 report has one fewer column and no increment. The docs' claim that `E_int(n)` plateaus was corrected in the same commit -- see below |
 | 0.3.0 | the sweep table is per **n**, not per run: the candidates of every packing at one n are pooled and deduped across packings, and the reported number is the pooled minimum rather than a seed mean. `dE_int` is keyed by n alone; Seed spread becomes Search convergence; the old per-run rows are demoted to a Per-packing detail table. `report.py` only, so 0.2.0 sweeps re-render |
@@ -85,7 +86,8 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
-| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a per-packing detail table under it, and the sampling diagnostics below |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), and the sampling diagnostics below |
+| `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
 
 `metadata.json` also carries `pack_clustering` and `pack_directions` -- the
 stratification parameter this packing was drawn at and the per-molecule

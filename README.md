@@ -151,8 +151,15 @@ Per run directory (`<label>_<solvent>_n<N>_seed<S>/`):
 | `best.xyz` | the lowest candidate |
 
 Per sweep: `sweep.json` and `report.txt` — the params block, the `E_int(n)`
-table, and the diagnostics. Rescoring in a second continuum writes
-`scored_<name>.json` / `.log` / `_candidates.xyz` rather than overwriting.
+table, a Best geometry at each n section naming the file behind each row, and
+the diagnostics — plus one `best_n<N>.xyz` per n: the pooled-minimum
+packing's `best.xyz` at that n, copied out with `sweep_n=` /
+`sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One
+file per n, not one multi-frame file, because the atom count changes with
+n and a viewer that reads a multi-frame xyz as a trajectory — Avogadro, VMD,
+most others — shows only the first frame.
+Rescoring in a second continuum writes `scored_<name>.json` / `.log` /
+`_candidates.xyz` rather than overwriting.
 
 Everything human-readable regenerates from the JSON already on disk, with no
 MD and no calculator:
