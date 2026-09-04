@@ -44,7 +44,9 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimized frames in a continuum. The **scorer**. |
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
-| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`) that `ensemble` re-exports. No ASE/tblite at module scope. |
+| `docking.py` | a second, constructive generator: random placement + BFGS instead of thermal sampling. Standalone, either/or with `n_sweep.py`; see below. |
+| `dft_export.py` | exports deduped, near-minimum candidates (from either generator) plus a manifest for a downstream DFT single point or reopt. |
+| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
 `run_sweep` deliberately does *not* assemble a difference of sweeps. One sweep
@@ -70,6 +72,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.4.0 | `scored.json` gains `pack_mode` (`"md"` or `"dock"`); every run directory gains `ref_solute.xyz` / `ref_solvent.xyz`, the relaxed reference geometries the run's `E_int` was measured against. `docking.py` (a second, constructive generator) and `dft_export.py` (candidate export for DFT) are new. Existing sweeps re-render unchanged (only the version line moves); `pack_mode` defaults to `"md"` when absent so nothing pre-0.4.0 breaks |
 | 0.3.1 | `report.txt` gained a Best geometry at each n section and a `best` marker in the per-packing detail table; the sweep directory gained one `best_n<N>.xyz` per n. `report.py` only, so 0.3.0 sweeps re-render |
 | 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
 | 0.1.1 | `report.txt` gained the `dE_int` column, so an 0.1.0 report has one fewer column and no increment. The docs' claim that `E_int(n)` plateaus was corrected in the same commit -- see below |
@@ -86,6 +89,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
+| `ref_solute.xyz`, `ref_solvent.xyz` | `ensemble.assemble` | the relaxed reference geometries `E_int` for this run was measured against (`reference_energies` keeps only energies otherwise). Written into every run directory that shares one reference, redundant but cheap. `dft_export.export_dft` reads either copy to reconstruct `E(solute) + n E(solvent)` at the DFT level |
 | `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), and the sampling diagnostics below |
 | `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
 
@@ -502,6 +506,158 @@ otherwise look alike in the table: a run still falling on the final frame
 (too short) and a run whose minimum came from frame 2 and never moved (stuck
 in the basin it was packed into).
 
+## `docking.py` -- a second generator, beside the MD sweep
+
+The sweep is a **geometry generator** for downstream ab initio refinement, not
+a source of final GFN2 numbers. Judged against that goal it has one defect:
+at n = 2 on pyrazine/chloroform it never produces the both-nitrogens
+arrangement (one chloroform H-bonded to each ring nitrogen), so DFT never
+sees it. A missing basin is the one failure downstream refinement cannot
+repair -- DFT can re-rank what it is given, but it cannot invent a motif.
+
+Measured, GFN2-xTB/ALPB(chcl3), against the same references already in
+`s_test/pyrazine_chcl3_n2_seed0/scored.json`:
+
+| structure | E_int (kcal/mol) | how found |
+| --- | --- | --- |
+| MD pooled minimum, n = 2 | -11.44 | 10 ps Langevin, 14 candidates, 3 packings |
+| both-N, docked | **-13.00** | random placement onto the relaxed n = 1 parent, screened, refined |
+
+All 14 MD candidates at n = 2 share one motif -- a single H-bond at 1.90 A,
+the second chloroform 3.8-5.6 A away and unbound -- because the trajectory
+never visits the other basin, not because the Hamiltonian disfavours it: the
+both-N geometry is 1.56 kcal/mol *lower*.
+
+`docking.py` finds it by constructing instead of sampling: place a solvent
+molecule at a random position and orientation around the relaxed parent, and
+run BFGS. BFGS only descends, so it cannot climb out of the well it lands in
+-- which is why it works where a *seeded* MD run would not (`run_one_job`
+discards 5 ps of equilibration before recording the first frame, so a seeded
+both-N start would already be gone by frame 1). On pyrazine + chloroform,
+docking n = 1 -> n = 2 with 3 parents x 64 placements reproduces the
+both-N basin as its overall minimum: E_int(2) = -13.00 kcal/mol, both H...N
+contacts at 1.94 A, 4 of the 10 refined placements landing within 1 meV of it
+(the "found by" column). The n = 1 parent itself came in at -6.65 kcal/mol,
+matching the -6.6 single-complex value in the binding table above. Total
+wall-clock for both n on 18 cores: 7.3 s -- 256 placements screened, 20
+refined.
+
+Both programs report the same *kind* of thing: a continuum-relaxed,
+wall-free local minimum, scored identically (`ensemble.relax`, no wall, and
+even `n_contacts` / `min_gap_A` computed on the *relaxed* geometry, not the
+raw placement). So neither report has to caveat the other -- they differ
+only in how the starting geometry was found, not in what "found" means once
+it is optimised:
+
+- **MD sweep** -- thermal exploration. Gas-phase Langevin inside a confining
+  wall; basin coverage is set by what the trajectory visits, which is why it
+  missed the both-N basin at n = 2 above.
+- **Docking** -- random construction, chained upward: n = 1's surviving
+  parents become n = 2's starting points. Greedy (the best structure at n
+  need not descend from the best at n - 1), which is why `Docking.n_parents`
+  carries more than one candidate forward, and why the MD sweep remains
+  available as an independent, non-greedy check on the same system.
+
+Run one from the command line, the same shape as `n_sweep.py`:
+
+    python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
+      --solvent chcl3 --n 1 2 3 --out pyrazine_dock/ --placements 64
+
+It writes `<out>/dock.json` (`{"params": ..., "runs": [...]}`, matching
+`sweep.json`'s shape) and `<out>/dock_report.txt`, plus one
+`<label>_n<N>_dock/` run directory and one `best_n<N>.xyz` per requested n.
+`python -m report <dir>` regenerates the report from `dock.json` alone, the
+same as for a sweep. `n_sweep.py` and `solvate_md.py` are unmodified;
+`docking.py` only reads from `solvate_md` (`solute_semi_axes`,
+`shell_padding`, `align_to_principal_axes`, `_random_rotation`,
+`bulk_molecular_volume`, `solvent_radius`, `pool_map`) and from `ensemble`
+(`relax`, `reference_energies`, `solvent_molecule_gaps`) -- it adds no new
+Hamiltonian and no new optimiser criterion of its own; `Scoring.fmax` /
+`opt_steps` are the ones a candidate is finally relaxed to, so a docked and a
+swept minimum are relaxed to the identical criterion and stay comparable.
+
+`scored.json` for a docked run carries `pack_mode: "dock"` (an MD run's says
+`"md"`) and every candidate's `wall_energy_eV` is `null` -- a docked
+structure has no sampling frame and so no wall energy, a real absence, not a
+zero, and `report.py`'s formatters render it as `-`.
+
+**Staged optimisation, measured to cost nothing in quality.** Every
+placement is first screened at a loose `screen_fmax` (default 0.05) and only
+the best `n_refine` (default 10) are re-relaxed at the scorer's tight
+`fmax = 0.002`. On the same 64 random placements (same RNG draw), two-pass
+screen-then-refine landed at -6.6514 kcal/mol; refining all 64 at the tight
+criterion directly landed at -6.6511 -- a 0.0003 kcal/mol difference, two
+orders of magnitude under the 1 meV (0.023 kcal/mol) dedupe tolerance. The
+two-pass run took 7.3 s combined over two n; refining every placement tightly
+took 5.9 s for n = 1 alone. `--freeze-solute` (FixAtoms on the solute during
+screening only, off by default) is the other lever, for a large solute whose
+soft modes make BFGS crawl without being relevant to where a solvent
+molecule binds; refinement is always unconstrained regardless.
+
+**1 - 0.93^K sets the default placement count.** The both-N basin was hit by
+4 of 60 random poses onto the relaxed n = 1 parent (7%), so
+`1 - 0.93^K` gives 90% confidence at K = 32 and 99% at K = 64 --
+`Docking.n_placements` default.
+
+### Applicability: where this stops working
+
+The same ~N^2.5 GFN2 gradient cost that limits the MD sweep limits docking,
+compounded by BFGS step count -- so this targets small n on small-to-moderate
+solutes, comfortable to ~90 atoms, painful at 180. See the gradient-cost table
+this repo already carries for the sweep; the same numbers apply here, since
+both programs pay for the identical optimisation.
+
+More fundamentally, **the shell regime belongs to the MD sweep, not to
+docking**: past roughly a third of a monolayer (`shell_capacity.
+monolayer_capacity`), no single minimum dominates and solvent-solvent
+cohesion takes over (already a known limitation of `E_int` at n >= 2 above),
+and a greedy chain compounds many sequential conditioned placement decisions
+into an arrangement space no longer well sampled by a handful of random
+poses. `run_docking` prints a warning once `n` exceeds that fraction of
+capacity, the same convention `n_sweep`'s `cover` column uses.
+
+Not built: quasi-RRHO free energies (GFN2-level thermochemistry is triage at
+best; DFT supersedes it), RMSD-based dedupe (energy dedupe already separates
+distinct minima at the counts docking produces), and pooling docked and swept
+candidates together (docking wins at every n by construction, so pooling
+would let it silently take over the headline number and erase the
+informative comparison between what each search actually finds).
+
+### `dft_export.py`
+
+    python -m dft_export pyrazine_dock/ --out pyrazine_dock/dft_export
+    python -m dft_export pyrazine_chcl3/ --out pyrazine_chcl3/dft_export
+
+Reads either a sweep or a docking output directory -- both write one
+`scored.json` per run in the same shape, so this needs no branch on which
+generator produced them. Per n: pool every run's candidates, dedupe at the
+same 1 meV criterion `pool_by_n` uses, keep everything within `--window-kcal`
+(default 3.0, ~5 kT) of that n's minimum. A window rather than a fixed count,
+so the exported set adapts to the system; 3 kcal/mol comfortably spans the
+1.56 kcal/mol gap between the two pyrazine/chloroform motifs above, which is
+the concrete test that it is not too tight. `--max-per-n` is a safety cap
+applied after the window.
+
+Writes `manifest.json`, `references/{solute,solvent}.xyz` (the relaxed
+geometries every exported `E_int` was measured against), and
+`n<N>/cand<i>.xyz`. Verified end to end: reconstructing `E_int` from the
+manifest's `energy_eV` and reference energies reproduces `interaction_kcal`
+to floating-point precision (< 1e-9 eV), and the solute/solvent reference
+energies from an MD sweep and a docking run on the same solute and solvent
+matched exactly (-446.915092 / -443.246268 eV), confirming both generators
+share one zero.
+
+Raises rather than exporting if the runs found were scored against different
+references -- the same invariant `pool_by_n` enforces, for the same reason.
+
+Two caveats worth knowing rather than rediscovering: GFN2 over-binds the
+C-H...N contact this pipeline studies (1.91 A against a literature 2.2-2.5),
+so a DFT single point on a GFN2 geometry sits partway up a repulsive wall and
+re-optimisation is preferable where affordable; and a raw MD frame must never
+be exported for a single point, since 298 K thermal strain is worth several
+kcal/mol at random and would swamp the signal -- `scored_candidates.xyz`
+never contains one, only optimised candidates.
+
 ## Gotchas
 
 - Scoring settings live on `Scoring` and **only** on `Scoring`, the same way
@@ -546,7 +702,12 @@ in the basin it was packed into).
   `if __name__ == "__main__":` guard** or workers re-run the grid on import
   and fork until the machine dies. `n_sweep.main()` is already under one, so
   the command line above is safe; a hand-written driver is not automatically.
-  `run_sweep` spawns twice, once per half.
+  `run_sweep` spawns twice, once per half. `docking.dock_at_n` goes through
+  the same `pool_map` (twice per n: screening, then refinement), and
+  `docking.main()` is guarded the same way, for the same reason -- killing a
+  docking run needs the process-group kill above too, not `pkill -f
+  docking.py`, which matches only the parent for the same reason it matches
+  only `n_sweep.py`'s.
 - Sampling is **gas phase by default**: `Condition.sample_in_continuum` is
   `False`, and scoring applies the continuum regardless. It was called
   `implicit_solvent` and defaulted to `True` -- the opposite of the documented

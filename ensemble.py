@@ -221,15 +221,24 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
                        calculator_kwargs, fmax, steps):
     """Relaxed isolated solute and solvent, in the scoring environment.
 
+    Returns `(e_solute_eV, e_solvent_eV, solute_atoms, solvent_atoms)`. The
+    geometries ride along, not just the energies: `assemble` persists them as
+    `ref_solute.xyz` / `ref_solvent.xyz` in every run directory that shares
+    this reference, which is what lets a downstream DFT export reconstruct
+    `E(solute) + n E(solvent)` against the same relaxed geometry the sweep
+    used, rather than re-relaxing (possibly to a different minimum) itself.
+
     The solute reference is geometry-specific by construction -- it comes
     from `solute_path`, so two conformers of one molecule each get their
     own, which is what makes an interaction energy comparable between them.
     """
     solute = align_to_principal_axes(read(solute_path))
-    return (relax(solute, calculator, solvation,
-                  calculator_kwargs, fmax, steps).energy_eV,
-            relax(read(solvent_path), calculator, solvation,
-                  calculator_kwargs, fmax, steps).energy_eV)
+    solute_relaxed = relax(solute, calculator, solvation,
+                           calculator_kwargs, fmax, steps)
+    solvent_relaxed = relax(read(solvent_path), calculator, solvation,
+                            calculator_kwargs, fmax, steps)
+    return (solute_relaxed.energy_eV, solvent_relaxed.energy_eV,
+            solute_relaxed.atoms, solvent_relaxed.atoms)
 
 
 def dedupe(pairs, energy_tol_eV=DEDUPE_TOL_EV):
@@ -287,7 +296,7 @@ def select_frames(run_dir, stride, max_frames):
 
 
 def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
-             calculator, scoring, out_name):
+             calculator, scoring, out_name, reference_atoms=None):
     """Turn one run's optimised candidates into its summary and its files.
 
     Everything after the optimisations, and nothing that needs a calculator:
@@ -295,8 +304,19 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     `<out_name>_candidates.xyz`, `<out_name>` and its `.log`. Contacts are
     microseconds of numpy, so this stays in the parent whether the
     optimisations ran here or in a pool.
+
+    `reference_atoms`, when given, is `(solute_atoms, solvent_atoms)` -- the
+    same relaxed geometries `references`' energies came from -- and gets
+    written to `ref_solute.xyz` / `ref_solvent.xyz` in `run_dir`. Every run in
+    a sweep shares one reference, so this writes the same two small files
+    into every run directory rather than trying to pick one place to own
+    them; a downstream DFT export reads either copy.
     """
     run_dir = Path(run_dir)
+    if reference_atoms is not None:
+        ref_solute_atoms, ref_solvent_atoms = reference_atoms
+        write(run_dir / "ref_solute.xyz", ref_solute_atoms)
+        write(run_dir / "ref_solvent.xyz", ref_solvent_atoms)
     n_solute = meta["n_solute"]
     aps = meta["atoms_per_solvent"]
     n_solvent = meta["n_solvent"]
@@ -339,6 +359,7 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     summary = {
         "run_dir": str(run_dir),
         "label": meta["label"],
+        "pack_mode": "md",
         "seed": meta["seed"],
         "n_solvent": n_solvent,
         "sampling_solvation": meta["solvation"],
@@ -406,14 +427,18 @@ def score_run(run_dir, solvation, scoring, calculator=None,
     meta, records, indices, frames = select_frames(
         run_dir, scoring.stride, scoring.max_frames)
     calculator = calculator or meta["calculator"]
+    reference_atoms = None
     if references is None:
-        references = reference_energies(
+        e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = reference_energies(
             meta["solute_path"], meta["solvent_path"], calculator, solvation,
             calculator_kwargs, scoring.fmax, scoring.opt_steps)
+        references = (e_solute, e_solvent)
+        reference_atoms = (ref_solute_atoms, ref_solvent_atoms)
     relaxed = [relax(frame, calculator, solvation, calculator_kwargs,
                      scoring.fmax, scoring.opt_steps) for frame in frames]
     return assemble(run_dir, meta, records, indices, relaxed, references,
-                    solvation, calculator, scoring, out_name)
+                    solvation, calculator, scoring, out_name,
+                    reference_atoms=reference_atoms)
 
 
 def score_run_grid(jobs, scoring, n_workers=None):
@@ -498,11 +523,14 @@ def score_run_grid(jobs, scoring, n_workers=None):
     for job, selection, start in zip(jobs, selections, starts):
         meta, records, indices, frames = selection
         references = job.get("references")
+        reference_atoms = None
         if references is None:
             at = job["references_at"]
             references = (results[at].energy_eV, results[at + 1].energy_eV)
+            reference_atoms = (results[at].atoms, results[at + 1].atoms)
         summaries.append(assemble(
             job["run_dir"], meta, records, indices,
             results[start:start + len(frames)], references, job["solvation"],
-            job["calculator"], scoring, job.get("out_name", "scored.json")))
+            job["calculator"], scoring, job.get("out_name", "scored.json"),
+            reference_atoms=reference_atoms))
     return summaries

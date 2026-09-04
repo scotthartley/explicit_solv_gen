@@ -375,6 +375,9 @@ def main(argv=None):
     parser.add_argument("--label", default=None,
                         help="solute name in run directories and the table "
                              "(default: the solute filename stem)")
+    parser.add_argument("--export-dft", action="store_true",
+                        help="also export deduped, near-minimum candidates "
+                             "for DFT refinement to <out>/dft_export/")
     args = parser.parse_args(argv)
 
     run_sweep(
@@ -395,6 +398,12 @@ def main(argv=None):
         },
     )
     print(Path(args.out) / "report.txt")
+
+    if args.export_dft:
+        from dft_export import export_dft
+        out_dir = Path(args.out) / "dft_export"
+        export_dft(args.out, out_dir)
+        print(out_dir / "manifest.json")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -416,8 +416,10 @@ def _candidate_table(candidates, temperature_K):
         # or to BFGS before anyone swaps optimisers on a guess.
         steps_s = str(c["n_opt_steps"])
         # Of the *sampling* frame this candidate came from -- the scorer
-        # applies no wall.
-        wall_s = f"{c['wall_energy_eV']:.6f}"
+        # applies no wall. "-" for a docked candidate, which has no sampling
+        # frame and so no wall energy to report -- a real absence, not a
+        # zero.
+        wall_s = _num(c["wall_energy_eV"], ".6f")
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
@@ -429,10 +431,11 @@ def _candidate_table(candidates, temperature_K):
 
 def _sampling_wall_str(summary):
     """One-line summary of the wall during the MD that produced these frames."""
-    # None only when the run dumped no frames at all, which `wall_stats`
-    # reports rather than guessing at.
+    # None for a docked candidate -- there is no sampling frame at all, and
+    # for an MD run that dumped no frames, which `wall_stats` reports rather
+    # than guessing at.
     wall = summary["sampling_wall"]
-    if wall["wall_active_fraction"] is None:
+    if wall is None or wall["wall_active_fraction"] is None:
         return None
     return (f"active in {100 * wall['wall_active_fraction']:.1f}% of "
             f"{wall['n_frames']} frames "
@@ -455,6 +458,10 @@ def format_scored_log(summary, meta):
     max_frames = summary["max_frames"]
     parts.append(kv_block("Provenance", {
         "run directory": summary["run_dir"],
+        # Missing on anything scored before 0.4.0 -- defaults to "md" rather
+        # than failing, since it is informational and never enters a
+        # computation, unlike the mandatory wall fields.
+        "pack mode": summary.get("pack_mode", "md"),
         "trajectory": (f"traj.xyz, every {summary['stride']}th frame"
                        + (f", at most {max_frames}" if max_frames else "")
                        + f"  ->  {summary['n_frames_scored']} scored"),
@@ -533,8 +540,10 @@ def format_scored_log(summary, meta):
   sanity-check the small differences of large energies against.""")
 
     # After the Result block rather than up in Provenance: these are the
-    # energies the confinement contaminated.
-    warning = wall_warning(summary["sampling_wall"]["wall_active_fraction"])
+    # energies the confinement contaminated. None for a docked candidate,
+    # which has no sampling wall at all.
+    warning = (wall_warning(summary["sampling_wall"]["wall_active_fraction"])
+              if summary["sampling_wall"] is not None else None)
     if warning:
         parts.append(warning)
     # Same reason, one line up the stack: these are the energies a residual
@@ -1186,6 +1195,230 @@ def write_best_geometries(sweep_dir, pooled):
 
 
 # --------------------------------------------------------------------------
+# Docking (docking.py's report)
+# --------------------------------------------------------------------------
+
+def dock_row_from_summary(s):
+    """One docking `scored.json` summary -> the row shape the report reads.
+
+    `docking.py` writes every field this needs straight into the summary
+    (`found_by`, `n_refined`, `parent_detail`, ...) precisely so this
+    reconstruction needs nothing but the JSON already on disk -- the same
+    reason `pool_by_n` works from `scored.json` alone. Used both by
+    `docking.run_docking` right after building a fresh summary, and by
+    `render_dock_dir` when regenerating a report with no MD, no calculator,
+    and no optimiser.
+    """
+    best_i = min(range(len(s["candidates"])),
+                key=lambda i: s["candidates"][i]["interaction_eV"])
+    weights = boltzmann_weights([c["energy_eV"] for c in s["candidates"]],
+                                s["temperature_K"])
+    return {
+        "n_solvent": s["n_solvent"],
+        "run_dir": s["run_dir"],
+        "pool": s["n_unique"],
+        "n_refined": s.get("n_refined", s["n_frames_scored"]),
+        "found_by": s["found_by"],
+        "e_int_min_kcal": s["min_interaction_kcal"],
+        "e_int_ens_kcal": s["ensemble_interaction_kcal"],
+        "e_cluster_ens_eV": s["ensemble_energy_eV"],
+        "mean_contacts": s["mean_contacts"],
+        "dissolved_fraction": s["dissolved_fraction"],
+        "best": {
+            "candidate": s["candidates"][best_i],
+            "weight": float(weights[best_i]),
+            "parent": s["candidates"][best_i]["parent"],
+        },
+        "parent_detail": s["parent_detail"],
+    }
+
+
+def _dock_increments(params, dock_rows):
+    """`dE_int(n)` for docking, seeded with `E_int(0) = 0` by construction.
+
+    Same idea as `_increments`, but keyed against `params["all_n_min_kcal"]`
+    rather than the reported rows alone: a docking chain walks every integer
+    n internally even when only some are requested (`--n 1 3` still docks
+    n = 2 to get there), so the predecessor a requested row needs may not be
+    one of the rows being printed. `all_n_min_kcal` carries the full walk,
+    which is what lets dE_int be exact rather than "-" at every gap.
+    """
+    all_min = {0: 0.0}
+    all_min.update({int(k): v for k, v in params.get("all_n_min_kcal", {}).items()})
+    return {p["n_solvent"]: all_min[p["n_solvent"]] - all_min[p["n_solvent"] - 1]
+            for p in dock_rows if (p["n_solvent"] - 1) in all_min}
+
+
+def format_dock_table(params, dock_rows):
+    """E_int vs n over one docking chain -- the docking analogue of `format_table`."""
+    deltas = _dock_increments(params, dock_rows)
+    capacity = params["monolayer_capacity"]
+    header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'dE_int':>10} "
+              f"{'E_int(ens)':>12} {'found by':>10} {'pool':>6} "
+              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10}")
+    lines = [f"leg: {params['solute_label']}/{params['solvent']} (docked)",
+             f"full first shell: ~{capacity:.0f} solvent molecules", "",
+             header, "-" * len(header)]
+    for p in dock_rows:
+        n = p["n_solvent"]
+        delta = deltas.get(n)
+        found = f"{p['found_by']}/{p['n_refined']}"
+        lines.append(
+            f"{n:>3} "
+            f"{100 * n / capacity:>5.0f}% "
+            f"{p['e_int_min_kcal']:>12.2f} "
+            + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
+            + f"{p['e_int_ens_kcal']:>12.2f} "
+            f"{found:>10} "
+            f"{p['pool']:>6} "
+            f"{p['e_cluster_ens_eV']:>15.6f} "
+            f"{p['mean_contacts']:>9.2f} "
+            f"{100 * p['dissolved_fraction']:>9.0f}%")
+    lines.append(
+        "\nOne row per requested n. Unlike the MD sweep's pooled search over "
+        "several\nindependent packings, a docking row is one constructed "
+        "chain: 'found by' =\nrefined placements within "
+        f"{1000 * DEDUPE_TOL_EV:.0f} meV of this n's minimum, out\nof the "
+        "placements actually refined at the tight criterion ('pool' is the "
+        "number\nof distinct minima among them -- most placements are only "
+        "screened, at a\nlooser fmax, and are not part of either count). "
+        "dE_int = E_int(min) at this n\nminus E_int(min) at n - 1, computed "
+        "over every n walked internally even when\nan intermediate n was "
+        "not requested. E_int(0) = 0 by construction: the chain\nalways "
+        "starts from the bare relaxed solute.\n"
+        "\nDocking constructs rather than samples -- BFGS only descends, so "
+        "it wins at\nevery n it is pointed at by construction -- so its "
+        "numbers are never pooled\nwith an MD sweep's. Read the two reports "
+        "side by side: a basin docking finds\nthat the sweep never visits "
+        "is the failure this program exists to catch; a\nbasin only "
+        "docking finds is not automatically more real than one only the\n"
+        "sweep finds, since docking never samples thermal motion at all. "
+        "'cover' = n\nas a percentage of a full first-shell monolayer -- "
+        "docking targets targeted\nmicrosolvation and warns past roughly a "
+        "third of capacity.")
+    return "\n".join(lines)
+
+
+def format_dock_best_geometry(dock_rows):
+    """Where the answer lives: the file behind each n's constructed minimum."""
+    header = (f"{'n':>3} {'E_int(min)':>12} {'weight':>7} {'contacts':>9} "
+             f"{'min gap/A':>10} {'parent':>6} {'directory'}")
+    lines = ["Best geometry at each n", "-----------------------",
+             header, "-" * len(header)]
+    for p in dock_rows:
+        best = p["best"]
+        c = best["candidate"]
+        gap = c["min_gap_A"]
+        gap_s = "-" if gap != gap else f"{gap:.3f}"
+        lines.append(
+            f"{p['n_solvent']:>3} "
+            f"{p['e_int_min_kcal']:>12.2f} "
+            f"{best['weight']:>7.3f} "
+            f"{c['n_contacts']:>9d} "
+            f"{gap_s:>10} "
+            f"{best['parent']:>6d} "
+            f"{Path(p['run_dir']).name}")
+    lines.append(
+        "\n  The geometry is <directory>/best.xyz above. 'parent' is the "
+        "0-based index\n  into the previous n's surviving parents that this "
+        "minimum grew from -- see\n  the per-parent detail table below for "
+        "what each of those parents found on\n  its own. Also copied to "
+        "best_n<N>.xyz alongside dock_report.txt, with dock_n=,\n  "
+        "dock_E_int_kcal=, and dock_parent= appended to its comment line -- "
+        "one file\n  per n, not one multi-frame xyz, for the same reason "
+        "the MD sweep's\n  best_n<N>.xyz is: atom count changes with n, and "
+        "a viewer that reads a\n  multi-frame xyz as a trajectory keeps "
+        "only the first frame's atom count.")
+    return "\n".join(lines)
+
+
+def format_dock_parent_detail(dock_rows):
+    """Per parent, under the main table: the greedy chain made visible."""
+    header = (f"{'n':>3} {'parent':>6} {'best':>4} {'placements':>10} "
+             f"{'E_int(min)':>12}")
+    lines = ["Per-parent detail", "-----------------", header,
+             "-" * len(header)]
+    for p in dock_rows:
+        for parent in p["parent_detail"]:
+            star = "*" if parent["best"] else ""
+            lines.append(
+                f"{p['n_solvent']:>3} "
+                f"{parent['parent']:>6} "
+                f"{star:>4} "
+                f"{parent['n_placements']:>10} "
+                f"{parent['e_int_min_kcal']:>12.2f}")
+    lines.append(
+        "\n  One row per parent used to grow to that n: its own best "
+        "E_int(min) among\n  its own random placements. 'best' marks the "
+        "parent whose descendant became\n  the n's reported minimum -- the "
+        "greedy chain made visible, and the reason\n  docking carries more "
+        "than one parent forward: the best structure at n need\n  not "
+        "descend from the best structure at n - 1. Unlike the MD sweep's "
+        "'found\n  by', several parents landing near the same minimum here "
+        "is not independent\n  corroboration -- every parent explores the "
+        "same shell region with\n  independent random poses, not a "
+        "differently-arranged packing -- so read it\n  as which branch of "
+        "the chain the reported minimum came from, not as agreement.")
+    return "\n".join(lines)
+
+
+def format_dock_report(params, dock_rows):
+    """Params block plus the docking E_int(n) table, for one docking chain."""
+    parts = [banner("docking report")]
+
+    shown = {k: ("-" if v is None else v) for k, v in params.items()
+            if k != "all_n_min_kcal"}
+    parts.append(kv_block("Parameters", shown))
+
+    parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
+                 + "-" * 58 + "\n" + format_dock_table(params, dock_rows))
+    parts.append(format_dock_best_geometry(dock_rows))
+    parts.append(format_dock_parent_detail(dock_rows))
+    return "\n\n".join(parts) + "\n"
+
+
+def write_dock_best_geometries(out_root, dock_rows):
+    """Copy each n's winning `best.xyz` to `<out_root>/best_n<N>.xyz`.
+
+    Mirrors `write_best_geometries`: one file per n rather than one
+    multi-frame xyz, because atom count grows with n and a trajectory viewer
+    would keep only the first frame.
+    """
+    out_root = Path(out_root)
+    written = []
+    for p in dock_rows:
+        run_dir = Path(p["run_dir"])
+        best_xyz = (run_dir if run_dir.is_absolute()
+                    else out_root / run_dir.name) / "best.xyz"
+        if not best_xyz.is_file():
+            continue
+        lines = best_xyz.read_text().splitlines()
+        if len(lines) < 2:
+            continue
+        lines[1] = (f"{lines[1].rstrip()} dock_n={p['n_solvent']} "
+                    f"dock_E_int_kcal={p['e_int_min_kcal']:.6f} "
+                    f"dock_parent={p['best']['parent']}")
+        out = out_root / f"best_n{p['n_solvent']}.xyz"
+        out.write_text("\n".join(lines) + "\n")
+        written.append(out)
+    return written
+
+
+def render_dock_dir(path):
+    """Rewrite `dock_report.txt` and `best_n<N>.xyz`, from `dock.json` alone."""
+    path = Path(path)
+    data = _load(path / "dock.json")
+    params, runs = data["params"], data["runs"]
+    dock_rows = [dock_row_from_summary(s) for s in runs]
+
+    report = path / "dock_report.txt"
+    report.write_text(format_dock_report(params, dock_rows))
+    written = [report]
+    written += write_dock_best_geometries(path, dock_rows)
+    return written
+
+
+# --------------------------------------------------------------------------
 # Post-hoc regeneration
 # --------------------------------------------------------------------------
 
@@ -1244,6 +1477,8 @@ def render_sweep_dir(path):
 
 def render(path):
     path = Path(path)
+    if (path / "dock.json").exists():
+        return render_dock_dir(path)
     if (path / "sweep.json").exists():
         return render_sweep_dir(path)
     if (path / "metadata.json").exists():
@@ -1253,8 +1488,8 @@ def render(path):
         if (child / "metadata.json").exists():
             written += render_run_dir(child)
     if not written:
-        raise SystemExit(f"{path}: no sweep.json, metadata.json, or run "
-                         "subdirectories found")
+        raise SystemExit(f"{path}: no dock.json, sweep.json, metadata.json, "
+                         "or run subdirectories found")
     return written
 
 
