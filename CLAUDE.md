@@ -743,12 +743,20 @@ never contains one, only optimised candidates.
   dumps the full N x N bond-order matrix. One sweep produced a 50 GB slurm
   file that way. The pipeline itself writes nothing of the sort: all real
   output goes to `run.log` / `scored.log` / JSON, and a whole sweep emits a
-  couple of hundred bytes to stdout. You land on 0.4.0 because conda-forge's
-  `tblite 0.7.0` requires `dftd4 >=4.2.0`, so `environment.yml`'s `dftd4<4`
-  pin -- added for a `libdftd4` segfault in `get_polarizabilities` seen on one
-  cluster with tblite 0.6.0 -- solves the whole stack backwards. The pin and
-  the flood are the same decision; revisit them together, and note that the
-  segfault has not been retested against 0.7.0.
+  couple of hundred bytes to stdout. **0.4.0 alone has them** -- 0.5.0, 0.6.0
+  and 0.7.0 are clean, checked by extracting the packages -- and no clean
+  solve of this `environment.yml` selects it: on linux-64 the `dftd4<4` pin
+  gives tblite 0.5.0, and dropping the pin gives 0.7.0. An env holding 0.4.0
+  got there by *incremental* downgrade, conda minimising changes to an
+  existing env rather than re-solving it, so the fix is to rebuild the env
+  from `environment.yml` rather than to patch a file or lift the pin.
+
+  The pin itself (added for a `libdftd4` SIGSEGV in `get_polarizabilities`,
+  seen on one cluster with tblite 0.6.0) costs a GFN2 build: 0.5.0 under the
+  pin against 0.7.0 without it. Note it was never a choice *between* tblite
+  versions -- 0.6.0 and 0.7.0 require the identical `dftd4 >=4.2.0,<4.3`, so
+  upgrading tblite alone would never have avoided the segfault. Lifting the
+  pin means retesting it, which has not been done.
 - Don't pipe a long background run through `tail` -- it buffers until the pipe
   closes, so no interim output appears no matter what `flush=True` says. Tail
   the run's own `run.log` instead; it is flushed per line.

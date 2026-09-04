@@ -88,9 +88,9 @@ def library_versions(calculator):
     Recorded beside the git commit because the commit does not pin them. Two
     sweeps from identical code under an identical `Condition` still rest on
     different Hamiltonians if one ran against a different GFN2 build, and
-    nothing else on disk would say so. Measured: a cluster env held at tblite
-    0.4.0 by an unrelated `dftd4<4` pin, against 0.7.0 locally -- the params
-    blocks were indistinguishable.
+    nothing else on disk would say so. Measured: a cluster env that had
+    drifted to tblite 0.4.0 against 0.7.0 locally -- the params blocks were
+    indistinguishable.
 
     Read from installed package metadata rather than by importing anything,
     so this module keeps its promise of no ASE, tblite or torch at any scope
