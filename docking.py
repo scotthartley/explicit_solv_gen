@@ -97,7 +97,6 @@ from report import (
     dock_row_from_summary,
     ensemble_energy,
     format_dock_report,
-    git_commit,
     library_versions,
     timestamp,
     write_dock_best_geometries,
@@ -543,7 +542,6 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
         # requested.
         "all_n_min_kcal": all_n_min_kcal,
         "version": VERSION,
-        "git_commit": git_commit(),
         "timestamp": timestamp(),
     })
     params.update(library_versions(docking.calculator))

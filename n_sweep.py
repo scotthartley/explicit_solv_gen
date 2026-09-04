@@ -111,9 +111,8 @@ from pathlib import Path
 from ase.io import read
 
 from ensemble import Scoring, score_run_grid
-from report import (VERSION, format_sweep_report, git_commit,
-                    library_versions, pool_by_n, timestamp,
-                    write_best_geometries)
+from report import (VERSION, format_sweep_report, library_versions,
+                    pool_by_n, timestamp, write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
@@ -292,7 +291,6 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
         # no longer says how many packings any given row had.
         "seeds_per_n": list(seeds_per_n),
         "version": VERSION,
-        "git_commit": git_commit(),
         "timestamp": timestamp(),
     })
     # The commit pins this repo, not the Hamiltonian under it: a sweep run

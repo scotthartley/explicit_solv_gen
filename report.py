@@ -26,7 +26,6 @@ Regenerate logs for anything already on disk, without running any MD:
 import single_thread  # noqa: F401  -- must precede numpy; see its docstring
 
 import json
-import subprocess
 import time
 from collections import Counter
 from datetime import datetime
@@ -38,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -51,21 +50,6 @@ KB_EV_PER_K = 8.617333262e-5   # Boltzmann constant, == ase.units.kB
 WALL_WARN_FRACTION = 0.20
 
 _RULE = "=" * 78
-
-
-def git_commit():
-    """Short HEAD of the repo this module lives in, or None."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parent),
-             "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return out.stdout.strip() or None
 
 
 def timestamp():

@@ -61,12 +61,19 @@ script, and imposed a shape real sweeps did not have.
 What that gives up is the guarantee that both halves of a difference ran under
 identical settings, so every sweep now records a **params block**: the whole
 `Condition` (via `asdict`, so new fields are picked up automatically) plus the
-package version (`report.VERSION`), the git commit, a timestamp, and the
-versions of the libraries the numbers came out of (`report.library_versions`,
-read from package metadata so nothing has to be imported). Given `wall_slack`
-silently changed meaning at `c429f8a`, and that the commit pins this repo but
-not the build of tblite underneath it, this is cheap insurance -- check it
-before subtracting two sweeps.
+package version (`report.VERSION`), a timestamp, and the versions of the
+libraries the numbers came out of (`report.library_versions`, read from
+package metadata so nothing has to be imported). Given `wall_slack` silently
+changed meaning at `c429f8a`, this is cheap insurance -- check it before
+subtracting two sweeps.
+
+It used to record the git commit too, from `git rev-parse` against the
+directory the source lives in. That was removed at 0.6.0: on a cluster the
+code is typically a copy without a `.git`, run under a batch environment that
+may not even have `git` on `PATH`, so the field came out blank exactly where
+two sweeps most needed distinguishing -- and it failed silently, since
+`git`'s stderr was discarded and `None` rendered as `-`. `version` is the
+pin now, which is why the bump below is not optional.
 
 ### Versioning
 
@@ -78,6 +85,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.6.0 | the params block of `sweep.json` / `dock.json` loses `git_commit`, and `report.git_commit` is gone. It was blank on every cluster run (no `.git` in the copied tree, or no `git` in the batch environment), so it pinned nothing where it mattered. Subtractive: an older sweep still carries the field and re-renders unchanged, since the params block is rendered key-by-key with nothing reading `git_commit` by name |
 | 0.5.0 | the params block of `sweep.json` / `dock.json` gains `ase_version`, `numpy_version` and the calculator's own library (`tblite_version`, or `mace_torch_version` / `torch_version`), from installed package metadata. Additive: nothing reads them, so older sweeps re-render unchanged |
 | 0.4.0 | `scored.json` gains `pack_mode` (`"md"` or `"dock"`); every run directory gains `ref_solute.xyz` / `ref_solvent.xyz`, the relaxed reference geometries the run's `E_int` was measured against. `docking.py` (a second, constructive generator) and `dft_export.py` (candidate export for DFT) are new. Existing sweeps re-render unchanged (only the version line moves); `pack_mode` defaults to `"md"` when absent so nothing pre-0.4.0 breaks |
 | 0.3.1 | `report.txt` gained a Best geometry at each n section and a `best` marker in the per-packing detail table; the sweep directory gained one `best_n<N>.xyz` per n. `report.py` only, so 0.3.0 sweeps re-render |

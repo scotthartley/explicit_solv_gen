@@ -103,9 +103,9 @@ python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
 One sweep is **one solute in one solvent**. Comparisons — the same solute in
 two solvents, two conformers in one solvent, a double difference
 `(A − B)_solvent1 − (A − B)_solvent2` — are assembled by hand from several
-sweeps. Every sweep records a params block (the whole `Condition`, the git
-commit, a timestamp) so you can check two sweeps ran under the same settings
-before subtracting them.
+sweeps. Every sweep records a params block (the whole `Condition`, the
+package version, the library versions, a timestamp) so you can check two
+sweeps ran under the same settings before subtracting them.
 
 A fast end-to-end smoke test, a few minutes rather than an hour:
 
