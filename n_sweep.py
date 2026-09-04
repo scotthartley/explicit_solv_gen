@@ -38,10 +38,15 @@ a configuration space that grows with n, and the curve tends to a line of
 nonzero slope rather than to a flat.
 
 Read the *increment* instead, dE_int(n) = E_int(n) - E_int(n-1), which
-`report.txt` prints as a column. Convergence is the increment settling to a
-constant -- the specific interaction exhausted, every further molecule merely
-being condensed into a bulk-like site -- rather than to zero, and a step
-counts only if it clears the seed spread. Better, judge "how much is enough"
+`report.txt` prints as a column of a per-n table: the candidates of every
+packing at one n are pooled and deduped across packings, and the reported
+E_int is the minimum over that pool rather than a mean over the seeds. Seeds
+are independent *searches*, not replicas, so averaging them would penalise
+searching more widely -- `report.txt` prints `found by` and `pool` instead, so
+the search effort behind a minimum is on the page. Convergence is the
+increment settling to a constant -- the specific interaction exhausted, every
+further molecule merely being condensed into a bulk-like site -- rather than
+to zero. Better, judge "how much is enough"
 on a difference at fixed n between two legs (two conformers, bound and free,
 one solute in two solvents): both legs carry n molecules in comparable
 environments, so the bias and the cohesion largely cancel and what is left
@@ -74,8 +79,9 @@ pyrazine/chloroform, 4% opposed). So the seeds at each n are not repeats:
 `solvate_md.run_job_grid` stratifies them over the degree of clustering, and
 `allocate_seeds` below spreads a fixed total of packings over n by monolayer
 coverage rather than giving each n the same number. `--seeds` is the
-*average* per n, and the seed spread is correspondingly a conservative upper
-bound on the error rather than a clean estimate of it.
+*average* per n. Because the packings differ by design, their scatter is not
+an error bar: what `report.txt` reports is how many of them **agree** on the
+pooled minimum.
 
 Run one from the command line:
 
@@ -107,10 +113,10 @@ from report import VERSION, format_sweep_report, git_commit, timestamp
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
-# Every n >= 1 keeps at least this many packings, because the seed spread is
-# the only error bar the pipeline produces and a row without one reads as
+# Every n >= 1 keeps at least this many packings, because a lone packing has
+# nothing to agree with it and a row without that agreement reads as
 # precision. When the budget cannot pay for it everywhere, the allocation
-# falls back to uniform rather than quietly stripping the error bar off some
+# falls back to uniform rather than quietly stripping the evidence off some
 # rows.
 MIN_SEEDS_PER_N = 2
 
@@ -225,7 +231,7 @@ def allocate_seeds(n_values, n_seeds, capacity):
     handed out by largest remainder over a floor of `MIN_SEEDS_PER_N`. If the
     budget cannot meet that floor -- notably `--seeds 1` -- the split is
     abandoned rather than fudged, and every n gets `n_seeds`, so a
-    single-seed sweep still reports no error bar and says so.
+    single-packing sweep still reports no agreement to speak of and says so.
 
     Returns `{n: packings}`.
     """
@@ -312,10 +318,12 @@ def main(argv=None):
                         help="*average* independent packings per n: the total, "
                              "N x len(--n), is spread by monolayer coverage, so "
                              "n = 0 gets one and small nonzero n get more than "
-                             "N. Seed-to-seed scatter is the only error bar "
-                             "this pipeline produces, so one seed reports a "
-                             "number with no uncertainty attached; the report "
-                             "says so when it sees one (default: %(default)s)")
+                             "N. Packings are independent searches, and "
+                             "how many of them agree on the minimum is the "
+                             "only convergence evidence this pipeline "
+                             "produces, so one packing reports a number "
+                             "nothing corroborates; the report says so when "
+                             "it sees one (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=None,
                         help="parallel workers, for both halves "
                              "(default: all cores)")

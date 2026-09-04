@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -94,6 +94,30 @@ def banner(text):
     return f"{_RULE}\n {text}\n{_RULE}"
 
 
+# Two optimised energies this close are one minimum. The criterion lives here,
+# beside the Boltzmann weighting and for the same reason: `ensemble` dedupes
+# the candidates of one run with it, and `pool_by_n` dedupes the pooled
+# candidates of every seed at one n with it, and the two must be the same test
+# by construction rather than by comment.
+DEDUPE_TOL_EV = 1e-3
+
+
+def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
+    """Indices of the distinct minima, lowest first.
+
+    Energy-based rather than RMSD-based: it cannot tell two genuinely
+    different structures apart when they happen to be isoenergetic, which for
+    ranking purposes costs nothing, and it needs nothing but the numbers
+    already in `scored.json` -- no geometries, no ASE, no calculator.
+    """
+    order = sorted(range(len(energies_eV)), key=lambda i: energies_eV[i])
+    kept = []
+    for i in order:
+        if all(abs(energies_eV[i] - energies_eV[k]) > tol_eV for k in kept):
+            kept.append(i)
+    return kept
+
+
 def boltzmann_weights(energies_eV, temperature_K=298.0):
     """Weights over a set of energies, minimum subtracted before exponentiating.
 
@@ -121,24 +145,6 @@ def ensemble_energy(energies_eV, temperature_K=298.0):
 
 def _num(value, spec):
     return "-" if value is None else format(value, spec)
-
-
-def _mean(values):
-    return sum(values) / len(values)
-
-
-def _half_range(values):
-    """`mean +/- half-range`, or the mean and a dash when there is only one.
-
-    A single-packing row has no spread to report, and printing `+/- 0.00`
-    for it would read as perfect agreement rather than as no measurement.
-    `allocate_seeds` gives n = 0 exactly one packing, so this is the ordinary
-    case now rather than an edge one.
-    """
-    if len(values) < 2:
-        return f"{_mean(values):>10.2f} {'-':<11}"
-    return (f"{_mean(values):>10.2f} +/- "
-            f"{(max(values) - min(values)) / 2:<7.2f}")
 
 
 def _solvation_str(solvation):
@@ -554,87 +560,173 @@ def _row_order(summary):
     return summary["n_solvent"], summary["seed"]
 
 
-def _increments(summaries):
-    """`dE_int(n) = E_int(n) - E_int(n-1)` at fixed seed, keyed by (n, seed).
+def _increments(pooled):
+    """`dE_int(n) = E_int(min, n) - E_int(min, n-1)`, keyed by n.
 
-    The increment is the readable quantity in an n-sweep, because the level
-    is not: see the note under the table for why `E_int(n)` tends to a line
+    The increment is the readable quantity in an n-sweep, because the level is
+    not: see the note under the table for why `E_int(n)` tends to a line
     rather than to a plateau.
 
-    Paired within a seed rather than across the seed mean, so that the seeds
-    at one n show up as repeat estimates of the same increment and the
-    scatter is on the page. The pairing is not a history -- seed 0 at n = 2
-    is not seed 0 at n = 1 with a molecule added, it is an independent
-    packing -- which is exactly why the spread across seeds is the error bar
-    on the step.
+    Keyed by n alone, over the pooled minima, because a seed is a search and
+    not a replica -- seed 0 at n = 2 is not seed 0 at n = 1 with a molecule
+    added, it is an independent packing, so pairing the two by index paired
+    nothing physical and threw away every seed that had no counterpart. Only
+    the minimum gets an increment: a second one on the ensemble average would
+    only invite reporting whichever of the two looks better.
     """
-    by_key = {(s["n_solvent"], s["seed"]): s["ensemble_interaction_kcal"]
-              for s in summaries}
-    return {(n, seed): value - previous
-            for (n, seed), value in by_key.items()
-            if (previous := by_key.get((n - 1, seed))) is not None}
+    by_n = {p["n_solvent"]: p["e_int_min_kcal"] for p in pooled}
+    return {n: value - previous for n, value in by_n.items()
+            if (previous := by_n.get(n - 1)) is not None}
+
+
+def pool_by_n(summaries):
+    """Pool every seed's candidates at each n, and score the pool as one set.
+
+    Seeds are independent *searches*, not replicas of a physical system: they
+    differ in packing, and under stratified packing they differ in packing by
+    design. Averaging over them therefore penalises searching more widely --
+    it dilutes the one packing that found the both-nitrogens geometry with the
+    six that missed it -- and the mean of several minima is a number no
+    geometry has. So the reported number at each n is the minimum over the
+    pooled candidates of every seed, and the ensemble average is taken over
+    the same pool.
+
+    Pooling requires a cross-seed dedupe, not just a concatenation: seven
+    seeds that all find one basin would otherwise multiply its Boltzmann
+    weight by seven, which is an artefact of how the search was spent rather
+    than a degeneracy. `dedupe_energies` is the same criterion `ensemble`
+    applies within a run.
+
+    That is only legitimate because the references are sweep-wide:
+    `score_run_grid` computes them once per distinct (solute, solvent,
+    calculator, continuum), so every `interaction_eV` in a sweep shares a
+    zero. A sweep whose rows were measured against different zeros is broken
+    rather than old, so this raises rather than pooling them anyway.
+
+    Returns one record per n, sorted by n.
+    """
+    references = {(s["e_solute_ref_eV"], s["e_solvent_ref_eV"])
+                  for s in summaries}
+    if len(references) > 1:
+        raise ValueError(
+            "the runs in this sweep were scored against different references "
+            f"({sorted(references)}); their interaction energies do not share "
+            "a zero and cannot be pooled. Rescore the sweep in one pass.")
+
+    groups = {}
+    for s in summaries:
+        groups.setdefault(s["n_solvent"], []).append(s)
+
+    pooled = []
+    for n, group in sorted(groups.items()):
+        candidates = [c for s in group for c in s["candidates"]]
+        keep = [candidates[i] for i in
+                dedupe_energies([c["energy_eV"] for c in candidates])]
+        interactions = [c["interaction_eV"] for c in keep]
+        absolutes = [c["energy_eV"] for c in keep]
+        e_min = min(interactions)
+        temperature = group[0]["temperature_K"]
+        # A seed "found" the pooled minimum when its own best candidate is the
+        # same minimum by the same test used everywhere else.
+        seed_minima = [min(c["interaction_eV"] for c in s["candidates"])
+                       for s in group]
+        walls = [f for s in group if (f := _wall_fraction(s)) is not None]
+        pooled.append({
+            "n_solvent": n,
+            "n_seeds": len(group),
+            "pool": len(keep),
+            "e_int_min_kcal": e_min * EV_TO_KCAL,
+            "e_int_ens_kcal":
+                ensemble_energy(interactions, temperature) * EV_TO_KCAL,
+            # Identical weights to the line above, by the minimum-subtraction
+            # argument in `boltzmann_weights`.
+            "e_cluster_ens_eV": ensemble_energy(absolutes, temperature),
+            "found_by": sum(1 for m in seed_minima
+                            if abs(m - e_min) <= DEDUPE_TOL_EV),
+            "seed_minima_kcal": [m * EV_TO_KCAL for m in seed_minima],
+            "mean_contacts": float(np.mean([c["n_contacts"] for c in keep])),
+            # At n = 0 there is no solvent to dissolve, and `assemble` calls
+            # that 1.0 rather than dividing by zero.
+            "dissolved_fraction": (
+                float(np.mean([c["n_contacts"] == 0 for c in keep]))
+                if n else 1.0),
+            # The worst of the seeds, matching `format_wall_diagnostic`: the
+            # question is whether any of the pooled energies is contaminated.
+            "wall": max(walls) if walls else None,
+        })
+    return pooled
 
 
 def format_table(params, summaries):
-    """E_int vs n, with the dissolution diagnostics and a raw cluster energy.
+    """E_int vs n over the pooled candidates, with the search effort behind it.
 
     One sweep is one solute in one solvent, so what is being measured is
     stated once above the table rather than repeated down a column of
     identical values. It comes from `params`, which is also why no summary
     carries a `solute_label` of its own.
     """
-    deltas = _increments(summaries)
+    pooled = pool_by_n(summaries)
+    deltas = _increments(pooled)
     capacity = params["monolayer_capacity"]
+    header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'E_int(ens)':>12} "
+              f"{'dE_int':>10} {'found by':>9} {'pool':>6} "
+              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
+              f"{'wall':>6}")
     lines = [f"leg: {params['solute_label']}/{params['solvent']}",
              f"full first shell: ~{capacity:.0f} solvent molecules", "",
-             f"{'n':>3} {'seed':>4} {'cover':>6} {'E_int(ens)':>12} "
-             f"{'E_int(min)':>12} "
-             f"{'dE_int':>10} {'E(cluster)/eV':>15} {'contacts':>9} "
-             f"{'dissolved':>10} {'uniq':>5} {'wall':>6}",
-             "-" * 102]
-    for s in sorted(summaries, key=_row_order):
-        frac = _wall_fraction(s)
-        delta = deltas.get((s["n_solvent"], s["seed"]))
+             header, "-" * len(header)]
+    for p in pooled:
+        n = p["n_solvent"]
+        delta = deltas.get(n)
+        found = f"{p['found_by']}/{p['n_seeds']}"
         lines.append(
-            f"{s['n_solvent']:>3} "
-            f"{s['seed']:>4} "
-            f"{100 * s['n_solvent'] / capacity:>5.0f}% "
-            f"{s['ensemble_interaction_kcal']:>12.2f} "
-            f"{s['min_interaction_kcal']:>12.2f} "
+            f"{n:>3} "
+            f"{100 * n / capacity:>5.0f}% "
+            f"{p['e_int_min_kcal']:>12.2f} "
+            f"{p['e_int_ens_kcal']:>12.2f} "
             + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
-            + f"{s['ensemble_energy_eV']:>15.6f} "
-            f"{s['mean_contacts']:>9.2f} "
-            f"{100 * s['dissolved_fraction']:>9.0f}% "
-            f"{s['n_unique']:>5} "
-            + (f"{'-':>6}" if frac is None else f"{100 * frac:>5.0f}%"))
-    pairs = ", ".join(
-        f"n = {n}: {count}"
-        for n, count in sorted(Counter(n for n, _ in deltas).items()))
+            + f"{found:>9} "
+            f"{p['pool']:>6} "
+            f"{p['e_cluster_ens_eV']:>15.6f} "
+            f"{p['mean_contacts']:>9.2f} "
+            f"{100 * p['dissolved_fraction']:>9.0f}% "
+            + (f"{'-':>6}" if p["wall"] is None
+               else f"{100 * p['wall']:>5.0f}%"))
     lines.append(
+        "\nOne row per n, over the candidates of every packing at that n "
+        "pooled together\nand deduped by energy. Seeds are independent "
+        "*searches*, not repeat measurements\nof one system, so they are "
+        "pooled rather than averaged: the mean of several\nsearches penalises "
+        "searching more widely, and it is exactly the packing that\nfinds the "
+        "geometry nobody else found that the stratification exists to buy.\n"
+        "'found by' = how many of that n's packings reached the pooled "
+        "minimum; 'pool' =\nhow many distinct minima the pooled search "
+        "turned up. The per-packing numbers\nare in the table below this one.\n"
         "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'cover' = n "
         "as a\npercentage of a full first-shell monolayer; well under 100% is "
         "targeted\nmicrosolvation, where every explicit molecule sits at the "
         "continuum boundary.\n'contacts' = solvent molecules touching the "
-        "solute after optimisation;\n'dissolved' = fraction of unique "
-        "candidates with no contact at all. 'wall' =\nfraction of the sampling "
-        "trajectory's frames with a nonzero wall energy.\n"
-        "\ndE_int = E_int(ens) at this n minus E_int(ens) at n - 1, same seed: "
-        "what the\nnth molecule was worth. Seeds are independent packings rather "
-        "than one\ntrajectory continued, so the seeds at a given n are repeat "
-        "estimates of that\nincrement, not a history -- their scatter is the "
-        "error bar on the step. It\npairs only over seeds present at *both* n, "
-        "so an n with more packings than\nits predecessor leaves the surplus "
-        f"rows without one ({pairs or 'no pairs'}).\n"
-        "\nRead the increment, not the level: E_int(n) does not plateau. "
-        "Every added\nmolecule also collects the continuum's per-molecule bias "
-        "(measured at ~1\nkcal/mol for chloroform, and of either sign -- see the "
-        "binding table in the\ndocs) and, from n = 2 on, solvent-solvent "
-        "cohesion, and neither term switches\noff once the specific sites are "
-        "filled. So the curve tends to a line with a\nnonzero slope, not to a "
-        "flat. Convergence is dE_int settling to a *constant*:\nthe specific "
-        "interaction is exhausted and each further molecule is only being\n"
-        "condensed out of the continuum into a bulk-like site. A step is real "
-        "only if\nit clears the seed spread below.\n"
+        "solute after optimisation;\n'dissolved' = fraction of pooled "
+        "candidates with no contact at all. 'wall' =\nthe worst seed's "
+        "fraction of sampling frames with a nonzero wall energy.\n"
+        "\ndE_int = E_int(min) at this n minus E_int(min) at n - 1: what the "
+        "nth molecule\nwas worth. Read the increment, not the level: E_int(n) "
+        "does not plateau. Every\nadded molecule also collects the continuum's "
+        "per-molecule bias (measured at ~1\nkcal/mol for chloroform, and of "
+        "either sign -- see the binding table in the\ndocs) and, from n = 2 "
+        "on, solvent-solvent cohesion, and neither term switches\noff once the "
+        "specific sites are filled. So the curve tends to a line with a\n"
+        "nonzero slope, not to a flat. Convergence is dE_int settling to a "
+        "*constant*:\nthe specific interaction is exhausted and each further "
+        "molecule is only being\ncondensed out of the continuum into a "
+        "bulk-like site.\n"
+        "\nA minimum is a running minimum over *search effort*, and the effort "
+        "is not\nconstant across n -- the pool column above says how far it "
+        "went at each. Some\nof dE_int's slope is therefore search depth "
+        "rather than chemistry, which is the\nhonest form of the objection "
+        "that would otherwise argue for averaging the seeds.\nThe answer is to "
+        "show the effort, not to average it away: a step is real only "
+        "if\nit survives that reading and the search convergence below.\n"
         "\nWhat does plateau is a difference taken at fixed n between two legs "
         "-- two\nconformers, two tautomers, bound and free, one solute in two "
         "solvents. Both\nlegs carry n molecules in comparable environments, so "
@@ -646,6 +738,43 @@ def format_table(params, summaries):
         "across rows\nof different n -- successive rows differ by a whole solvent "
         "molecule. Making\nthat comparison meaningful is exactly what E_int is "
         "for; subtract those\ninstead.")
+    return "\n".join(lines)
+
+
+def format_seed_detail(summaries):
+    """Per packing, under the pooled table: what each search on its own found.
+
+    These rows used to be the report's primary table, back when the reported
+    number was a per-run one. They are kept because a pooled number hides
+    which packing produced it -- a row whose E_int(min) is alone at the bottom
+    of its n is the arrangement lottery being won once -- but they are not the
+    answer, so they sit below it. No dE_int here: the increment is a pooled
+    quantity now, and a per-packing one would be pairing independent searches
+    by index.
+    """
+    header = (f"{'n':>3} {'seed':>4} {'E_int(ens)':>12} {'E_int(min)':>12} "
+              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
+              f"{'uniq':>5} {'wall':>6}")
+    lines = ["Per-packing detail", "------------------", header,
+             "-" * len(header)]
+    for s in sorted(summaries, key=_row_order):
+        frac = _wall_fraction(s)
+        lines.append(
+            f"{s['n_solvent']:>3} "
+            f"{s['seed']:>4} "
+            f"{s['ensemble_interaction_kcal']:>12.2f} "
+            f"{s['min_interaction_kcal']:>12.2f} "
+            f"{s['ensemble_energy_eV']:>15.6f} "
+            f"{s['mean_contacts']:>9.2f} "
+            f"{100 * s['dissolved_fraction']:>9.0f}% "
+            f"{s['n_unique']:>5} "
+            + (f"{'-':>6}" if frac is None else f"{100 * frac:>5.0f}%"))
+    lines.append(
+        "\n  One row per packing: its own candidates, its own Boltzmann "
+        "average over them,\n  and 'uniq' its own count of distinct minima. "
+        "These do not average to the table\n  above and are not meant to -- "
+        "the pooled minimum is the lowest of the\n  E_int(min) column, not "
+        "the mean of it.")
     return "\n".join(lines)
 
 
@@ -783,76 +912,101 @@ def format_sampling_convergence(summaries):
     return "\n".join(lines)
 
 
-def format_seed_spread(params, summaries):
-    """Run-to-run scatter of E_int at fixed n -- the only error bar here.
+def format_search_convergence(params, summaries):
+    """Do the independent packings at each n agree on the minimum?
 
-    Independent seeds differ only in their packing and initial velocities, so
-    anything they disagree about is sampling error rather than chemistry.
-    That makes the spread the honest uncertainty on every number in the table
-    above, and it is worth stating loudly that a single-seed sweep has none:
-    an absence of error bars reads as precision unless something says
-    otherwise.
+    A packing is a search, not a replica, so the useful question about a set
+    of them is not how far apart their answers scattered but how many of them
+    arrived at the same minimum. Agreement is the convergence evidence: a
+    minimum several independent packings reached is one the search is finding
+    reliably, and a minimum one packing reached and six missed rests entirely
+    on that packing -- the reported number is then an upper bound held up by a
+    single draw, and the honest response is more packings.
 
-    Under stratified packing the seeds at one n are no longer draws from one
-    distribution -- they are deliberately different arrangements -- so the
-    spread mixes sampling noise with designed differences and reads as a
-    conservative upper bound on the error rather than as an estimate of it.
-    That is said in the text, not corrected for: the alternative is many more
-    packings per arrangement, which is the compute this reallocation exists
-    to avoid spending.
+    That is also why this is not an error bar. The spread of the per-packing
+    minima is printed because it is worth seeing, but under stratified packing
+    the packings are *designed* to differ, so their scatter measures the
+    arrangement lottery as much as the sampling noise. A sweep with one
+    packing has none of this evidence at all and must say so, rather than
+    leaving the absence to read as precision.
     """
-    groups = {}
-    for s in summaries:
-        groups.setdefault(s["n_solvent"], []).append(s)
-
-    if not groups:
+    if not summaries:
         return None
+    pooled = pool_by_n(summaries)
 
-    lines = ["Seed spread", "-----------"]
-    if max(len(g) for g in groups.values()) < 2:
+    lines = ["Search convergence", "------------------"]
+    if max(p["n_seeds"] for p in pooled) < 2:
         return "\n".join(lines + [
-            "  Single seed: no error bar. Every E_int above is one trajectory's",
-            "  answer, and the difference between two such answers at the same n",
-            "  has been measured at whole kcal/mol. Re-run with --seeds 3 before",
-            "  subtracting two sweeps from each other -- a double difference is",
-            "  four of these numbers, and it inherits the error of all four."])
+            "  Single packing per n: no agreement to measure. Every E_int above is",
+            "  one search's answer, and the difference between two such answers at",
+            "  the same n has been measured at whole kcal/mol -- at n = 2 the",
+            "  arrangement that puts one solvent molecule on each of pyrazine's",
+            "  nitrogens turns up in well under half of packings. Re-run with",
+            "  --seeds 3 before subtracting two sweeps from each other: a double",
+            "  difference is four of these numbers and inherits the weakness of all",
+            "  four."])
 
-    lines += [f"{'n':>3} {'seeds':>6} {'E_int(ens)':>22} "
-              f"{'E_int(min)':>22}",
-              "-" * 56]
+    header = (f"{'n':>3} {'packings':>9} {'E_int(min)':>12} {'found by':>9} "
+              f"{'spread':>8} {'pool':>6}")
+    lines += [header, "-" * len(header)]
 
     worst = 0.0
-    for n, group in sorted(groups.items()):
-        ens = [g["ensemble_interaction_kcal"] for g in group]
-        mins = [g["min_interaction_kcal"] for g in group]
-        if len(group) > 1:
-            worst = max(worst, max(ens) - min(ens), max(mins) - min(mins))
+    alone = []
+    for p in pooled:
+        minima = p["seed_minima_kcal"]
+        spread = max(minima) - min(minima) if len(minima) > 1 else None
+        if spread is not None:
+            worst = max(worst, spread)
+        if p["n_seeds"] > 1 and p["found_by"] == 1:
+            alone.append(p["n_solvent"])
+        found = f"{p['found_by']}/{p['n_seeds']}"
         lines.append(
-            f"{n:>3} {len(group):>6} {_half_range(ens)} "
-            f"{_half_range(mins)}".rstrip())
+            f"{p['n_solvent']:>3} {p['n_seeds']:>9} "
+            f"{p['e_int_min_kcal']:>12.2f} "
+            f"{found:>9} "
+            + (f"{'-':>8} " if spread is None else f"{spread:>8.2f} ")
+            + f"{p['pool']:>6}")
 
     lines.append(
-        "\n  Mean over seeds +/- half the full range, kcal/mol. Half-range "
-        "rather than\n  a standard deviation because three seeds do not "
-        "estimate one, and the\n  quantity that matters is how far apart two "
-        "runs of the same thing can land.\n  A row of one packing gets no "
-        "spread at all, and prints '-' rather than a\n  zero that would read "
-        "as agreement."
-        f"\n\n  Widest spread in this sweep: {worst:.2f} kcal/mol. Any "
-        "difference you go on\n  to take between sweeps has to clear that, "
-        "and a double difference of four\n  such numbers accumulates it four "
+        "\n  'found by' = how many of that n's packings reached the pooled "
+        "minimum, by the\n  same energy criterion that dedupes candidates "
+        f"within a run ({1000 * DEDUPE_TOL_EV:.0f} meV).\n  'spread' = the "
+        "full range of the per-packing minima, kcal/mol -- printed to be\n"
+        "  seen, not to be used as an error bar, because independent packings "
+        "are\n  independent searches rather than repeat measurements of one "
+        "system.\n"
+        f"\n  Widest spread in this sweep: {worst:.2f} kcal/mol. A difference "
+        "you go on to\n  take between sweeps has to be credible against that, "
+        "and a double difference\n  of four such numbers accumulates it four "
         "times.")
+
+    if alone:
+        lines.append(
+            "\n" + "\n".join("  " + line for line in (
+                f"** WARNING: at n = {', '.join(str(n) for n in alone)} the "
+                "pooled minimum was reached",
+                "** by exactly one packing. That number rests on a single "
+                "draw of the",
+                "** arrangement lottery, and the packings that missed it are "
+                "not evidence",
+                "** against it -- they are evidence that the search is not "
+                "finding it",
+                "** reliably. Add packings (--seeds) rather than steps; a "
+                "longer trajectory",
+                "** mostly sits in the basin it was packed into.",
+            )))
 
     if params["pack_stratified"]:
         lines.append(
-            "\n  Packing was stratified across the seeds at each n (see the "
-            "params block),\n  so these seeds are not repeat draws from one "
-            "distribution: they are\n  deliberately different solvent "
-            "arrangements, spread and clustered. The\n  spread above "
-            "therefore mixes sampling noise with designed differences "
-            "between\n  packings, which makes it a conservative upper bound "
-            "on the error rather than\n  a clean estimate of it. A difference "
-            "still has to clear it.")
+            "\n  Packing was stratified across the packings at each n (see "
+            "the params block),\n  so they are not repeat draws from one "
+            "distribution: they are deliberately\n  different solvent "
+            "arrangements, spread and clustered. That is what makes "
+            "their\n  agreement meaningful -- searches that started from "
+            "different arrangements and\n  converged on one minimum -- and it "
+            "is why disagreement at small n reads as an\n  arrangement "
+            "lottery not yet won often enough. The fix for that is more "
+            "packings,\n  not more steps.")
     return "\n".join(lines)
 
 
@@ -866,8 +1020,10 @@ def format_sweep_report(params, summaries):
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
                  + "-" * 58 + "\n" + format_table(params, summaries))
 
+    parts.append(format_seed_detail(summaries))
+
     for section in (format_sampling_convergence(summaries),
-                    format_seed_spread(params, summaries),
+                    format_search_convergence(params, summaries),
                     format_wall_diagnostic(summaries)):
         if section:
             parts.append(section)

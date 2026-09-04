@@ -37,7 +37,14 @@ from ase.io import read, write
 from ase.optimize import BFGS
 from ase.units import Bohr, Hartree
 
-from report import EV_TO_KCAL, ensemble_energy, format_scored_log, wall_stats
+from report import (
+    DEDUPE_TOL_EV,
+    EV_TO_KCAL,
+    dedupe_energies,
+    ensemble_energy,
+    format_scored_log,
+    wall_stats,
+)
 from solvate_md import (
     _vdw_radii_array,
     align_to_principal_axes,
@@ -45,10 +52,11 @@ from solvate_md import (
     pool_map,
 )
 
-# EV_TO_KCAL and the Boltzmann helpers live in `report` so that formatting a
-# number, or regenerating a log from JSON, never drags in ASE -- and so the
-# live and the regenerated logs weight identically by construction rather than
-# by comment.
+# EV_TO_KCAL, the Boltzmann helpers and the dedupe criterion live in `report`
+# so that formatting a number, or regenerating a log from JSON, never drags in
+# ASE -- and so the live and the regenerated logs weight and dedupe identically
+# by construction rather than by comment. `report` pools candidates across
+# seeds with the same criterion this module applies within one run.
 
 # A solvent molecule counts as touching the solute when some atom pair is
 # within this much of van der Waals contact. Generous on purpose: it is a
@@ -224,25 +232,25 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
                   calculator_kwargs, fmax, steps).energy_eV)
 
 
-def dedupe(pairs, energy_tol_eV=1e-3):
+def dedupe(pairs, energy_tol_eV=DEDUPE_TOL_EV):
     """Drop candidates that optimised into the same minimum.
 
     Consecutive MD frames mostly relax to the same structure, so without this
     a Boltzmann average is really an average over how long the trajectory
-    happened to loiter somewhere. Energy-based rather than RMSD-based: it
-    cannot distinguish two genuinely different structures that happen to be
-    isoenergetic, which for ranking purposes costs nothing.
+    happened to loiter somewhere.
 
     Takes and returns `(candidate, geometry)` pairs, sorted lowest first. The
     geometry rides along because the sort breaks the correspondence with the
     input order, and the caller needs the kept structures to write them out.
+
+    The criterion itself is `report.dedupe_energies`, because the same
+    question -- is this the same minimum? -- is asked again in `report` when
+    the candidates of every seed at one n are pooled, and the two answers have
+    to agree by construction. This is the wrapper that keeps the geometries
+    attached.
     """
-    kept = []
-    for pair in sorted(pairs, key=lambda p: p[0].energy_eV):
-        if all(abs(pair[0].energy_eV - k.energy_eV) > energy_tol_eV
-               for k, _ in kept):
-            kept.append(pair)
-    return kept
+    kept = dedupe_energies([c.energy_eV for c, _ in pairs], energy_tol_eV)
+    return [pairs[i] for i in kept]
 
 
 def select_frames(run_dir, stride, max_frames):

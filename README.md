@@ -61,8 +61,17 @@ of nonzero slope rather than to a flat.
 So read the **increment**, `dE_int(n) = E_int(n) − E_int(n−1)`, which
 `report.txt` prints as a column. Convergence is the increment settling to a
 *constant* — the specific interaction exhausted, every further molecule merely
-condensed into a bulk-like site — not to zero, and a step counts only if it
-clears the seed spread.
+condensed into a bulk-like site — not to zero.
+
+Both are taken over the **pooled** candidates of every packing at that `n`,
+because the packings are independent *searches* and not replicas: averaging
+them penalizes searching more widely, and it dilutes the one packing that
+found the geometry the stratification below exists to buy. So the reported
+number is the pooled minimum, and `found by` says how many packings reached
+it. What that gives up is that a minimum is a running minimum over *search
+effort*, which is not constant across `n` — the `pool` column says how far the
+search went at each, so some of `dE_int`'s slope is search depth rather than
+chemistry. The answer is to show the effort, not to average it away.
 
 Better still, judge "how much is enough" on a **difference at fixed `n`**
 between two legs: two conformers, two tautomers, bound and free, one solute in
@@ -158,27 +167,31 @@ E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 leg: pyrazine/chcl3
 full first shell: ~13 solvent molecules
 
-  n seed  cover   E_int(ens)   E_int(min)     dE_int   E(cluster)/eV  contacts  dissolved  uniq   wall
-------------------------------------------------------------------------------------------------------
-  0    0     0%         0.02        -0.01          -     -446.914347      0.00       100%     3     5%
-  1    0    15%        -5.59        -5.93      -5.61     -890.403421      0.92         8%    12     4%
-  2    0    23%        -6.62        -7.00      -1.03    -1333.694375      0.58        50%    12     5%
-  3    0    31%       -12.47       -12.77      -5.85    -1777.194312      1.79         0%    14     4%
+  n  cover   E_int(min)   E_int(ens)     dE_int  found by   pool   E(cluster)/eV  contacts  dissolved   wall
+------------------------------------------------------------------------------------------------------------
+  0     0%        -0.03        -0.01          -       1/1      2     -446.915704      0.00       100%     0%
+  1     8%        -6.66        -6.54      -6.63       2/3     18     -890.445167      0.33        67%     4%
+  2    15%       -13.02       -12.63      -6.36       1/2     22    -1333.955483      1.23        14%     0%
 ```
 
-`cover` is `n` as a percentage of a full first-shell monolayer — well under
-100% is targeted microsolvation, the regime where every explicit molecule sits
-at the continuum boundary. `E_int` is in kcal/mol and absolute energies in eV
-(ASE's native unit); the mix is deliberate.
-`E_int(ens)` is Boltzmann-averaged over the unique minima,
-`E_int(min)` is the lowest, and `dE_int` is the per-molecule increment against
-the same seed at `n − 1` — the column to read for convergence, per the section
-above. (This particular sweep is one seed, 15 frames and 3 ps, all well under
-the current defaults, so its increments are dominated by sampling noise: they
-do not settle because the sampling never did.) `E(cluster)` is shown beside
-them to give the large numbers the small differences came from — it is *not*
-comparable across rows of different `n`, which is precisely what `E_int` is
-for.
+One row per `n`, over every packing's candidates pooled together and deduped
+by energy. `cover` is `n` as a percentage of a full first-shell monolayer —
+well under 100% is targeted microsolvation, the regime where every explicit
+molecule sits at the continuum boundary. `E_int` is in kcal/mol and absolute
+energies in eV (ASE's native unit); the mix is deliberate.
+`E_int(min)` is the pooled minimum — the reported number — `E_int(ens)` is
+Boltzmann-averaged over the same pool, and `dE_int` is the per-molecule
+increment in the minimum against `n − 1`, the column to read for convergence
+per the section above. `found by` is how many of that `n`'s packings reached
+the pooled minimum and `pool` how many distinct minima the pooled search
+found: a `1/2` says the number rests on a single draw of the arrangement
+lottery. (This particular sweep is the fast smoke test — 3 ps, 20 frames, two
+packings per `n` on average, all well under the current defaults — so its
+increments are dominated by sampling noise: they do not settle because the
+sampling never did.) `E(cluster)` is shown beside them to give the large
+numbers the small differences came from — it is *not* comparable across rows
+of different `n`, which is precisely what `E_int` is for. A **per-packing
+detail** table under it carries what each search found on its own.
 
 ## Packing: the seeds are stratified, not repeated
 
@@ -212,10 +225,11 @@ being the bottleneck anyway.
 count at each. The total, `--seeds × len(--n)`, is spread by monolayer
 coverage: `n = 0` has no solvent to arrange and takes one, and the rest are
 weighted toward small nonzero `n` where the room to arrange is largest, with a
-floor of two so every row keeps an error bar. With `--seeds 3 --n 0 1 2 3` and
-a 13-molecule shell that is 1 / 4 / 4 / 3 rather than 3 / 3 / 3 / 3 — the same
+floor of two so every row keeps something to agree with it. With
+`--seeds 3 --n 0 1 2 3` and a 13-molecule shell that is 1 / 4 / 4 / 3 rather
+than 3 / 3 / 3 / 3 — the same
 compute, better spent. `--seeds 1` falls back to one everywhere, so a
-single-seed sweep still reports no error bar and says so.
+single-packing sweep still reports no agreement and says so.
 
 ## The three diagnostics
 
@@ -238,16 +252,18 @@ report gives, per run, how far into the trajectory the best candidate was
 found and what the last 25% took off the minimum. A minimum found on the final
 frame is an upper bound, not a converged value.
 
-**Seed spread.** Independent seeds differ only in packing and initial
-velocities, so anything they disagree about is sampling error rather than
-chemistry. This is the **only error bar the pipeline produces**, and a
-single-seed sweep says so in place of the table rather than leaving the
-absence to read as precision. A difference between two sweeps has to clear
-that spread; a double difference of four inherits it four times. Since the
-packings are now stratified, the seeds at one `n` are deliberately different
-arrangements as well as different draws, so the spread mixes sampling noise
-with designed differences — read it as a conservative upper bound on the
-error rather than as a clean estimate of it. The report says so.
+**Search convergence.** Independent packings are independent *searches*, so
+the useful question about a set of them is not how far apart their answers
+scattered but how many of them arrived at the same minimum. The report gives,
+per `n`, the pooled minimum, `found by`, the spread of the per-packing minima
+and the pool size. A minimum several packings reached is one the search finds
+reliably; a `1/7` rests entirely on one draw of the arrangement lottery, and
+the report warns about it — the fix there is more packings, not more steps.
+The spread is printed to be seen rather than propagated: since the packings
+are stratified, they are *designed* to differ, so their scatter measures the
+lottery as much as the sampling noise. A single-packing sweep has none of this
+evidence and says so in place of the table, rather than leaving the absence to
+read as precision.
 
 ## Choosing `n`
 

@@ -44,7 +44,7 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimized frames in a continuum. The **scorer**. |
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
-| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`) that `ensemble` re-exports. No ASE/tblite at module scope. |
+| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`) that `ensemble` re-exports. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
 `run_sweep` deliberately does *not* assemble a difference of sweeps. One sweep
@@ -72,6 +72,7 @@ refactor-only commits leave it alone.
 | --- | --- |
 | 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
 | 0.1.1 | `report.txt` gained the `dE_int` column, so an 0.1.0 report has one fewer column and no increment. The docs' claim that `E_int(n)` plateaus was corrected in the same commit -- see below |
+| 0.3.0 | the sweep table is per **n**, not per run: the candidates of every packing at one n are pooled and deduped across packings, and the reported number is the pooled minimum rather than a seed mean. `dE_int` is keyed by n alone; Seed spread becomes Search convergence; the old per-run rows are demoted to a Per-packing detail table. `report.py` only, so 0.2.0 sweeps re-render |
 | 0.2.0 | stratified packing: the arrangement of the solvent now varies by design across the seeds at each n, and the seed budget is spread unevenly over n. Changes the packing for **every n >= 2 run**, so sweeps either side of it are not comparable. `report.txt` gained a `cover` column and `metadata.json` two fields |
 
 ## Artefacts
@@ -84,7 +85,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `run.log` | `solvate_md.run_one_job` | header (system, packing, Hamiltonian, pre-MD relaxation, MD settings), a streaming per-dump table, a footer |
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
-| `report.txt` | `n_sweep.run_sweep` | params block, the `E_int(n)` table, and the sampling diagnostics below |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a per-packing detail table under it, and the sampling diagnostics below |
 
 `metadata.json` also carries `pack_clustering` and `pack_directions` -- the
 stratification parameter this packing was drawn at and the per-molecule
@@ -212,13 +213,49 @@ condensing a molecule out of the continuum, and that `E_int(min)` is a running
 minimum over a configuration space that grows with n, and the curve tends to a
 line of nonzero slope rather than to a flat.
 
-So `report.txt` carries a **`dE_int` column** -- `E_int(ens)` at this n minus
-`E_int(ens)` at n - 1, paired within a seed. Paired within a seed rather than
-across the seed mean so that the seeds at one n read as repeat estimates of
-one increment and the scatter is visible; it is not a history, since seed 0 at
-n = 2 is an independent packing rather than seed 0 at n = 1 with a molecule
-added. Convergence is the increment settling to a **constant**, not to zero,
-and a step counts only if it clears the seed spread.
+So `report.txt` carries a **`dE_int` column** -- `E_int(min)` at this n minus
+`E_int(min)` at n - 1, over the **pooled** candidates of every packing at each
+n. It is keyed by n alone. It used to pair by seed *index*, which paired
+nothing physical: seed 0 at n = 2 is not seed 0 at n = 1 with a molecule
+added, it is an independent packing, so the pairing had variance
+`var(A) + var(B)` where pairing exists to cancel variance, and under
+stratification it did not even hold the arrangement fixed, since
+`c = (seed + 0.5) / n_seeds_at_this_n` and the seed count varies with n. It
+also silently dropped every row whose index had no counterpart -- with
+`allocate_seeds` giving n = 0 one packing, that was all but one row of the
+table. Convergence is the increment settling to a **constant**, not to zero.
+
+Only `E_int(min)` gets an increment. A second one on the ensemble average
+would only invite reporting whichever of the two looks better.
+
+**The seeds at one n are pooled, not averaged.** They are independent
+*searches*, not replicas of a physical system: a mean over them penalizes
+searching more widely, and it fights the stratification below head-on, since
+that design exists precisely so that one packing in seven finds the
+both-nitrogens geometry and the mean then dilutes that discovery by the six
+that missed it. Measured on one sweep at n = 2: six packings find -12.12 and
+one finds -11.60, and the mean of the minima is -12.05 -- a number no geometry
+has. So the reported number at each n is the minimum over the pooled
+candidates of every packing, and the pool is deduped across packings with the
+same energy criterion `ensemble` uses within a run (`report.dedupe_energies`,
+1 meV), because seven packings finding one basin would otherwise multiply its
+Boltzmann weight by seven. `E_int(ens)` is pooled the same way and retained:
+Boltzmann weighting at 298 K (kT = 0.594 kcal/mol) is a soft minimum rather
+than a democratic average, and it is continuous in the candidate set where the
+minimum is a step function.
+
+Pooling is only legitimate because the references are sweep-wide --
+`score_run_grid` computes them once per distinct (solute, solvent, calculator,
+continuum), so every `interaction_eV` in a sweep shares a zero. `pool_by_n`
+checks that and **raises** if not: a sweep whose rows were measured against
+different zeros is broken, not old.
+
+What a pooled minimum gives up is that it is a running minimum over *search
+effort*, and the effort is not constant across n -- one measured sweep's pool
+went 42 / 89 / 174 / 247 candidates over n = 1..4, so some of `dE_int`'s slope
+is search depth rather than chemistry. That is the honest form of the concern
+that would otherwise argue for means; the answer is the `pool` and `found by`
+columns, which show the effort rather than averaging it away.
 
 The quantity that does plateau is a **difference at fixed n** between two legs
 -- two conformers, two tautomers, bound and free, one solute in two solvents.
@@ -360,8 +397,9 @@ packing, is largest at small nonzero n -- which is where the problem is. So
 `n_sweep.allocate_seeds` spends a **fixed total** of `n_seeds * len(n_values)`
 unevenly: n = 0 takes 1, the rest are weighted by `1 - min(n/capacity, 1)` and
 handed out by largest remainder over a floor of 2 packings, so every n >= 1
-keeps an error bar. Capacity comes from `shell_capacity.monolayer_capacity`,
-computed once per sweep, and lands in the params block as
+keeps something to agree with it. Capacity comes from
+`shell_capacity.monolayer_capacity`, computed once per sweep, and lands in the
+params block as
 `monolayer_capacity` alongside `seeds_per_n`.
 
     capacity 13, budget 3 x 4 = 12
@@ -370,20 +408,22 @@ computed once per sweep, and lands in the params block as
 
 Same compute, better spent. When the budget cannot meet the floor of 2 --
 notably `--seeds 1` -- the split is abandoned rather than fudged and every n
-gets `n_seeds`, so a single-seed sweep still reports no error bar and says so.
+gets `n_seeds`, so a single-packing sweep still reports no agreement and
+says so.
 `--seeds` is therefore the *average* packings per n now, not the count at
-each. Both report sections that assume seeds degrade gracefully:
-`format_seed_spread` groups by n, and the `dE_int` pairing uses
-`by_key.get((n-1, seed))` so it simply yields fewer pairs -- `report.txt`
-prints how many each n got.
+each. Nothing downstream assumes an equal count: `report.txt` aggregates by n
+over the pooled candidates and prints how many packings each n got.
 
-**The seed spread is now a conservative upper bound, not a clean error bar.**
+**Because the packings differ by design, their scatter is not an error bar.**
 Independent seeds used to differ only in packing and velocities; they now
-differ by design as well, so the spread mixes sampling noise with deliberate
-arrangement differences. `report.txt` says so under Seed spread rather than
-correcting for it -- the correction is more packings per arrangement, which is
-the compute this reallocation exists to avoid spending. A difference still has
-to clear it.
+differ deliberately, so their spread measures the arrangement lottery as much
+as the sampling noise. That is why `report.txt` reports **agreement** rather
+than scatter: `found by` says how many of an n's packings reached the pooled
+minimum, and that is the convergence evidence -- searches started from
+different arrangements converging on one answer. Disagreement at small n means
+the lottery has not been won often enough, and the fix is more packings, not
+more steps. The spread is still printed, to be seen rather than to be
+propagated.
 
 `report.txt` also gained a **`cover` column**, `n / monolayer_capacity` as a
 percent, which is what says whether a row is targeted microsolvation or a real
@@ -442,13 +482,16 @@ makes *when it last fell* a convergence test, and `report.txt` now runs it:
   candidate was found and what the last 25% took off `E_int(min)`. A minimum
   found at 100% is an upper bound, not a converged value; a minimum found
   early and never beaten is evidence the sampling saturated.
-- **Seed spread** -- mean over seeds +/- half the full range, at fixed n.
-  Independent seeds differ only in packing and initial velocities, so anything
-  they disagree about is sampling error rather than chemistry. **This is the
-  only error bar the pipeline produces**, and a single-seed sweep says so in
-  place of the table rather than leaving the absence to read as precision.
-  A double difference is four of these numbers and inherits the error of all
-  four.
+- **Search convergence** -- per n: the pooled minimum, `found by` (how many of
+  that n's packings reached it, by the 1 meV dedupe criterion), the spread of
+  the per-packing minima, and the pool size. Independent packings are
+  independent *searches*, so their **agreement on the minimum** is the
+  evidence, not an error bar on a mean: a minimum several packings reached is
+  one the search finds reliably, and a `1/7` is a number resting on a single
+  draw of the arrangement lottery, which the report warns about. A
+  single-packing sweep has no such evidence and says so in place of the table
+  rather than leaving the absence to read as precision. A double difference is
+  four of these numbers and inherits the weakness of all four.
 
 Both are computed from the candidate list already in `scored.json`, so
 `python -m report <dir>` renders them for anything on disk -- no MD, no
