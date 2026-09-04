@@ -67,9 +67,11 @@ and two solvents -- a double difference such as
 module to know that a difference is what you eventually want. What that gives
 up is the guarantee that both halves ran under identical settings, so each
 sweep writes a **params block** into `sweep.json` recording the whole
-`Condition` it ran under plus the package version and git commit -- cheap
+`Condition` it ran under, the package version and git commit, and the
+versions of the libraries the numbers actually came out of -- cheap
 insurance, given that `wall_slack` has already changed meaning once (at
-c429f8a) without changing its name.
+c429f8a) without changing its name, and that the commit says nothing about
+which build of tblite evaluated the Hamiltonian.
 
 At small n the packing *is* the answer -- a chloroform bound to a pyrazine
 nitrogen does not detach, migrate around the ring and rebind at the far one
@@ -109,8 +111,9 @@ from pathlib import Path
 from ase.io import read
 
 from ensemble import Scoring, score_run_grid
-from report import (VERSION, format_sweep_report, git_commit, pool_by_n,
-                    timestamp, write_best_geometries)
+from report import (VERSION, format_sweep_report, git_commit,
+                    library_versions, pool_by_n, timestamp,
+                    write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
@@ -270,6 +273,9 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
     from a hand-written list, so every default and every override is captured
     and no field can be added to either dataclass without appearing here.
     Only the two `Condition` fields that vary within a sweep are dropped.
+
+    The dataclasses cover the settings; `library_versions` covers the code
+    underneath them, which they cannot.
     """
     params = {k: v for k, v in asdict(condition).items()
               if k not in ("n_solvent", "label")}
@@ -289,6 +295,10 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
         "git_commit": git_commit(),
         "timestamp": timestamp(),
     })
+    # The commit pins this repo, not the Hamiltonian under it: a sweep run
+    # against a different tblite is a different measurement, and without this
+    # the two params blocks would agree.
+    params.update(library_versions(condition.calculator))
     return params
 
 

@@ -98,6 +98,7 @@ from report import (
     ensemble_energy,
     format_dock_report,
     git_commit,
+    library_versions,
     timestamp,
     write_dock_best_geometries,
 )
@@ -526,7 +527,8 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
 
     Built from `asdict` of the real `Docking` and `Scoring`, the same
     convention `n_sweep.sweep_params` uses, so a docking run and a sweep are
-    reproducible from their own params block by the same rule.
+    reproducible from their own params block by the same rule -- including
+    the `library_versions` that say which build of the Hamiltonian ran.
     """
     params = {k: v for k, v in asdict(docking).items()}
     params.update(asdict(scoring))
@@ -544,6 +546,7 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
         "git_commit": git_commit(),
         "timestamp": timestamp(),
     })
+    params.update(library_versions(docking.calculator))
     return params
 
 

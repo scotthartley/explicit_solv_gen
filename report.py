@@ -30,6 +30,7 @@ import subprocess
 import time
 from collections import Counter
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -69,6 +70,43 @@ def git_commit():
 
 def timestamp():
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# The libraries that can move a number, keyed by the calculator that uses
+# them. ASE and numpy are common to every calculator: the optimiser, the
+# integrator and the unit conversions all live there.
+_CALCULATOR_LIBRARIES = {
+    "gfn1-xtb": ("tblite",),
+    "gfn2-xtb": ("tblite",),
+    "mace-off23": ("mace-torch", "torch"),
+}
+
+
+def library_versions(calculator):
+    """`{"<dist>_version": ...}` for the libraries behind `calculator`.
+
+    Recorded beside the git commit because the commit does not pin them. Two
+    sweeps from identical code under an identical `Condition` still rest on
+    different Hamiltonians if one ran against a different GFN2 build, and
+    nothing else on disk would say so. Measured: a cluster env held at tblite
+    0.4.0 by an unrelated `dftd4<4` pin, against 0.7.0 locally -- the params
+    blocks were indistinguishable.
+
+    Read from installed package metadata rather than by importing anything,
+    so this module keeps its promise of no ASE, tblite or torch at any scope
+    and a report still regenerates in an environment that has none of them.
+    `None` where the metadata is unreadable, which is a visible gap rather
+    than a silently absent key.
+    """
+    names = ("ase", "numpy") + _CALCULATOR_LIBRARIES.get(calculator.lower(), ())
+    versions = {}
+    for name in names:
+        try:
+            found = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            found = None
+        versions[f"{name.replace('-', '_')}_version"] = found
+    return versions
 
 
 def kv_block(title, mapping, indent="  "):

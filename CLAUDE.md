@@ -58,9 +58,12 @@ script, and imposed a shape real sweeps did not have.
 What that gives up is the guarantee that both halves of a difference ran under
 identical settings, so every sweep now records a **params block**: the whole
 `Condition` (via `asdict`, so new fields are picked up automatically) plus the
-package version (`report.VERSION`), the git commit, and a timestamp. Given
-`wall_slack` silently changed meaning at `c429f8a`, this is cheap insurance --
-check it before subtracting two sweeps.
+package version (`report.VERSION`), the git commit, a timestamp, and the
+versions of the libraries the numbers came out of (`report.library_versions`,
+read from package metadata so nothing has to be imported). Given `wall_slack`
+silently changed meaning at `c429f8a`, and that the commit pins this repo but
+not the build of tblite underneath it, this is cheap insurance -- check it
+before subtracting two sweeps.
 
 ### Versioning
 
@@ -72,6 +75,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.5.0 | the params block of `sweep.json` / `dock.json` gains `ase_version`, `numpy_version` and the calculator's own library (`tblite_version`, or `mace_torch_version` / `torch_version`), from installed package metadata. Additive: nothing reads them, so older sweeps re-render unchanged |
 | 0.4.0 | `scored.json` gains `pack_mode` (`"md"` or `"dock"`); every run directory gains `ref_solute.xyz` / `ref_solvent.xyz`, the relaxed reference geometries the run's `E_int` was measured against. `docking.py` (a second, constructive generator) and `dft_export.py` (candidate export for DFT) are new. Existing sweeps re-render unchanged (only the version line moves); `pack_mode` defaults to `"md"` when absent so nothing pre-0.4.0 breaks |
 | 0.3.1 | `report.txt` gained a Best geometry at each n section and a `best` marker in the per-packing detail table; the sweep directory gained one `best_n<N>.xyz` per n. `report.py` only, so 0.3.0 sweeps re-render |
 | 0.1.0 | first numbered version; `report.VERSION` added and recorded in the params block |
@@ -732,6 +736,19 @@ never contains one, only optimised candidates.
   differently. It is not just a margin: the wall volume sets the translational
   entropy of a dissociated solvent molecule, so a looser wall makes
   dissociation more favourable.
+- **tblite 0.4.0 floods stdout**, and an unrelated pin is what selects it.
+  `tblite-python` 0.4.0 ships debug `print`s in
+  `library.get_post_processing_dict`, which runs *twice per single point*
+  (`get_bond_orders` and `get_dipole` both call it), so every force evaluation
+  dumps the full N x N bond-order matrix. One sweep produced a 50 GB slurm
+  file that way. The pipeline itself writes nothing of the sort: all real
+  output goes to `run.log` / `scored.log` / JSON, and a whole sweep emits a
+  couple of hundred bytes to stdout. You land on 0.4.0 because conda-forge's
+  `tblite 0.7.0` requires `dftd4 >=4.2.0`, so `environment.yml`'s `dftd4<4`
+  pin -- added for a `libdftd4` segfault in `get_polarizabilities` seen on one
+  cluster with tblite 0.6.0 -- solves the whole stack backwards. The pin and
+  the flood are the same decision; revisit them together, and note that the
+  segfault has not been retested against 0.7.0.
 - Don't pipe a long background run through `tail` -- it buffers until the pipe
   closes, so no interim output appears no matter what `flush=True` says. Tail
   the run's own `run.log` instead; it is flushed per line.
