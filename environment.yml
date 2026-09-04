@@ -4,12 +4,19 @@ channels:
 dependencies:
   - python=3.11
   - packmol
-  - xtb
   - ase
-  - tblite
+  # Floor, not a preference: tblite 0.4.x ships debug prints in library.py
+  # that dump a full bond-order matrix twice per single point -- 50 GB of
+  # slurm output on one sweep. Nothing else here excludes it, because the
+  # package that used to drag it in was `xtb`.
+  #
+  # `xtb` is deliberately absent. This pipeline never invokes the binary --
+  # it reaches GFN2 through tblite, and the only `xtb` in the codebase is the
+  # command `scored.log` prints for you to reproduce a geometry by hand. But
+  # most linux-64 `xtb 6.7.1` builds require `tblite >=0.4.0,<0.5.0a0` and
+  # the newest caps it at 0.6.x, so keeping it here constrains the actual
+  # Hamiltonian for the sake of a manual cross-check. Install it separately
+  # when you want it:  conda create -n xtb_check -c conda-forge xtb
+  - tblite>=0.5
   - tblite-python
   - numpy
-  # dftd4 4.2.0 segfaults in get_polarizabilities on this cluster (SIGSEGV
-  # inside libdftd4's OpenMP region, reproducible even single-threaded, with
-  # tblite 0.6.0); pin <4 until upstream fixes it.
-  - dftd4<4

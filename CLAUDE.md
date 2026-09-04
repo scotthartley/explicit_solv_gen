@@ -20,9 +20,12 @@ whether the sampling behind it was sufficient.
 
 ## Environment
 
-Conda env from `environment.yml` (packmol, xtb, ase, tblite, numpy; MACE via
-pip). **packmol is installed into the env's bin and is not on the default
-PATH**, so either activate the env or run with it prepended:
+Conda env from `environment.yml` (packmol, ase, tblite, numpy; MACE via pip).
+The `xtb` binary is deliberately *not* in it -- nothing here invokes it, and
+its conda package constrains which tblite you get; install it separately if
+you want the manual cross-check below. **packmol is installed into the env's
+bin and is not on the default PATH**, so either activate the env or run with
+it prepended:
 
     conda env create -f environment.yml
     conda activate solvate_md
@@ -736,27 +739,31 @@ never contains one, only optimised candidates.
   differently. It is not just a margin: the wall volume sets the translational
   entropy of a dissociated solvent molecule, so a looser wall makes
   dissociation more favourable.
-- **tblite 0.4.0 floods stdout**, and an unrelated pin is what selects it.
-  `tblite-python` 0.4.0 ships debug `print`s in
-  `library.get_post_processing_dict`, which runs *twice per single point*
-  (`get_bond_orders` and `get_dipole` both call it), so every force evaluation
-  dumps the full N x N bond-order matrix. One sweep produced a 50 GB slurm
-  file that way. The pipeline itself writes nothing of the sort: all real
+- **A huge stdout file means tblite 0.4.x.** `tblite-python` 0.4.0 ships
+  debug `print`s in `library.get_post_processing_dict`, which runs *twice per
+  single point* (`get_bond_orders` and `get_dipole` both call it), so every
+  force evaluation dumps the full N x N bond-order matrix -- one sweep
+  produced a 50 GB slurm file. 0.5.0, 0.6.0 and 0.7.0 are clean, checked by
+  extracting the packages. This pipeline writes nothing of the sort: all real
   output goes to `run.log` / `scored.log` / JSON, and a whole sweep emits a
-  couple of hundred bytes to stdout. **0.4.0 alone has them** -- 0.5.0, 0.6.0
-  and 0.7.0 are clean, checked by extracting the packages -- and no clean
-  solve of this `environment.yml` selects it: on linux-64 the `dftd4<4` pin
-  gives tblite 0.5.0, and dropping the pin gives 0.7.0. An env holding 0.4.0
-  got there by *incremental* downgrade, conda minimising changes to an
-  existing env rather than re-solving it, so the fix is to rebuild the env
-  from `environment.yml` rather than to patch a file or lift the pin.
-
-  The pin itself (added for a `libdftd4` SIGSEGV in `get_polarizabilities`,
-  seen on one cluster with tblite 0.6.0) costs a GFN2 build: 0.5.0 under the
-  pin against 0.7.0 without it. Note it was never a choice *between* tblite
-  versions -- 0.6.0 and 0.7.0 require the identical `dftd4 >=4.2.0,<4.3`, so
-  upgrading tblite alone would never have avoided the segfault. Lifting the
-  pin means retesting it, which has not been done.
+  couple of hundred bytes to stdout, so a large one is always the
+  environment, never the code. `environment.yml` therefore carries a
+  `tblite>=0.5` floor -- what used to select 0.4.x was `xtb`, since most
+  linux-64 `xtb 6.7.1` builds require `tblite >=0.4.0,<0.5.0a0` and the
+  newest caps it at 0.6.x. Which of the two a solver holds back is a
+  tie-break, and it differed between machines.
+- **The `dftd4<4` pin is gone, and the segfault behind it did not reproduce.**
+  dftd4 4.2.0 was crashing GFN2 single points on the cluster -- SIGSEGV in
+  libdftd4's OpenMP region, on a bare water molecule, even at
+  `OMP_NUM_THREADS=1`, with GFN1/D3 unaffected -- which pinned dftd4 below 4
+  and dragged tblite down with it (b36541c). Retested at tblite 0.7.0 with
+  dftd4 4.2.0 `gfortran_*_1`: the same reproducer now runs clean on that
+  cluster and locally, to identical energies (GFN1 -156.9675059, GFN2
+  -137.9677759 eV on H2O). Whether the tblite upgrade or dftd4's `_1` rebuild
+  fixed it was not isolated. If it returns, try `ulimit -s unlimited` and
+  `OMP_STACKSIZE` first: a SIGSEGV in a Fortran OpenMP region that reproduces
+  single-threaded is the signature of stack exhaustion, not necessarily a
+  code bug.
 - Don't pipe a long background run through `tail` -- it buffers until the pipe
   closes, so no interim output appears no matter what `flush=True` says. Tail
   the run's own `run.log` instead; it is flushed per line.
@@ -765,8 +772,9 @@ never contains one, only optimised candidates.
 - `best.xyz` is relaxed **in the scoring continuum, with no wall**, so a plain
   `xtb best.xyz --opt` optimizes it on a different surface and keeps moving it.
   Reproduce it with `xtb best.xyz --gfn 2 --alpb <solvent> --sp`; `scored.log`
-  prints the exact command. Two further traps, both checked rather than
-  assumed: ASE's `fmax` (largest per-atom force, eV/A) and xtb's gradient norm
+  prints the exact command. The binary is not in this env (see Environment);
+  `conda create -n xtb_check -c conda-forge xtb` when you want it. Two
+  further traps, both checked rather than assumed: ASE's `fmax` (largest per-atom force, eV/A) and xtb's gradient norm
   (all components, Eh/a) are **different criteria** -- the old 0.05 eV/A is
   ~2.5x looser than `--opt normal`'s 1e-3 Eh/a -- so `scored.log` now prints
   both per candidate. And tblite and the env's `xtb` 6.4.1 binary were
