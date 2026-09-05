@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -69,7 +69,7 @@ _CALCULATOR_LIBRARIES = {
 def library_versions(calculator):
     """`{"<dist>_version": ...}` for the libraries behind `calculator`.
 
-    Recorded beside the git commit because the commit does not pin them. Two
+    Recorded beside `VERSION` because a version does not pin them. Two
     sweeps from identical code under an identical `Condition` still rest on
     different Hamiltonians if one ran against a different GFN2 build, and
     nothing else on disk would say so. Measured: a cluster env that had
@@ -359,11 +359,9 @@ def format_run_footer(records, target_K=None, elapsed_s=None):
         return kv_block("MD summary", {"frames written": 0})
 
     n = len(records)
-    temps = [r["temperature_K"] for r in records]
-    epots = [r["potential_energy_eV"] for r in records]
-    mean_T = sum(temps) / n
-    mean_E = sum(epots) / n
-    sd_E = (sum((e - mean_E) ** 2 for e in epots) / n) ** 0.5
+    mean_T = float(np.mean([r["temperature_K"] for r in records]))
+    epots = np.array([r["potential_energy_eV"] for r in records])
+    mean_E, sd_E = float(epots.mean()), float(epots.std())
     wall = wall_stats(records)
     frac = wall["wall_active_fraction"]
 
@@ -406,7 +404,7 @@ class RunLogger:
         self._fh.flush()
 
     def header(self, meta, extra=None):
-        self._target_K = meta.get("temperature_K")
+        self._target_K = meta["temperature_K"]
         if not self._live:
             self._write(f"[regenerated from JSON on {timestamp()}]\n")
         self._write(format_run_header(meta, extra))
@@ -429,13 +427,6 @@ class RunLogger:
     def close(self):
         if not self._fh.closed:
             self._fh.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
 
 
 # --------------------------------------------------------------------------
@@ -502,12 +493,10 @@ def format_scored_log(summary, meta):
     max_frames = summary["max_frames"]
     parts.append(kv_block("Provenance", {
         "run directory": summary["run_dir"],
-        # Missing on anything scored before 0.4.0 -- defaults to "md" rather
-        # than failing, since it is informational and never enters a
-        # computation, unlike the mandatory wall fields.
-        "pack mode": summary.get("pack_mode", "md"),
-        "trajectory": (f"traj.xyz, every {summary['stride']}th frame"
-                       + (f", at most {max_frames}" if max_frames else "")
+        "pack mode": summary["pack_mode"],
+        "trajectory": ("traj.xyz"
+                       + (f", at most {max_frames} frames, spread evenly"
+                          if max_frames else "")
                        + f"  ->  {summary['n_frames_scored']} scored"),
         "sampling Hamiltonian": (
             f"{summary['calculator']}, "
@@ -1110,7 +1099,7 @@ def format_wall_diagnostic(summaries):
     worst_frac, worst = max(known, key=lambda pair: pair[0])
     lines = ["Wall diagnostic", "---------------",
              f"  max wall-active fraction   {100 * worst_frac:.1f}%  "
-             f"({worst.get('label', '?')} seed {worst.get('seed', '?')})"]
+             f"({worst['label']} seed {worst['seed']})"]
 
     warning = wall_warning(worst_frac)
     if warning:
@@ -1357,7 +1346,7 @@ def format_sweep_report(params, summaries):
     # occupancy fields are `None` by convention (see `_assemble_dock_n`), a
     # real absence rather than a broken run, and must not be mistaken for
     # one. `format_dock_report` never calls this at all.
-    if all(s.get("pack_mode", "md") == "md" for s in summaries):
+    if all(s["pack_mode"] == "md" for s in summaries):
         parts.append(format_basin_occupancy(params, summaries, pooled))
 
     for section in (format_sampling_convergence(summaries),
@@ -1454,7 +1443,7 @@ def dock_row_from_summary(s):
         "n_solvent": s["n_solvent"],
         "run_dir": s["run_dir"],
         "pool": s["n_unique"],
-        "n_refined": s.get("n_refined", s["n_frames_scored"]),
+        "n_refined": s["n_refined"],
         "found_by": s["found_by"],
         "e_int_min_kcal": s["min_interaction_kcal"],
         "e_int_ens_kcal": s["ensemble_interaction_kcal"],
@@ -1674,11 +1663,12 @@ def render_run_dir(path):
     meta = _load(path / "metadata.json")
     records = _load(path / "energies.json")
 
-    with RunLogger(path / "run.log", live=False) as log:
-        log.header(meta)
-        for record in records:
-            log.md_row(record)
-        log.footer(records)
+    log = RunLogger(path / "run.log", live=False)
+    log.header(meta)
+    for record in records:
+        log.md_row(record)
+    log.footer(records)
+    log.close()
     written = [path / "run.log"]
 
     for scored in sorted(path.glob("scored*.json")):

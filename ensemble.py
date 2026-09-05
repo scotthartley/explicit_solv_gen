@@ -38,7 +38,6 @@ from ase.optimize import BFGS
 from ase.units import Bohr, Hartree
 
 from report import (
-    DEDUPE_TOL_EV,
     EV_TO_KCAL,
     dedupe_groups,
     ensemble_energy,
@@ -75,21 +74,18 @@ class Scoring:
     """Everything that sets how a trajectory is rescored.
 
     One owner per default, for the same reason the MD lengths live only on
-    `Condition`: `score_run` used to default `stride=10, max_frames=40` while
-    the CLI advertised 1 and 50, so a script that called it directly scored a
-    different set of frames than a sweep did and nothing said so.
+    `Condition`: an internal function that defaulted `max_frames` for itself
+    would be a second, silently different opinion, and this pipeline has been
+    bitten by exactly that twice.
     """
 
-    # Score every Nth dump. Redundant with `max_frames` whenever that cap
-    # bites -- `max_frames` selects by `linspace` over the whole trajectory,
-    # so it discards whatever thinning happened first -- and at these defaults
-    # the cap always bites. So this is 1 unless you specifically want a
-    # prefix-thinned trajectory.
-    stride: int = 1
     # Cap on frames scored per run, spread evenly over the whole trajectory.
-    # This, not `stride`, is what sets scoring cost, and the cost is
-    # independent of run length: a longer trajectory is scored at wider
-    # spacing for the same price.
+    # This is what sets scoring cost, and the cost is independent of run
+    # length: a longer trajectory is scored at wider spacing for the same
+    # price. There used to be a `stride` beside it, which selected every Nth
+    # dump before this cap was applied -- but the cap selects by `linspace`
+    # over the whole trajectory, so it discarded whatever thinning `stride`
+    # had done, and at any usable setting the cap always bites.
     max_frames: int = 50
     # Optimiser convergence, eV/A per-atom max force. Every term of E_int has
     # to be relaxed to convergence, not merely to a stationary-ish geometry:
@@ -139,8 +135,8 @@ class Candidate:
     n_opt_steps: int
     # How many scored frames quenched into this minimum, and their sampling
     # dump indices -- the inherent-structure occupancy `n_sweep`'s docstring
-    # discusses. 1 / [frame] until `dedupe` groups this candidate with its
-    # duplicates and `assemble` calls `dataclasses.replace` on the survivor;
+    # discusses. 1 / [frame] until `assemble` groups this candidate with its
+    # duplicates and calls `dataclasses.replace` on the survivor;
     # a docked candidate (no sampling frame at all) carries `None` for both,
     # a real absence rather than a population of one.
     n_frames: int = 1
@@ -249,56 +245,14 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
             solute_relaxed.atoms, solvent_relaxed.atoms)
 
 
-def dedupe(pairs, energy_tol_eV=DEDUPE_TOL_EV):
-    """Group candidates that optimised into the same minimum, keep one each.
-
-    Consecutive MD frames mostly relax to the same structure. At the
-    pipeline's old 5 fs dump interval that made naive frame-counting an
-    average over how long the trajectory happened to loiter somewhere -- 5 fs
-    against a ~0.55 ps shell decorrelation time is ~100x oversampled, so a
-    frame count was pure autocorrelation, not signal. At today's defaults --
-    50 fs dumps, `max_frames = 50` selecting down to ~200 fs of scored-frame
-    spacing on a 10 ps trajectory -- that ratio is ~2.75x, roughly the ~18
-    effectively independent shell configurations the MD-length defaults were
-    chosen to buy (see CLAUDE.md). A frame count is no longer pure
-    autocorrelation, so the membership is now kept rather than thrown away:
-    each survivor's `n_frames` / `frames` (set by `assemble` via
-    `dataclasses.replace`, since a bare `Candidate` above knows only about
-    itself) is a usable, free inherent-structure population estimate --
-    every energy behind it was already computed regardless.
-
-    Takes `(candidate, geometry)` pairs, sorted lowest first, and returns
-    `(candidate, geometry, members)` triples: `members` is every pre-dedupe
-    candidate this representative absorbed (representative first, same
-    order `dedupe_groups` returns). The geometry and the members both ride
-    along because the sort breaks the correspondence with the input order,
-    and the caller needs the kept structures to write out and the members to
-    build the occupancy fields.
-
-    The criterion itself is `report.dedupe_groups`, because the same
-    question -- is this the same minimum? -- is asked again in `report` when
-    the candidates of every seed at one n are pooled, and the two answers have
-    to agree by construction. This is the wrapper that keeps the geometries
-    (and now the membership) attached.
-    """
-    groups = dedupe_groups([c.energy_eV for c, _ in pairs], energy_tol_eV)
-    return [(pairs[group[0]][0], pairs[group[0]][1],
-             [pairs[i][0] for i in group])
-            for group in groups]
-
-
-def select_frames(run_dir, stride, max_frames):
+def select_frames(run_dir, max_frames):
     """The frames of one run directory that will be scored, and their context.
 
-    Returns `(meta, records, indices, frames)`. Split out of `score_run` so
-    the parent can do it for every job in a sweep before any optimisation
+    Returns `(meta, records, indices, frames)`. Split out of the scoring pass
+    so the parent can do it for every job in a sweep before any optimisation
     starts: reading a trajectory is milliseconds, and doing it up front is
     what turns a sweep into one flat list of independent candidate
     optimisations rather than a handful of serial per-directory loops.
-
-    `stride` and `max_frames` are not independent. `max_frames` selects by
-    `linspace` over the whole trajectory, so whenever it bites it discards
-    whatever thinning `stride` did -- which at the defaults is always.
     """
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "metadata.json").read_text())
@@ -307,11 +261,11 @@ def select_frames(run_dir, stride, max_frames):
     # energy straight out of this list.
     records = json.loads((run_dir / "energies.json").read_text())
 
-    frames = read(str(run_dir / "traj.xyz"), index=f"::{stride}")
+    frames = read(str(run_dir / "traj.xyz"), index=":")
     # Carried alongside so a candidate can name the dump it actually came
-    # from. `i * stride` would index the subsampled list instead, and label a
-    # 300-dump trajectory 0..70 as soon as `max_frames` bites.
-    indices = list(range(0, len(frames) * stride, stride))
+    # from -- `max_frames` below subsamples, and an index into the subsampled
+    # list would label a 300-dump trajectory 0..49.
+    indices = list(range(len(frames)))
     if max_frames is not None and len(frames) > max_frames:
         # Spread over the whole trajectory rather than taking a prefix.
         sel = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
@@ -367,16 +321,32 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
 
     candidates = [c for c, _ in pairs]
     n_frames_scored = len(candidates)
-    # `dedupe` groups pre-dedupe candidates by basin; a survivor's own
-    # `n_frames` / `frames` (1 / [its own frame]) is replaced with the
-    # pooled membership of its whole group, which is what makes the
-    # occupancy fields below a population over *scored frames*, not over
-    # distinct minima. `Σ n_frames == n_frames_scored` by construction: the
-    # groups partition `pairs`.
+    # Consecutive MD frames mostly relax into the same basin, so grouping
+    # them is what turns a candidate list into an inherent-structure
+    # population: each survivor's `n_frames` / `frames` (1 / [its own frame]
+    # on a bare `Candidate`, which knows only about itself) is replaced with
+    # its whole group's membership, which is what makes the occupancy fields
+    # below a population over *scored frames* rather than over distinct
+    # minima. `Σ n_frames == n_frames_scored` by construction: the groups
+    # partition `pairs`.
+    #
+    # The counts used to be discarded here, on the grounds that a frame count
+    # at the old 5 fs dump interval was pure autocorrelation -- ~100x
+    # oversampled against a ~0.55 ps shell decorrelation time. At today's
+    # defaults (50 fs dumps, `max_frames = 50` selecting down to ~200 fs of
+    # scored-frame spacing on a 10 ps trajectory) that ratio is ~2.75x,
+    # roughly the ~18 independent shell configurations the MD lengths were
+    # chosen to buy, and every energy behind the count was computed anyway.
+    #
+    # `report.dedupe_groups` rather than a criterion of our own, because the
+    # same question -- is this the same minimum? -- is asked again by
+    # `report.pool_by_n` when the candidates of every packing at one n are
+    # pooled, and the two answers have to agree by construction.
     unique = [
-        (replace(c, n_frames=len(members),
-                 frames=sorted(m.frame for m in members)), geometry)
-        for c, geometry, members in dedupe(pairs)
+        (replace(pairs[g[0]][0], n_frames=len(g),
+                 frames=sorted(pairs[i][0].frame for i in g)),
+         pairs[g[0]][1])
+        for g in dedupe_groups([c.energy_eV for c, _ in pairs])
     ]
     unique_candidates = [c for c, _ in unique]
     interactions = [c.interaction_eV for c in unique_candidates]
@@ -425,7 +395,6 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
         "scoring_solvation": list(solvation) if solvation else None,
         "calculator": calculator,
         "temperature_K": scoring.temperature_K,
-        "stride": scoring.stride,
         "max_frames": scoring.max_frames,
         "opt_fmax": scoring.fmax,
         "opt_steps": scoring.opt_steps,
@@ -469,44 +438,6 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     return summary
 
 
-def score_run(run_dir, solvation, scoring, calculator=None,
-              calculator_kwargs=None, references=None, out_name="scored.json"):
-    """Rescore one `run_one_job` output directory in the continuum, serially.
-
-    Select, optimise, assemble. `score_run_grid` does the same three things
-    for many run directories at once with the middle one fanned out; this is
-    the one-directory path, for rescoring a trajectory by hand in a second
-    continuum.
-
-    Writes `<run_dir>/scored.json`, a human-readable `<run_dir>/scored.log`
-    beside it, the lowest-interaction-energy geometry as
-    `<run_dir>/best.xyz`, and every other deduped candidate as a multi-frame
-    `<run_dir>/scored_candidates.xyz` -- frame i there is
-    `summary["candidates"][i]`, so a structure of interest in the JSON (an odd
-    contact count, a low weight that's still non-negligible) can be pulled
-    back out rather than re-run from scratch.
-
-    All of those are named after `out_name`, so rescoring the same trajectory
-    in a second continuum gives `scored_acetone.json` / `.log` /
-    `scored_acetone_candidates.xyz` rather than appending to one growing file.
-    """
-    meta, records, indices, frames = select_frames(
-        run_dir, scoring.stride, scoring.max_frames)
-    calculator = calculator or meta["calculator"]
-    reference_atoms = None
-    if references is None:
-        e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = reference_energies(
-            meta["solute_path"], meta["solvent_path"], calculator, solvation,
-            calculator_kwargs, scoring.fmax, scoring.opt_steps)
-        references = (e_solute, e_solvent)
-        reference_atoms = (ref_solute_atoms, ref_solvent_atoms)
-    relaxed = [relax(frame, calculator, solvation, calculator_kwargs,
-                     scoring.fmax, scoring.opt_steps) for frame in frames]
-    return assemble(run_dir, meta, records, indices, relaxed, references,
-                    solvation, calculator, scoring, out_name,
-                    reference_atoms=reference_atoms)
-
-
 def score_run_grid(jobs, scoring, n_workers=None):
     """Score many run directories at once, parallel over *candidates*.
 
@@ -539,8 +470,17 @@ def score_run_grid(jobs, scoring, n_workers=None):
 
     `jobs` is a list of keyword dicts (`run_dir`, `solvation`, and optionally
     `calculator`, `calculator_kwargs`, `references`, `out_name`) rather than
-    tuples of positional arguments, so this does not restate `score_run`'s
-    signature and cannot fall behind it.
+    tuples of positional arguments, so a caller adding one more per-job knob
+    does not have to widen a positional signature to reach it.
+
+    Each job writes `<run_dir>/scored.json`, a human-readable `.log` beside
+    it, the lowest-interaction-energy geometry as `<run_dir>/best.xyz`, and
+    every deduped candidate as a multi-frame `scored_candidates.xyz` -- frame
+    i there is `summary["candidates"][i]`. All are named after `out_name`, so
+    rescoring the same trajectory in a second continuum gives
+    `scored_acetone.json` / `.log` / `scored_acetone_candidates.xyz` rather
+    than appending to one growing file. One job in the list is the
+    rescore-by-hand path.
 
     Like every grid here the pool uses spawn, so a driver script must guard
     its call with `if __name__ == "__main__":`. See `solvate_md.pool_map`.
@@ -549,8 +489,8 @@ def score_run_grid(jobs, scoring, n_workers=None):
     if not jobs:
         return []
 
-    selections = [select_frames(job["run_dir"], scoring.stride,
-                                scoring.max_frames) for job in jobs]
+    selections = [select_frames(job["run_dir"], scoring.max_frames)
+                  for job in jobs]
     for job, (meta, *_) in zip(jobs, selections):
         job["calculator"] = job.get("calculator") or meta["calculator"]
 

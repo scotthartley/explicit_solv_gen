@@ -152,7 +152,7 @@ A fast end-to-end smoke test, a few minutes rather than an hour:
 ```bash
 python n_sweep.py examples/solute_toy.xyz examples/water.xyz \
   --solvent water --n 2 --seeds 1 --out smoke/ \
-  --steps 6000 --equilibrate 2000 --dump-interval 20 --stride 5 --max-frames 20
+  --steps 6000 --equilibrate 2000 --dump-interval 20 --max-frames 20
 ```
 
 `n_sweep.py --help` lists everything. Each flag maps onto a field of

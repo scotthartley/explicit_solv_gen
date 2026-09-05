@@ -74,7 +74,7 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
 
     run_dirs = list(_iter_run_dirs(root))
     if not run_dirs:
-        raise SystemExit(
+        raise FileNotFoundError(
             f"{root}: no scored.json found directly or in a subdirectory")
 
     summaries = [(d, json.loads((d / "scored.json").read_text()))
@@ -97,7 +97,7 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
         (d / "ref_solvent.xyz" for d, _ in summaries
          if (d / "ref_solvent.xyz").is_file()), None)
     if ref_solute_src is None or ref_solvent_src is None:
-        raise SystemExit(
+        raise FileNotFoundError(
             f"{root}: no run carries ref_solute.xyz / ref_solvent.xyz -- "
             "rescore with the current ensemble.py or docking.py, which "
             "persist the relaxed reference geometries alongside the energies.")
@@ -158,7 +158,7 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
                     "and scored.json have drifted out of step.")
             out_path = n_dir / f"cand{i:02d}.xyz"
             write(out_path, frames[idx])
-            pack_mode = summary.get("pack_mode", "md")
+            pack_mode = summary["pack_mode"]
             manifest["structures"].append({
                 "n": n,
                 "path": str(out_path.relative_to(out_dir)),

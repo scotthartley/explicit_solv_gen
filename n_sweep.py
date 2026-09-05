@@ -98,11 +98,11 @@ and two solvents -- a double difference such as
 module to know that a difference is what you eventually want. What that gives
 up is the guarantee that both halves ran under identical settings, so each
 sweep writes a **params block** into `sweep.json` recording the whole
-`Condition` it ran under, the package version and git commit, and the
-versions of the libraries the numbers actually came out of -- cheap
-insurance, given that `wall_slack` has already changed meaning once (at
-c429f8a) without changing its name, and that the commit says nothing about
-which build of tblite evaluated the Hamiltonian.
+`Condition` it ran under, the package version, and the versions of the
+libraries the numbers actually came out of -- cheap insurance, given that
+`wall_slack` has already changed meaning once (at c429f8a) without changing
+its name, and that a version says nothing about which build of tblite
+evaluated the Hamiltonian.
 
 At small n the packing *is* the answer -- a chloroform bound to a pyrazine
 nitrogen does not detach, migrate around the ring and rebind at the far one
@@ -324,7 +324,7 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
         "version": VERSION,
         "timestamp": timestamp(),
     })
-    # The commit pins this repo, not the Hamiltonian under it: a sweep run
+    # `version` pins this repo, not the Hamiltonian under it: a sweep run
     # against a different tblite is a different measurement, and without this
     # the two params blocks would agree.
     params.update(library_versions(condition.calculator))
@@ -392,17 +392,12 @@ def main(argv=None):
                         default=dataclass_default(Condition, "temperature_K"),
                         help="K, for both MD and the Boltzmann weights "
                              "(default: %(default)s)")
-    parser.add_argument("--stride", type=int,
-                        default=dataclass_default(Scoring, "stride"),
-                        help="score every Nth dump; redundant with "
-                             "--max-frames whenever that cap bites, which at "
-                             "the defaults it always does "
-                             "(default: %(default)s)")
     parser.add_argument("--max-frames", type=int,
                         default=dataclass_default(Scoring, "max_frames"),
                         help="cap on frames scored per run, spread evenly over "
-                             "the whole trajectory. This, not --stride, is "
-                             "what sets scoring cost (default: %(default)s)")
+                             "the whole trajectory. This is what sets scoring "
+                             "cost, and it is independent of run length "
+                             "(default: %(default)s)")
     parser.add_argument("--fmax", type=float,
                         default=dataclass_default(Scoring, "fmax"),
                         help="scoring optimiser convergence, eV/A per-atom max "
@@ -424,8 +419,8 @@ def main(argv=None):
         args.out,
         n_seeds=args.seeds,
         n_workers=args.workers,
-        scoring=Scoring(stride=args.stride, max_frames=args.max_frames,
-                        fmax=args.fmax, opt_steps=args.opt_steps,
+        scoring=Scoring(max_frames=args.max_frames, fmax=args.fmax,
+                        opt_steps=args.opt_steps,
                         temperature_K=args.temperature),
         label=args.label,
         condition_kwargs={

@@ -37,7 +37,7 @@ it prepended:
 entry point -- there is no driver script, and `solvate_md.py` has no
 `__main__` smoke test of its own. A fast end-to-end check is the same command
 with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
---stride 5 --max-frames 20`.
+--max-frames 20`.
 
 ## Layout
 
@@ -573,11 +573,12 @@ trajectory lands -- was considered and rejected: MD is the cheap half, and a
 shared pool would let a worker that had run MACE then run tblite and hit the
 OpenMP clash the file boundary exists to avoid.
 
-`--stride` and `--max-frames` are not independent: `max_frames` selects by
-`linspace` over the whole trajectory, so **whenever it bites, `stride` does
-nothing at all**. `max_frames` alone sets scoring cost, and that cost is
-independent of run length -- a longer trajectory is scored at wider spacing
-for the same price. So `stride` is 1 and `max_frames` is 50.
+`--max-frames` alone sets scoring cost, and that cost is independent of run
+length -- a longer trajectory is scored at wider spacing for the same price.
+It is 50. There used to be a `--stride` beside it, selecting every Nth dump
+first, which did nothing at all: `max_frames` selects by `linspace` over the
+whole trajectory, so it discards whatever thinning `stride` did, and at any
+usable setting the cap always bites.
 
 ### The two diagnostics that say whether the sampling was enough
 
@@ -778,10 +779,10 @@ never contains one, only optimised candidates.
   `condition_kwargs` dict and a `Scoring` and names no field of either, and
   the CLI reads every default off whichever dataclass owns it via
   `dataclass_default`. Internal functions -- `pack_solvent`, `relax`,
-  `score_run` and the rest -- carry no defaults at all, so a caller has to say
-  what it means. `pack_solvent` used to default `wall_slack = 1.0` against
-  `Condition`'s 0.25, and `score_run` `stride = 10, max_frames = 40` against
-  the CLI's 1 and 50.
+  `select_frames` and the rest -- carry no defaults at all, so a caller has to
+  say what it means. `pack_solvent` used to default `wall_slack = 1.0` against
+  `Condition`'s 0.25, and a since-deleted serial `score_run` defaulted
+  `stride = 10, max_frames = 40` against the CLI's 1 and 50.
 - Sampling lengths live on `Condition` and **only** on `Condition`. Do not
   give `run_sweep` or the CLI a literal default for one; that is exactly the
   shadowing that made every run so far 3 ps when the docs said 10.
