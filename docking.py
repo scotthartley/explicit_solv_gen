@@ -31,19 +31,31 @@ the top on its own without ever needing to be suspected.
 Both programs report the same *kind* of thing -- a continuum-relaxed,
 wall-free local minimum, scored identically (`ensemble.relax`, no wall, even
 the contact count computed on the relaxed geometry rather than the raw
-frame) -- so neither report has to caveat the other. They differ only in how
-the starting geometry was found: thermal exploration versus random
-construction. `n_sweep.py` is not modified; this is a standalone, either/or
-alternative beside it, sharing `ensemble.py`'s optimiser and `report.py`'s
-formatting and dedupe/Boltzmann machinery, and only reading (never writing)
-`solvate_md.py`.
+frame) -- so neither report has to caveat the other. But they are no longer
+peers at the one job both used to claim: **docking owns minimum-finding.**
+`n_sweep.py`'s candidates are potential-energy minima too, reached by 10 ps of
+MD rather than by construction, and BFGS descending from dozens of
+independent, unconstrained random poses reliably outfinds a single thermal
+trajectory at the same job -- the -11.44 vs -13.00 kcal/mol measurement above
+is a case of the sweep's proposal move (10 ps of gas-phase Langevin) simply
+being a worse basin-hopping search than random placement.
 
-Docking is a chain, not a sweep: n = 1's survivors become n = 2's starting
-points, and so on. That is a **greedy** search -- the best structure at n
-need not be the best structure at n - 1 plus one molecule -- so
-`Docking.n_parents` carries more than one candidate forward, and the MD
-sweep remains available as an independent, non-greedy check on the same
-system.
+That leaves the MD sweep two jobs docking cannot do by construction. First,
+it is a **non-greedy, independently drawn check** at each n: docking's chain
+means the best structure at n need not descend from the best at n - 1 (hence
+`Docking.n_parents` carrying more than one candidate forward), but the whole
+chain still grows from one lineage, and a basin no random pose in that
+lineage happens to land in is invisible to it regardless of how many
+placements are tried -- a fresh, independently packed MD run samples a
+different region of configuration space entirely. Second, and the reason
+CLAUDE.md gives it a dedicated section, MD is the **only source of basin
+occupancy**: a docked minimum was placed, not visited, so there is no sense
+in which BFGS "spent time" in one basin over another, and `_assemble_dock_n`
+below writes `n_frames` / `frames` as `None` for exactly that reason -- a real
+absence, not a population of one. `n_sweep.py` is not modified; this is a
+standalone, either/or alternative beside it, sharing `ensemble.py`'s optimiser
+and `report.py`'s formatting and dedupe/Boltzmann machinery, and only reading
+(never writing) `solvate_md.py`.
 
 Applicability is limited by the same GFN2 gradient cost that limits the MD
 sweep (~N^2.5, measured), compounded by BFGS step count, which is why this
@@ -359,6 +371,12 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             "gnorm_Eh_bohr": result.gnorm_Eh_bohr,
             "n_opt_steps": result.n_opt_steps,
             "parent": parent_index,
+            # A docked candidate has no sampling frame at all, and so no
+            # basin-occupancy population -- a real absence, the same
+            # convention `wall_energy_eV` above already uses here, and
+            # exactly why `pack_mode: "dock"` exists to say so.
+            "n_frames": None,
+            "frames": None,
         })
 
     absolutes = [c["energy_eV"] for c in candidates]
@@ -409,6 +427,14 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
         "mean_contacts": float(np.mean([c["n_contacts"] for c in candidates])),
         "dissolved_fraction": float(
             np.mean([c["n_contacts"] == 0 for c in candidates])),
+        # A docking dedupe groups constructed *placements*, not thermal
+        # samples -- counting them would look like a frame-weighted
+        # occupancy and would not be one, so these are None rather than a
+        # value pooling code might read as real. `found_by` below is the
+        # docking-appropriate analogue.
+        "scored_frame_spacing_fs": None,
+        "occupancy_mean_contacts": None,
+        "occupancy_dissolved_fraction": None,
         "converged_fraction": float(np.mean([r.converged for r, _ in pairs])),
         "n_unconverged_unique": sum(1 for c in candidates if not c["converged"]),
         "sampling_wall": None,

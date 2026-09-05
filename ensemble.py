@@ -27,7 +27,7 @@ such a molecule contributes exactly zero.
 import single_thread  # noqa: F401  -- must precede numpy; see its docstring
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +40,7 @@ from ase.units import Bohr, Hartree
 from report import (
     DEDUPE_TOL_EV,
     EV_TO_KCAL,
-    dedupe_energies,
+    dedupe_groups,
     ensemble_energy,
     format_scored_log,
     wall_stats,
@@ -137,6 +137,14 @@ class Candidate:
     # floppy cluster -- worth knowing before anyone tries swapping it on a
     # larger system.
     n_opt_steps: int
+    # How many scored frames quenched into this minimum, and their sampling
+    # dump indices -- the inherent-structure occupancy `n_sweep`'s docstring
+    # discusses. 1 / [frame] until `dedupe` groups this candidate with its
+    # duplicates and `assemble` calls `dataclasses.replace` on the survivor;
+    # a docked candidate (no sampling frame at all) carries `None` for both,
+    # a real absence rather than a population of one.
+    n_frames: int = 1
+    frames: list = field(default_factory=list)
 
 
 def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
@@ -242,24 +250,41 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
 
 
 def dedupe(pairs, energy_tol_eV=DEDUPE_TOL_EV):
-    """Drop candidates that optimised into the same minimum.
+    """Group candidates that optimised into the same minimum, keep one each.
 
-    Consecutive MD frames mostly relax to the same structure, so without this
-    a Boltzmann average is really an average over how long the trajectory
-    happened to loiter somewhere.
+    Consecutive MD frames mostly relax to the same structure. At the
+    pipeline's old 5 fs dump interval that made naive frame-counting an
+    average over how long the trajectory happened to loiter somewhere -- 5 fs
+    against a ~0.55 ps shell decorrelation time is ~100x oversampled, so a
+    frame count was pure autocorrelation, not signal. At today's defaults --
+    50 fs dumps, `max_frames = 50` selecting down to ~200 fs of scored-frame
+    spacing on a 10 ps trajectory -- that ratio is ~2.75x, roughly the ~18
+    effectively independent shell configurations the MD-length defaults were
+    chosen to buy (see CLAUDE.md). A frame count is no longer pure
+    autocorrelation, so the membership is now kept rather than thrown away:
+    each survivor's `n_frames` / `frames` (set by `assemble` via
+    `dataclasses.replace`, since a bare `Candidate` above knows only about
+    itself) is a usable, free inherent-structure population estimate --
+    every energy behind it was already computed regardless.
 
-    Takes and returns `(candidate, geometry)` pairs, sorted lowest first. The
-    geometry rides along because the sort breaks the correspondence with the
-    input order, and the caller needs the kept structures to write them out.
+    Takes `(candidate, geometry)` pairs, sorted lowest first, and returns
+    `(candidate, geometry, members)` triples: `members` is every pre-dedupe
+    candidate this representative absorbed (representative first, same
+    order `dedupe_groups` returns). The geometry and the members both ride
+    along because the sort breaks the correspondence with the input order,
+    and the caller needs the kept structures to write out and the members to
+    build the occupancy fields.
 
-    The criterion itself is `report.dedupe_energies`, because the same
+    The criterion itself is `report.dedupe_groups`, because the same
     question -- is this the same minimum? -- is asked again in `report` when
     the candidates of every seed at one n are pooled, and the two answers have
     to agree by construction. This is the wrapper that keeps the geometries
-    attached.
+    (and now the membership) attached.
     """
-    kept = dedupe_energies([c.energy_eV for c, _ in pairs], energy_tol_eV)
-    return [pairs[i] for i in kept]
+    groups = dedupe_groups([c.energy_eV for c, _ in pairs], energy_tol_eV)
+    return [(pairs[group[0]][0], pairs[group[0]][1],
+             [pairs[i][0] for i in group])
+            for group in groups]
 
 
 def select_frames(run_dir, stride, max_frames):
@@ -337,10 +362,22 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
             wall_energy_eV=float(records[index]["wall_energy_eV"]),
             gnorm_Eh_bohr=result.gnorm_Eh_bohr,
             n_opt_steps=result.n_opt_steps,
+            frames=[index],
         ), result.atoms))
 
     candidates = [c for c, _ in pairs]
-    unique = dedupe(pairs)
+    n_frames_scored = len(candidates)
+    # `dedupe` groups pre-dedupe candidates by basin; a survivor's own
+    # `n_frames` / `frames` (1 / [its own frame]) is replaced with the
+    # pooled membership of its whole group, which is what makes the
+    # occupancy fields below a population over *scored frames*, not over
+    # distinct minima. `Σ n_frames == n_frames_scored` by construction: the
+    # groups partition `pairs`.
+    unique = [
+        (replace(c, n_frames=len(members),
+                 frames=sorted(m.frame for m in members)), geometry)
+        for c, geometry, members in dedupe(pairs)
+    ]
     unique_candidates = [c for c, _ in unique]
     interactions = [c.interaction_eV for c in unique_candidates]
     # Absolute energies over the same candidates. `boltzmann_weights`
@@ -348,6 +385,28 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     # E(cluster) only by the constant e_solute + n * e_solvent, so these two
     # averages carry identical weights and cannot disagree.
     absolutes = [c.energy_eV for c in unique_candidates]
+
+    # How far apart, in fs, the frames actually sent to the optimiser are --
+    # what the occupancy section below has to be read against a
+    # decorrelation time measured on the system, never a fabricated one.
+    # `indices` is already ascending (built by `select_frames`); `None` for a
+    # single scored frame, which has no spacing to report.
+    scored_frame_spacing_fs = (
+        float(np.mean(np.diff(indices))) * meta["dump_interval"]
+        * meta["timestep_fs"] if len(indices) > 1 else None)
+    # Frame-weighted, over the same deduped basins: how much of the
+    # *trajectory* actually sat in a contact state, as opposed to how many
+    # distinct contact states were found (`mean_contacts` /
+    # `dissolved_fraction` below). Quarantined from every energy in this
+    # summary -- occupancy never enters `interaction_eV` or the Boltzmann
+    # averages, only these two diagnostic fields.
+    occupancy_mean_contacts = float(
+        sum(c.n_contacts * c.n_frames for c in unique_candidates)
+        / n_frames_scored)
+    occupancy_dissolved_fraction = (
+        float(sum(c.n_frames for c in unique_candidates if c.n_contacts == 0)
+             / n_frames_scored)
+        if n_solvent else 1.0)
 
     best = min(range(len(pairs)), key=lambda i: pairs[i][0].interaction_eV)
     write(run_dir / "best.xyz", pairs[best][1])
@@ -370,7 +429,7 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
         "max_frames": scoring.max_frames,
         "opt_fmax": scoring.fmax,
         "opt_steps": scoring.opt_steps,
-        "n_frames_scored": len(candidates),
+        "n_frames_scored": n_frames_scored,
         "n_unique": len(unique),
         "e_solute_ref_eV": e_solute,
         "e_solvent_ref_eV": e_solvent,
@@ -379,10 +438,17 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
             ensemble_energy(interactions, scoring.temperature_K) * EV_TO_KCAL,
         "min_energy_eV": min(absolutes),
         "ensemble_energy_eV": ensemble_energy(absolutes, scoring.temperature_K),
+        # Over the *distinct minima* -- how many kinds of basin the search
+        # turned up, not how the trajectory's time was actually spent. See
+        # `occupancy_mean_contacts` / `occupancy_dissolved_fraction` below
+        # for the frame-weighted analogues.
         "mean_contacts": float(np.mean([c.n_contacts for c in unique_candidates])),
         "dissolved_fraction": (
             float(np.mean([c.n_contacts == 0 for c in unique_candidates]))
             if n_solvent else 1.0),
+        "scored_frame_spacing_fs": scored_frame_spacing_fs,
+        "occupancy_mean_contacts": occupancy_mean_contacts,
+        "occupancy_dissolved_fraction": occupancy_dissolved_fraction,
         "converged_fraction": float(np.mean([c.converged for c in candidates])),
         # Counted over the unique candidates because those are the ones that
         # carry Boltzmann weight. A candidate left with residual force is

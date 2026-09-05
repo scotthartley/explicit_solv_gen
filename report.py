@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -124,8 +124,16 @@ def banner(text):
 DEDUPE_TOL_EV = 1e-3
 
 
-def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
-    """Indices of the distinct minima, lowest first.
+def dedupe_groups(energies_eV, tol_eV=DEDUPE_TOL_EV):
+    """Partition indices into distinct minima, lowest first within and across.
+
+    Each inner list is one basin's member indices, representative (its own
+    lowest-energy member) first; the groups themselves are ordered by that
+    representative's energy ascending. Walking the indices in ascending
+    energy order, an index joins the first existing group whose
+    representative is within `tol_eV`, else starts a new group -- exactly the
+    rule `dedupe_energies` used to decide keep-or-drop, just with the merged
+    members kept rather than thrown away.
 
     Energy-based rather than RMSD-based: it cannot tell two genuinely
     different structures apart when they happen to be isoenergetic, which for
@@ -133,11 +141,25 @@ def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
     already in `scored.json` -- no geometries, no ASE, no calculator.
     """
     order = sorted(range(len(energies_eV)), key=lambda i: energies_eV[i])
-    kept = []
+    groups = []
     for i in order:
-        if all(abs(energies_eV[i] - energies_eV[k]) > tol_eV for k in kept):
-            kept.append(i)
-    return kept
+        for group in groups:
+            if abs(energies_eV[i] - energies_eV[group[0]]) <= tol_eV:
+                group.append(i)
+                break
+        else:
+            groups.append([i])
+    return groups
+
+
+def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
+    """Indices of the distinct minima, lowest first.
+
+    A thin wrapper over `dedupe_groups` that keeps only the representatives --
+    for the many callers that only ever wanted keep-or-drop and never needed
+    which candidates a representative absorbed.
+    """
+    return [group[0] for group in dedupe_groups(energies_eV, tol_eV)]
 
 
 def boltzmann_weights(energies_eV, temperature_K=298.0):
@@ -625,14 +647,29 @@ def pool_by_n(summaries):
     Pooling requires a cross-seed dedupe, not just a concatenation: seven
     seeds that all find one basin would otherwise multiply its Boltzmann
     weight by seven, which is an artefact of how the search was spent rather
-    than a degeneracy. `dedupe_energies` is the same criterion `ensemble`
-    applies within a run.
+    than a degeneracy. `dedupe_groups` is the same criterion `ensemble`
+    applies within a run, kept as groups rather than representatives-only so
+    that a basin found by several seeds can have their frame counts summed --
+    each summary's candidates already carry `n_frames`, the number of scored
+    frames that quenched into it within that one run, and a basin found by
+    two packings should report the sum, not either half.
 
     That is only legitimate because the references are sweep-wide:
     `score_run_grid` computes them once per distinct (solute, solvent,
     calculator, continuum), so every `interaction_eV` in a sweep shares a
     zero. A sweep whose rows were measured against different zeros is broken
     rather than old, so this raises rather than pooling them anyway.
+
+    Each record also carries `basins` -- one entry per pooled distinct
+    minimum, richest first would defeat the point, so `format_basin_occupancy`
+    sorts by frame share -- and `occupancy_mean_contacts` /
+    `occupancy_dissolved_fraction`, the frame-weighted analogues of
+    `mean_contacts` / `dissolved_fraction` below. The two pairs answer
+    different questions and must not be confused: `mean_contacts` is a
+    property of the *search* (how many kinds of basin were found), the
+    `occupancy_*` pair a property of the *trajectory* (how much of it sat in
+    each). Quarantined from every energy in this record -- occupancy never
+    enters `e_int_min_kcal` or `e_int_ens_kcal`.
 
     Returns one record per n, sorted by n.
     """
@@ -650,13 +687,13 @@ def pool_by_n(summaries):
 
     pooled = []
     for n, group in sorted(groups.items()):
-        # Deterministic ties: `dedupe_energies` sorts by energy before
-        # keeping anything, so this ordering never changes which candidates
+        # Deterministic ties: `dedupe_groups` sorts by energy before
+        # forming any group, so this ordering never changes which candidates
         # survive -- only which packing gets the credit when several tie.
         group = sorted(group, key=_row_order)
         tagged = [(s, c) for s in group for c in s["candidates"]]
-        keep = [tagged[i] for i in
-                dedupe_energies([c["energy_eV"] for _, c in tagged])]
+        basin_groups = dedupe_groups([c["energy_eV"] for _, c in tagged])
+        keep = [tagged[g[0]] for g in basin_groups]
         interactions = [c["interaction_eV"] for _, c in keep]
         absolutes = [c["energy_eV"] for _, c in keep]
         e_min = min(interactions)
@@ -666,12 +703,34 @@ def pool_by_n(summaries):
         seed_minima = [min(c["interaction_eV"] for c in s["candidates"])
                        for s in group]
         walls = [f for s in group if (f := _wall_fraction(s)) is not None]
-        # `dedupe_energies` sorts ascending, so `keep[0]` is not just *a*
+        # `basin_groups` sorts ascending, so `keep[0]` is not just *a*
         # minimum -- it is the pooled minimum, and therefore its own
         # packing's minimum too: that packing's `best.xyz` is the geometry
         # behind `e_int_min_kcal` below.
         weights = boltzmann_weights([c["energy_eV"] for _, c in keep],
                                     temperature)
+
+        # Occupancy: sum `n_frames` -- the scored frames that quenched into
+        # this basin within their own run -- over every candidate a basin
+        # absorbed, possibly from several packings. A run's own candidates
+        # are already deduped by `ensemble.assemble`, so no packing can
+        # contribute two candidates to one basin here: counting distinct
+        # seeds per group is counting packings that visited it.
+        n_frames_pooled = sum(c["n_frames"] for _, c in tagged)
+        basins = []
+        for basin, (_, rep_c), weight in zip(basin_groups, keep, weights):
+            members = [tagged[i] for i in basin]
+            frames = sum(c["n_frames"] for _, c in members)
+            basins.append({
+                "e_int_kcal": rep_c["interaction_eV"] * EV_TO_KCAL,
+                "n_frames": frames,
+                "frame_share": (frames / n_frames_pooled
+                                if n_frames_pooled else None),
+                "n_seeds_hit": len({s["seed"] for s, _ in members}),
+                "weight": float(weight),
+                "n_contacts": rep_c["n_contacts"],
+            })
+
         s_best, c_best = keep[0]
         pooled.append({
             "n_solvent": n,
@@ -686,12 +745,28 @@ def pool_by_n(summaries):
             "found_by": sum(1 for m in seed_minima
                             if abs(m - e_min) <= DEDUPE_TOL_EV),
             "seed_minima_kcal": [m * EV_TO_KCAL for m in seed_minima],
+            # Over the *distinct minima* -- a property of how many kinds of
+            # basin the search turned up, not of how the trajectory's time
+            # was spent. See `occupancy_*` below for the latter.
             "mean_contacts": float(np.mean([c["n_contacts"] for _, c in keep])),
             # At n = 0 there is no solvent to dissolve, and `assemble` calls
             # that 1.0 rather than dividing by zero.
             "dissolved_fraction": (
                 float(np.mean([c["n_contacts"] == 0 for _, c in keep]))
                 if n else 1.0),
+            "n_frames_pooled": n_frames_pooled,
+            "basins": basins,
+            # Frame-weighted, over the same pooled+deduped basins: how much of
+            # the *sampling* actually sat in a contact state, as opposed to
+            # how many distinct contact states were found. At n = 0 every
+            # frame's basin has n_contacts = 0, so this comes out 1.0 the same
+            # way `dissolved_fraction` is defined to, with no special case.
+            "occupancy_mean_contacts": (
+                sum(b["n_contacts"] * b["n_frames"] for b in basins)
+                / n_frames_pooled if n_frames_pooled else None),
+            "occupancy_dissolved_fraction": (
+                sum(b["n_frames"] for b in basins if b["n_contacts"] == 0)
+                / n_frames_pooled if n_frames_pooled else None),
             # The worst of the seeds, matching `format_wall_diagnostic`: the
             # question is whether any of the pooled energies is contaminated.
             "wall": max(walls) if walls else None,
@@ -715,7 +790,7 @@ def format_table(params, pooled):
     capacity = params["monolayer_capacity"]
     header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'E_int(ens)':>12} "
               f"{'dE_int':>10} {'found by':>9} {'pool':>6} "
-              f"{'E(cluster)/eV':>15} {'contacts':>9} {'dissolved':>10} "
+              f"{'E(cluster)/eV':>15} {'uniq cont':>9} {'uniq diss':>10} "
               f"{'wall':>6}")
     lines = [f"leg: {params['solute_label']}/{params['solvent']}",
              f"full first shell: ~{capacity:.0f} solvent molecules", "",
@@ -750,9 +825,14 @@ def format_table(params, pooled):
         "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'cover' = n "
         "as a\npercentage of a full first-shell monolayer; well under 100% is "
         "targeted\nmicrosolvation, where every explicit molecule sits at the "
-        "continuum boundary.\n'contacts' = solvent molecules touching the "
-        "solute after optimisation;\n'dissolved' = fraction of pooled "
-        "candidates with no contact at all. 'wall' =\nthe worst seed's "
+        "continuum boundary.\n'uniq cont' = solvent molecules touching the "
+        "solute after optimisation, averaged\nover the pooled *distinct "
+        "minima* -- how many kinds of basin the search turned up,\nnot how "
+        "often the trajectory actually sat in one. 'uniq diss' = fraction of "
+        "those\ndistinct minima with no contact at all. Both are search-effort "
+        "diagnostics, the\nsame kind as 'pool' -- see the Basin occupancy "
+        "section below for the frame-\nweighted versions, which say how the "
+        "sampling's time was actually spent. 'wall'\n= the worst seed's "
         "fraction of sampling frames with a nonzero wall energy.\n"
         "\ndE_int = E_int(min) at this n minus E_int(min) at n - 1: what the "
         "nth molecule\nwas worth. Read the increment, not the level: E_int(n) "
@@ -892,6 +972,129 @@ def format_seed_detail(summaries, pooled):
     return "\n".join(lines)
 
 
+_OCCUPANCY_TOP_N = 5
+
+
+def format_basin_occupancy(params, summaries, pooled):
+    """How the trajectory's time was actually spent, per n -- not just which
+    distinct minima the search turned up.
+
+    `pool_by_n` already summed `n_frames` -- scored frames that quenched into
+    each basin -- across every packing at this n, into `pooled[n]["basins"]`.
+    This only formats it: the top 5 basins by frame share, an "other" row for
+    the rest, and a line contrasting `E_int(min)` against the frame-share-
+    weighted mean and the two contact statistics (over distinct minima versus
+    over frames) against each other. That contrast is the point of the
+    section -- a basin can be the reported minimum and still be a rare
+    outlier the shell almost never visits.
+
+    Six caveats travel with the numbers rather than living only in the docs,
+    because a table of frame counts invites being read as a Boltzmann
+    population and it is not one:
+
+      1. Sampling is gas-phase (`Condition.sample_in_continuum = False`).
+         Occupancy here describes the gas-phase search, not solvation in the
+         scoring continuum -- measured on methanol + 4 water: 3.84-4.39
+         H-bonds in gas versus 0.00-0.30 in ALPB(water), no overlap between
+         the two populations.
+      2. Pooling across stratified packings is a mixture with hand-picked
+         weights (`c = (seed + 0.5) / n_seeds` is chosen by design, not drawn
+         at random from anything), so only *within* one packing is a frame
+         count an unbiased -- if correlated -- sample. `n_seeds_hit` beside
+         every basin is the same idiom as `found by`: how many independently
+         arranged packings visited it.
+      3. The 1 meV energy dedupe merges isoenergetic distinct minima, which
+         inflates one count. Tolerable for ranking; sharper for counting.
+      4. Frames are correlated. `scored_frame_spacing_fs` below is what to
+         compare against a decorrelation time measured on *this* system (0.55
+         ps for pyrazine + 3 CHCl3) -- not fabricated here, since it is a
+         property of the system, not of the integrator.
+      5. These are inherent-structure populations, not basin free energies:
+         no vibrational entropy, no ZPE.
+      6. The wall volume (`wall_slack`) sets any occupancy number and leaves
+         `E_int(min)` untouched -- a dissolved molecule contributes ~0 to
+         E_int regardless of box size. That is why occupancy is a diagnostic
+         here and never an energy.
+
+    Guarded by the caller on `pack_mode == "md"`: a docked run has no
+    sampling frames and so no occupancy to report, and `_assemble_dock_n`
+    writes `None` for exactly that reason -- a real absence, not a zero.
+    """
+    lines = ["Basin occupancy", "----------------"]
+    header = (f"  {'E_int/kcal':>11} {'frames':>7} {'share':>7} "
+              f"{'seeds':>6} {'weight':>7} {'contacts':>9}")
+    rule = "  " + "-" * (len(header) - 2)
+
+    for p in pooled:
+        basins = sorted(p["basins"], key=lambda b: -(b["frame_share"] or 0.0))
+        top, rest = basins[:_OCCUPANCY_TOP_N], basins[_OCCUPANCY_TOP_N:]
+        lines.append(f"n = {p['n_solvent']}  ({p['n_frames_pooled']} scored "
+                     "frames pooled)")
+        lines += [header, rule]
+        for b in top:
+            lines.append(
+                f"  {b['e_int_kcal']:>11.2f} {b['n_frames']:>7} "
+                f"{100 * b['frame_share']:>6.1f}% {b['n_seeds_hit']:>6} "
+                f"{b['weight']:>7.3f} {b['n_contacts']:>9}")
+        if rest:
+            other_frames = sum(b["n_frames"] for b in rest)
+            other_share = sum(b["frame_share"] for b in rest)
+            other_weight = sum(b["weight"] for b in rest)
+            lines.append(
+                f"  {'other (' + str(len(rest)) + ')':>11} {other_frames:>7} "
+                f"{100 * other_share:>6.1f}% {'-':>6} {other_weight:>7.3f} "
+                f"{'-':>9}")
+        occ_mean = p["occupancy_mean_contacts"]
+        occ_diss = p["occupancy_dissolved_fraction"]
+        weighted_mean = sum(b["e_int_kcal"] * (b["frame_share"] or 0.0)
+                            for b in basins)
+        lines.append(
+            f"  E_int(min) {p['e_int_min_kcal']:.2f} kcal/mol vs "
+            f"frame-share-weighted mean {weighted_mean:.2f} kcal/mol")
+        lines.append(
+            f"  contacts -- distinct minima {p['mean_contacts']:.2f}, "
+            f"occupancy (frame-weighted) {occ_mean:.2f}")
+        lines.append(
+            f"  dissolved -- distinct minima {100 * p['dissolved_fraction']:.0f}%, "
+            f"occupancy (frame-weighted) {100 * occ_diss:.0f}%")
+        lines.append("")
+
+    spacings = sorted({s["scored_frame_spacing_fs"] for s in summaries
+                       if s["scored_frame_spacing_fs"] is not None})
+    spacing_str = ("-" if not spacings else
+                   f"{spacings[0]:.0f} fs" if len(spacings) == 1 else
+                   ", ".join(f"{s:.0f} fs" for s in spacings))
+    lines.append(f"scored frame spacing: {spacing_str}")
+
+    lines.append(
+        "\n  Caveats, load-bearing rather than decorative:\n"
+        "  1. Sampling is gas-phase (Condition.sample_in_continuum = False); "
+        "occupancy\n     here describes the gas-phase search, not solvation "
+        "in the scoring continuum.\n     Measured on methanol + 4 water: "
+        "3.84-4.39 H-bonds in gas vs 0.00-0.30 in\n     ALPB(water), no "
+        "overlap between the two populations.\n"
+        "  2. Pooling across stratified packings is a mixture with "
+        "hand-picked weights\n     (c = (seed + 0.5) / n_seeds is chosen by "
+        "design, not drawn at random), so\n     only *within* one packing is "
+        "a frame count an unbiased -- if correlated --\n     sample. "
+        "'seeds' beside every basin is the same idiom as 'found by': how\n   "
+        "  many independently arranged packings visited it.\n"
+        "  3. The 1 meV energy dedupe merges isoenergetic distinct minima, "
+        "inflating\n     one count -- tolerable for ranking, sharper for "
+        "counting.\n"
+        "  4. Frames are correlated. Compare the scored frame spacing above "
+        "to a\n     decorrelation time measured on *this* system (0.55 ps "
+        "for pyrazine + 3\n     CHCl3) -- not fabricated here, since it is a "
+        "property of the system.\n"
+        "  5. These are inherent-structure populations, not basin free "
+        "energies: no\n     vibrational entropy, no ZPE.\n"
+        "  6. The wall volume (wall_slack) sets any occupancy number and "
+        "leaves\n     E_int(min) untouched -- a dissolved molecule "
+        "contributes ~0 to E_int\n     regardless of box size. That is why "
+        "occupancy is a diagnostic and never\n     an energy.")
+    return "\n".join(lines)
+
+
 def format_wall_diagnostic(summaries):
     """The worst wall-active fraction in the sweep, and what it means.
 
@@ -941,27 +1144,32 @@ def sampling_convergence(summary):
     number is an upper bound and a longer run would beat it.
 
     Computed from the candidate list already in `scored.json`, so it costs no
-    MD and no calculator. `dedupe` drops only energy-duplicates, and a
-    duplicate cannot move a running minimum by more than the dedup tolerance,
-    so working from the deduped list is safe.
+    MD and no calculator. Each candidate's basin was first *reached* at
+    `min(c["frames"])` -- the representative's own `frame` is arbitrary among
+    a group of members agreeing to within 1 meV, but the earliest of them is
+    when the trajectory first visited this minimum, which is what "best found
+    at" means. A duplicate cannot move a running minimum by more than the
+    dedup tolerance, so working from the deduped list is safe.
 
     Returns None when there is nothing to say: too few candidates to see a
-    trend, or a summary too old to carry frame indices.
+    trend, or a trajectory too short for the late-quarter cut to mean
+    anything.
     """
     candidates = summary.get("candidates") or []
     if len(candidates) < 4:
         return None
-    frames = [c.get("frame") for c in candidates]
-    if any(f is None for f in frames):
-        return None
-    last = max(frames)
+    firsts = [min(c["frames"]) for c in candidates]
+    last = max(firsts)
     if last <= 0:
         return None
 
     cut = LATE_TRAJECTORY_FRACTION * last
-    best = min(candidates, key=lambda c: c["interaction_eV"])
-    early = [c["interaction_eV"] for c in candidates if c["frame"] <= cut]
-    late = [c["interaction_eV"] for c in candidates if c["frame"] > cut]
+    best_i = min(range(len(candidates)),
+                key=lambda i: candidates[i]["interaction_eV"])
+    early = [candidates[i]["interaction_eV"] for i in range(len(candidates))
+             if firsts[i] <= cut]
+    late = [candidates[i]["interaction_eV"] for i in range(len(candidates))
+            if firsts[i] > cut]
     # Undefined rather than zero when the trajectory has no candidates on one
     # side of the cut: there was nothing there to improve on. Clamped at zero
     # because the quantity being reported is a *running* minimum, which cannot
@@ -971,9 +1179,9 @@ def sampling_convergence(summary):
     gain = (min(min(late) - min(early), 0.0) * EV_TO_KCAL
             if early and late else None)
     return {
-        "best_at": best["frame"] / last,
+        "best_at": firsts[best_i] / last,
         "late_gain_kcal": gain,
-        "still_improving": (best["frame"] > cut
+        "still_improving": (firsts[best_i] > cut
                             or (gain is not None
                                 and gain < -LATE_GAIN_WARN_KCAL)),
     }
@@ -1144,6 +1352,13 @@ def format_sweep_report(params, summaries):
     parts.append(format_best_geometry(pooled))
 
     parts.append(format_seed_detail(summaries, pooled))
+
+    # Guarded on pack_mode, not on field presence: a docked run's
+    # occupancy fields are `None` by convention (see `_assemble_dock_n`), a
+    # real absence rather than a broken run, and must not be mistaken for
+    # one. `format_dock_report` never calls this at all.
+    if all(s.get("pack_mode", "md") == "md" for s in summaries):
+        parts.append(format_basin_occupancy(params, summaries, pooled))
 
     for section in (format_sampling_convergence(summaries),
                     format_search_convergence(params, pooled),

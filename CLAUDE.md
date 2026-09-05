@@ -49,7 +49,7 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
 | `docking.py` | a second, constructive generator: random placement + BFGS instead of thermal sampling. Standalone, either/or with `n_sweep.py`; see below. |
 | `dft_export.py` | exports deduped, near-minimum candidates (from either generator) plus a manifest for a downstream DFT single point or reopt. |
-| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
+| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`, `dedupe_groups`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
 `run_sweep` deliberately does *not* assemble a difference of sweeps. One sweep
@@ -85,6 +85,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.7.0 | an MD candidate in `scored.json` gains `n_frames` / `frames` -- how many scored frames quenched into that minimum, and their sampling dump indices, preserved through dedupe instead of discarded at it; each run's summary gains `scored_frame_spacing_fs`, `occupancy_mean_contacts`, `occupancy_dissolved_fraction`. `report.txt` gains a Basin occupancy section, fed by a `basins` list `pool_by_n` now attaches to each pooled n. The sweep table's `contacts` / `dissolved` columns are renamed `uniq cont` / `uniq diss`, because that is what they always measured -- the distinct minima a search turned up, not how the trajectory's time was spent. A docked candidate's occupancy fields are `null` (`pack_mode: "dock"` already says why -- see the `docking.py` section). Not additive: a pre-0.7.0 `scored.json` lacks `n_frames` on its candidates, so `pool_by_n` now raises on it rather than pooling silently without the counts -- rescore, don't re-report |
 | 0.6.0 | the params block of `sweep.json` / `dock.json` loses `git_commit`, and `report.git_commit` is gone. It was blank on every cluster run (no `.git` in the copied tree, or no `git` in the batch environment), so it pinned nothing where it mattered. Subtractive: an older sweep still carries the field and re-renders unchanged, since the params block is rendered key-by-key with nothing reading `git_commit` by name |
 | 0.5.0 | the params block of `sweep.json` / `dock.json` gains `ase_version`, `numpy_version` and the calculator's own library (`tblite_version`, or `mace_torch_version` / `torch_version`), from installed package metadata. Additive: nothing reads them, so older sweeps re-render unchanged |
 | 0.4.0 | `scored.json` gains `pack_mode` (`"md"` or `"dock"`); every run directory gains `ref_solute.xyz` / `ref_solvent.xyz`, the relaxed reference geometries the run's `E_int` was measured against. `docking.py` (a second, constructive generator) and `dft_export.py` (candidate export for DFT) are new. Existing sweeps re-render unchanged (only the version line moves); `pack_mode` defaults to `"md"` when absent so nothing pre-0.4.0 breaks |
@@ -105,7 +106,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `ref_solute.xyz`, `ref_solvent.xyz` | `ensemble.assemble` | the relaxed reference geometries `E_int` for this run was measured against (`reference_energies` keeps only energies otherwise). Written into every run directory that shares one reference, redundant but cheap. `dft_export.export_dft` reads either copy to reconstruct `E(solute) + n E(solvent)` at the DFT level |
-| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), and the sampling diagnostics below |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the sampling diagnostics below |
 | `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
 
 `metadata.json` also carries `pack_clustering` and `pack_directions` -- the
@@ -151,6 +152,15 @@ subtracts the minimum before exponentiating, so the weights -- and therefore
 the two ensemble averages -- are consistent by construction. It costs nothing
 and gives the large numbers the small differences came from. Absolute energies
 are in eV (ASE's native unit), `E_int` in kcal/mol; the mix is deliberate.
+
+An MD candidate in `scored.json` also carries `n_frames` and `frames` -- how
+many scored frames quenched into that minimum, and their sampling dump
+indices -- and each run's summary carries `scored_frame_spacing_fs`,
+`occupancy_mean_contacts`, `occupancy_dissolved_fraction`. See [Basin
+occupancy](#basin-occupancy-what-quenching-throws-away) below for why these
+exist and what they are quarantined from. A docked candidate's are `null`:
+see the `docking.py` section for why a constructed minimum has no occupancy
+to report.
 
 ## The central design decision: sampling and scoring use different Hamiltonians
 
@@ -283,14 +293,89 @@ The quantity that does plateau is a **difference at fixed n** between two legs
 Both legs carry n molecules in comparable environments, so the bias and the
 cohesion largely cancel. That is also the quantity a cluster-continuum study
 reports, which is the other reason one sweep is one leg. `mean_contacts` and
-`dissolved_fraction` are the remaining honest convergence indicators: the
-monolayer capacity bounds them, so they saturate where `E_int` cannot.
+`dissolved_fraction` are convergence indicators for the **search**, not the
+**sampling**: both are computed over the pooled *distinct minima*, so they say
+how many kinds of basin were found, not how much of the trajectory actually
+sat in a contact state. They still saturate where `E_int` cannot, because the
+monolayer capacity bounds them, but they are not the honest occupancy claim
+this doc used to make them out to be -- see Basin occupancy below for the
+frame-weighted version of the same question.
 
 A solute-free background leg, `E(n solvent) - n E(solvent)` in the same
 continuum, would isolate the bias-plus-cohesion drift directly. Considered and
 deliberately not built: the geometries are not comparable to the solvated
 ones, and a difference between two real legs already cancels the same terms
 without a second sweep to maintain.
+
+### Basin occupancy: what quenching throws away
+
+Reading `n_sweep.py`'s code settles a question its docs used to leave open:
+**it is not producing an ensemble of thermally reasonable geometries.** Its
+thermal information is destroyed in two steps. First, the quench --
+`ensemble.relax` optimises every selected frame to `fmax = 0.002`, projecting
+it onto its basin's minimum and discarding where in the basin it actually sat,
+which is the part the MD generated. Second, the dedupe -- `report.dedupe_energies`
+used to return kept indices only, so *how many frames landed in each basin*
+was never stored anywhere. What survived was a set of distinct
+continuum-relaxed local minima with potential energies -- structurally the
+same object `docking.py` produces, and docking finds better ones by
+construction (measured: -13.00 vs -11.44 kcal/mol at n = 2 on
+pyrazine/chloroform, see the `docking.py` section). So the MD sweep was a
+basin-hopping search whose proposal move happened to be 10 ps of MD, and a
+worse one than random placement + BFGS. `E_int(ens)` does not fill that gap:
+it is a Boltzmann average over *quenched potential energies* of a *deduped,
+search-effort-dependent* set -- no vibrational entropy, no ZPE, and, because
+dedupe threw the counts away, no configurational entropy either.
+
+The fix is not to make MD compete with docking at minimum-finding -- it can't,
+by construction. It is to recover the one thing quenching threw away for
+free: **which basin the trajectory actually visited, and how often.**
+`ensemble.dedupe`'s old justification for discarding frame counts was that
+counting them would make the average "an average over how long the trajectory
+happened to loiter somewhere" -- true when `dump_interval` was 5 fs, about
+100x oversampled against the ~0.55 ps shell decorrelation time above. At
+today's defaults -- 20000 x 0.5 fs = 10 ps, dumped every 50 fs = 200 dumps,
+`max_frames = 50` selecting down to ~200 fs of scored-frame spacing -- that
+ratio is ~2.75x, roughly the same ~18 effectively independent configurations
+the MD-length defaults were chosen to buy. A frame count is no longer pure
+autocorrelation, and every energy behind it is already computed, so
+`ensemble.dedupe` now returns `(candidate, geometry, members)` groups instead
+of representatives alone, and `assemble` sets `n_frames` / `frames` on the
+survivor via `dataclasses.replace`. `report.pool_by_n` sums `n_frames` across
+every packing that visited a basin into a per-n `basins` list
+(`e_int_kcal`, `n_frames`, `frame_share`, `n_seeds_hit`, `weight`,
+`n_contacts`), and `format_basin_occupancy` renders the top 5 by frame share
+plus an "other" row, with a line contrasting `E_int(min)` against the
+frame-share-weighted mean and both pairs of contact statistics -- the gap
+between `mean_contacts` (over distinct minima) and `occupancy_mean_contacts`
+(frame-weighted) is itself the diagnostic: it says how far the minima set
+over-represents rare tight basins.
+
+**Occupancy is quarantined from every `E_int` in this pipeline, on purpose.**
+The wall volume (`wall_slack`) sets the translational entropy of a dissociated
+solvent molecule and therefore fixes any dissolved/bound *population* --
+raise it and an occupancy number moves -- while leaving `E_int(min)`
+completely untouched, since a dissolved molecule contributes ~0 to `E_int`
+regardless of box size. So occupancy is reported only as a diagnostic, never
+folded into an energy: no thermal-average `E_int` is built from it. Reading
+the section also means holding six caveats that live beside the numbers, not
+just in this doc: sampling is gas-phase (methanol + 4 water: 3.84-4.39
+H-bonds in gas vs 0.00-0.30 in ALPB(water), no overlap); pooling across
+stratified packings is a mixture with hand-picked weights, so agreement
+within one basin's `n_seeds_hit` is the only unbiased evidence; the 1 meV
+dedupe merges isoenergetic distinct minima into one count; frames are
+correlated, so `scored_frame_spacing_fs` has to be read against a
+decorrelation time measured on the system in question, not assumed; these are
+inherent-structure populations, with no vibrational entropy or ZPE; and the
+wall-volume point above.
+
+A docked candidate has no sampling frame and so no occupancy at all --
+`_assemble_dock_n` writes `n_frames` / `frames` as `None`, a real absence
+rather than a population of one, the same convention `wall_energy_eV: null`
+already uses there. Docking's own dedupe groups constructed *placements*, not
+thermal samples; counting them would look like a frame-weighted population
+and would not be one, which is exactly what `found_by` already reports
+instead.
 
 Every term has to be relaxed *to convergence*, not merely to a stationary-ish
 geometry. The scoring optimizer therefore runs to `fmax = 0.002` eV/A
@@ -560,18 +645,31 @@ refined.
 Both programs report the same *kind* of thing: a continuum-relaxed,
 wall-free local minimum, scored identically (`ensemble.relax`, no wall, and
 even `n_contacts` / `min_gap_A` computed on the *relaxed* geometry, not the
-raw placement). So neither report has to caveat the other -- they differ
-only in how the starting geometry was found, not in what "found" means once
-it is optimised:
+raw placement). But they are not peers at minimum-finding any more --
+**docking owns that job.** The MD sweep's candidates are potential-energy
+minima too, reached by quenching 10 ps of MD rather than by construction, and
+dozens of independent, unconstrained random poses descending by BFGS reliably
+outfind a single thermal trajectory at the same job: the -11.44 vs -13.00
+kcal/mol measurement above is the sweep's proposal move (10 ps of gas-phase
+Langevin) simply losing to random placement as a basin-hopping search. See
+[Basin occupancy](#basin-occupancy-what-quenching-throws-away) above for why
+that isn't a reason to drop the MD sweep.
 
-- **MD sweep** -- thermal exploration. Gas-phase Langevin inside a confining
-  wall; basin coverage is set by what the trajectory visits, which is why it
-  missed the both-N basin at n = 2 above.
 - **Docking** -- random construction, chained upward: n = 1's surviving
   parents become n = 2's starting points. Greedy (the best structure at n
   need not descend from the best at n - 1), which is why `Docking.n_parents`
-  carries more than one candidate forward, and why the MD sweep remains
-  available as an independent, non-greedy check on the same system.
+  carries more than one candidate forward. Wins at minimum-finding by
+  construction: BFGS only descends, so trying enough independent poses is
+  the whole method.
+- **MD sweep** -- demoted to two jobs docking cannot do. First, a
+  **non-greedy, independently drawn check**: docking's chain still grows
+  from one lineage, so a basin no pose in that lineage lands in is invisible
+  to it no matter how many placements are tried, while a freshly packed MD
+  run samples a genuinely different region of configuration space. Second,
+  the MD sweep is the **only source of basin occupancy** -- a docked minimum
+  was placed, not visited, so it has no sense of "time spent" in one basin
+  over another, which is exactly what `_assemble_dock_n` writing `n_frames: null`
+  is saying.
 
 Run one from the command line, the same shape as `n_sweep.py`:
 

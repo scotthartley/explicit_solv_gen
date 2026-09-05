@@ -78,9 +78,49 @@ between two legs: two conformers, two tautomers, bound and free, one solute in
 two solvents. Both legs carry `n` molecules in comparable environments, so the
 bias and the cohesion largely cancel and what is left does plateau. That is
 also the quantity a cluster–continuum study reports in the first place, which
-is why one sweep is one leg. `contacts` and `dissolved` are the other honest
-convergence indicators — the monolayer capacity bounds them, so they saturate
-where `E_int` cannot.
+is why one sweep is one leg. `uniq cont` and `uniq diss` are convergence
+indicators for the *search*, not the *sampling*: computed over the pooled
+distinct minima, they say how many kinds of basin were found, not how much of
+the trajectory sat in one. The monolayer capacity still bounds them, so they
+saturate where `E_int` cannot — but the frame-weighted version of the same
+question lives in [Basin occupancy](#basin-occupancy) below.
+
+### Basin occupancy
+
+`n_sweep.py`'s candidates are quenched local minima, not a thermal ensemble —
+`ensemble.relax` optimizes every scored frame to `fmax = 0.002` before
+anything downstream sees it, and the cross-seed dedupe above discards
+duplicate basins. What survives is structurally the same object `docking.py`
+produces, and docking finds better minima by construction (dozens of
+independent random poses descending by BFGS reliably outfind one thermal
+trajectory: −13.00 vs −11.44 kcal/mol at `n = 2` on pyrazine/chloroform — see
+[Docking](#docking-a-constructive-alternative)). So `E_int(ens)` is **not** a
+thermal average; it is a Boltzmann-weighted soft minimum over a deduped,
+search-effort-dependent set of quenched energies.
+
+What the MD sweep gives that docking structurally cannot is **basin
+occupancy** — how many of the scored frames quenched into each minimum,
+pooled across packings and reported frame-weighted in `report.txt`'s Basin
+occupancy section. At today's defaults (50 fs dumps, `max_frames = 50`
+selecting down to ~200 fs of scored-frame spacing against a ~0.55 ps shell
+decorrelation time) that count is only ~2.75× oversampled, close enough to
+independent to be a usable inherent-structure population estimate — unlike at
+the old 5 fs dump interval (~100× oversampled), which is why it used to be
+discarded at dedupe.
+
+Occupancy is a diagnostic, quarantined from every `E_int` in this repo: the
+wall volume (`wall_slack`) sets the population of a dissociated molecule and
+moves an occupancy number, while a dissolved molecule still contributes ~0 to
+`E_int` regardless of box size — no thermal-average `E_int` is built from any
+of this. Read it with its caveats in mind: sampling is gas-phase (see the
+Hamiltonians section below); pooling across stratified packings is a mixture
+with hand-picked weights, so agreement within one basin (`n_seeds_hit`) is the
+only unbiased evidence; the 1 meV dedupe merges isoenergetic distinct minima
+into one count; frames are correlated, so the reported spacing has to be
+compared against a decorrelation time measured on the system in question; and
+these are inherent-structure populations with no vibrational entropy or ZPE.
+A docked candidate has no sampling frame and so no occupancy — its fields are
+`null`, a real absence rather than a population of one.
 
 ## Install
 
@@ -151,8 +191,11 @@ Per run directory (`<label>_<solvent>_n<N>_seed<S>/`):
 | `best.xyz` | the lowest candidate |
 
 Per sweep: `sweep.json` and `report.txt` — the params block, the `E_int(n)`
-table, a Best geometry at each n section naming the file behind each row, and
-the diagnostics — plus one `best_n<N>.xyz` per n: the pooled-minimum
+table, a Best geometry at each n section naming the file behind each row, a
+Basin occupancy section (how many scored frames quenched into each basin,
+frame-weighted and pooled across packings — see
+[Basin occupancy](#basin-occupancy) above), and the diagnostics — plus one
+`best_n<N>.xyz` per n: the pooled-minimum
 packing's `best.xyz` at that n, copied out with `sweep_n=` /
 `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One
 file per n, not one multi-frame file, because the atom count changes with
@@ -174,11 +217,11 @@ E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 leg: pyrazine/chcl3
 full first shell: ~13 solvent molecules
 
-  n  cover   E_int(min)   E_int(ens)     dE_int  found by   pool   E(cluster)/eV  contacts  dissolved   wall
+  n  cover   E_int(min)   E_int(ens)     dE_int  found by   pool   E(cluster)/eV  uniq cont  uniq diss   wall
 ------------------------------------------------------------------------------------------------------------
-  0     0%        -0.03        -0.01          -       1/1      2     -446.915704      0.00       100%     0%
-  1     8%        -6.66        -6.54      -6.63       2/3     18     -890.445167      0.33        67%     4%
-  2    15%       -13.02       -12.63      -6.36       1/2     22    -1333.955483      1.23        14%     0%
+  0     0%        -0.03        -0.01          -       1/1      2     -446.915704       0.00       100%     0%
+  1     8%        -6.66        -6.54      -6.63       2/3     18     -890.445167       0.33        67%     4%
+  2    15%       -13.02       -12.63      -6.36       1/2     22    -1333.955483       1.23        14%     0%
 ```
 
 One row per `n`, over every packing's candidates pooled together and deduped
@@ -197,8 +240,53 @@ packings per `n` on average, all well under the current defaults — so its
 increments are dominated by sampling noise: they do not settle because the
 sampling never did.) `E(cluster)` is shown beside them to give the large
 numbers the small differences came from — it is *not* comparable across rows
-of different `n`, which is precisely what `E_int` is for. A **per-packing
-detail** table under it carries what each search found on its own.
+of different `n`, which is precisely what `E_int` is for. `uniq cont` /
+`uniq diss` are averaged over the pooled distinct minima — a search-effort
+diagnostic, not an occupancy one; see [Basin occupancy](#basin-occupancy) for
+the frame-weighted version. A **per-packing detail** table under it carries
+what each search found on its own.
+
+## Docking: a constructive alternative
+
+`n_sweep.py` explores by thermal sampling and quenches whatever basin the
+trajectory happens to visit — which means it can miss one entirely.
+`docking.py` finds basins by constructing instead: place a solvent molecule at
+a random position and orientation around the relaxed parent cluster and run
+BFGS, chained upward (`n = 1`'s survivors become `n = 2`'s starting points).
+Measured on pyrazine + 2 chloroform: the MD sweep never finds the
+both-nitrogens arrangement (one chloroform H-bonded to each ring nitrogen) in
+14 candidates over three packings, even though it is 1.56 kcal/mol *lower*;
+docking finds it as its overall minimum, `E_int(2) = −13.00` kcal/mol against
+the sweep's pooled `−11.44`.
+
+```bash
+python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
+  --solvent chcl3 --n 1 2 3 --out pyrazine_dock/ --placements 64
+```
+
+Same shape as `n_sweep.py`: writes `dock.json` (matching `sweep.json`'s
+`{"params": ..., "runs": [...]}` shape) and `dock_report.txt`, and
+`python -m dft_export` and `python -m report` both read a docking output
+directory exactly as they read a sweep's. Docking **owns minimum-finding** —
+BFGS descending from dozens of independent random poses reliably outfinds one
+thermal trajectory at the same job, by construction — which is why the two
+generators' numbers are never pooled together: docking would win at every `n`
+trivially and erase the informative comparison. The MD sweep keeps two jobs
+docking cannot do: it is a non-greedy, independently packed check at each `n`
+(docking's chain still grows from one lineage, so a basin no pose in that
+lineage lands in is invisible to it), and it is the only source of
+[basin occupancy](#basin-occupancy), since a docked minimum was placed, not
+visited, and so has no sense of "time spent" in it.
+
+Applicability is limited by the same ~N^2.5 GFN2-xTB gradient cost that limits
+the MD sweep, compounded by BFGS step count — comfortable to ~90 atoms,
+painful at 180 — and, more fundamentally, docking targets *targeted
+microsolvation*: past roughly a third of a monolayer no single minimum
+dominates and solvent–solvent cohesion takes over, which is the MD sweep's
+regime instead. `run_docking` warns past that fraction, the same convention
+the `cover` column uses. See `CLAUDE.md`'s `docking.py` section for the full
+measurements (staged screen-then-refine cost, the placement-count confidence
+argument, per-parent detail).
 
 ## Packing: the seeds are stratified, not repeated
 
@@ -238,10 +326,10 @@ than 3 / 3 / 3 / 3 — the same
 compute, better spent. `--seeds 1` falls back to one everywhere, so a
 single-packing sweep still reports no agreement and says so.
 
-## The three diagnostics
+## The four diagnostics
 
-Numbers from this kind of workflow are easy to over-read. Three things are
-reported alongside them, and all three can turn a plausible-looking table into
+Numbers from this kind of workflow are easy to over-read. Four things are
+reported alongside them, and all four can turn a plausible-looking table into
 an obviously unfinished one.
 
 **Wall activity.** The confining wall is meant to be a safety net. If it is
@@ -271,6 +359,13 @@ are stratified, they are *designed* to differ, so their scatter measures the
 lottery as much as the sampling noise. A single-packing sweep has none of this
 evidence and says so in place of the table, rather than leaving the absence to
 read as precision.
+
+**Basin occupancy.** The first three diagnostics all judge the *search* — did
+it converge, did it agree with itself. This one is different: it says how the
+trajectory's time was actually spent, frame-weighted and pooled across
+packings, rather than how many distinct kinds of basin the search happened to
+turn up. See [Basin occupancy](#basin-occupancy) above for what it is, why it
+exists now and did not before, and the caveats that come with reading it.
 
 ## Choosing `n`
 
@@ -323,7 +418,9 @@ kill -TERM -- -$(ps -o pgid= -p <parent-pid> | tr -d ' ')
 | --- | --- |
 | `solvate_md.py` | packing + MD — the **generator** |
 | `ensemble.py` | re-optimizing and scoring frames in a continuum — the **scorer** |
-| `n_sweep.py` | the `E_int(n)` sweep, and the CLI |
+| `n_sweep.py` | the `E_int(n)` sweep: a non-greedy diversity check and the only source of basin occupancy |
+| `docking.py` | a second, constructive generator — random placement + BFGS instead of thermal sampling; owns minimum-finding, standalone/either-or with `n_sweep.py` |
+| `dft_export.py` | exports deduped, near-minimum candidates from either generator, plus a manifest, for downstream DFT refinement |
 | `report.py` | all text rendering, plus the ASE-free numeric helpers; no ASE/tblite at module scope |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent` |
 | `single_thread.py` | pins the numeric stack to one thread per process — **must be imported before numpy** |

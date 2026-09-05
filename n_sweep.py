@@ -50,9 +50,40 @@ to zero. Better, judge "how much is enough"
 on a difference at fixed n between two legs (two conformers, bound and free,
 one solute in two solvents): both legs carry n molecules in comparable
 environments, so the bias and the cohesion largely cancel and what is left
-does plateau. `mean_contacts` and `dissolved_fraction` are the other honest
-convergence indicators, because the monolayer capacity bounds them and so
-they saturate where E_int cannot.
+does plateau. `mean_contacts` and `dissolved_fraction` are search-effort
+diagnostics, not occupancy -- both are computed over the *deduped* candidate
+set, so they say how many kinds of basin the search turned up, not how much
+of the trajectory actually sat in a contact state. `report.txt`'s Basin
+occupancy section is the frame-weighted version of that question, and it is
+the only place in this module where an answer to it lives.
+
+**This is a basin search whose proposal move happens to be MD, not a thermal
+ensemble.** `ensemble.relax` quenches every scored frame to its basin's
+minimum before anything downstream sees it, and the cross-seed dedupe above
+discards duplicate basins the same way `docking.py` discards duplicate
+placements -- what survives is a set of distinct continuum-relaxed minima
+with potential energies, structurally the same object `docking.py` produces,
+and docking finds better ones by construction (BFGS descending from dozens of
+independent unconstrained poses reliably outfinds one 10 ps trajectory at the
+same job -- measured at -11.44 vs -13.00 kcal/mol on pyrazine + 2 chloroform,
+see `docking.py`'s module docstring). So `E_int(ens)` is **not** a thermal
+average: it is a soft minimum (Boltzmann-weighted) over a deduped,
+search-effort-dependent set of quenched energies, with no vibrational or
+configurational entropy in it -- the same caveat `report.ensemble_energy`
+carries, restated here because it is easy to misread a Boltzmann weight as
+"thermal" when it is not one.
+
+What this module gives that docking structurally cannot is **basin
+occupancy** -- how many of the scored frames quenched into each minimum, kept
+now rather than discarded at dedupe (see `ensemble.dedupe`'s docstring for
+why that used to be the wrong call and is not any more) and reported as
+`report.txt`'s Basin occupancy section, frame-weighted and pooled across
+packings. A docked minimum was placed, not visited, so there is no sense in
+which it has an occupancy at all -- `docking.py` writes `None` for it. Read
+occupancy as a diagnostic only, quarantined from every `E_int` in this module:
+the wall volume (`Condition.wall_slack`) sets the population of a dissociated
+molecule and would move an occupancy number, while a dissolved molecule still
+contributes ~0 to `E_int` regardless of box size.
 
 Sampling is gas-phase by default and scoring is in the continuum: see the
 module docstring of `ensemble.py` for why those are separated. Sampling is
