@@ -15,8 +15,8 @@ the bulk dielectric to the continuum.
 
 That leaves one question, which this code turns into a measurement: **how much
 explicit solvent is enough?** Sweep the number of explicit molecules `n`, watch
-the interaction energy converge, and report the two diagnostics that say
-whether the sampling behind it was sufficient.
+the interaction energy converge, and report the diagnostics that say whether
+the search and the sampling behind it were sufficient.
 
 ## Environment
 
@@ -46,7 +46,7 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | `single_thread.py` | pins the numeric stack to one thread per process. Must be imported **before numpy**; see its docstring. |
 | `solvate_md.py` | packing + MD. The **generator**. |
 | `ensemble.py` | rescoring optimized frames in a continuum. The **scorer**. |
-| `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**. |
+| `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**: an independently drawn diversity check, and the only source of basin occupancy. |
 | `docking.py` | a second, constructive generator: random placement + BFGS instead of thermal sampling. Standalone, either/or with `n_sweep.py`; see below. |
 | `dft_export.py` | exports deduped, near-minimum candidates (from either generator) plus a manifest for a downstream DFT single point or reopt. |
 | `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`, `dedupe_groups`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
@@ -85,6 +85,10 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.8.0 | two changes, landed together and both non-comparable. **Report shape**: the tables keep only the load-bearing columns -- `E_int(ens)`, `E(cluster)` and the distinct-minima `mean_contacts` / `dissolved_fraction` leave every table and `scored.log`'s Result block (they stay in the JSON), and the frame-weighted `occupancy_*` pair takes the `contacts` / `dissolved` columns. The ~150 lines of fixed prose every report carried move to README's "Reading report.txt". **Packing**: stratification is gone -- every solvent molecule is drawn independently again, `allocate_seeds` collapses to `n_seeds` everywhere and one at n = 0, and the Sampling convergence section goes with them. Changes the packing for **every n >= 2 run**, so sweeps either side are not comparable; `metadata.json` loses `pack_clustering` / `pack_directions` and the params block loses `pack_stratified`. Measured cost on one sweep: the n = 2 pooled minimum went -13.01 -> -11.40 kcal/mol, the both-nitrogens basin stratification used to buy -- which `docking.py` now finds by construction, which is why this is the intended trade |
+| 0.7.3 | one rendering pipeline for both generators. The docking table gains a `wall` column (always `-`) and takes the sweep's column order; both Best geometry tables carry `frame`, `parent` and `E_wall/eV`, `-` where one does not apply. `report.dock_row_from_summary`, `format_dock_table`, `format_dock_best_geometry`, `_dock_increments`, `format_dock_report`, `write_dock_best_geometries` and `render_dock_dir` are gone; `pool_by_n` takes a docking `runs` list and carries `pack_mode` per row. No number moves |
+| 0.7.2 | one candidate and one summary constructor for both generators (`ensemble.summarise`, `Candidate` for docking too). An MD candidate in `scored.json` gains `parent: null`; a docked candidate's `frame` is now its index among the refined placements *before* the dedupe rather than after. No number moves |
+| 0.7.1 | `Scoring.stride`, `--stride` and the `stride` field of every summary are gone -- the `max_frames` cap always bit, so stride selected nothing. `ensemble.score_run` and `ensemble.dedupe` deleted (no callers, one caller). Readers index `pack_mode` / `n_refined` / `label` / `seed` directly instead of defaulting them, so a broken summary fails loudly. No number moves |
 | 0.7.0 | an MD candidate in `scored.json` gains `n_frames` / `frames` -- how many scored frames quenched into that minimum, and their sampling dump indices, preserved through dedupe instead of discarded at it; each run's summary gains `scored_frame_spacing_fs`, `occupancy_mean_contacts`, `occupancy_dissolved_fraction`. `report.txt` gains a Basin occupancy section, fed by a `basins` list `pool_by_n` now attaches to each pooled n. The sweep table's `contacts` / `dissolved` columns are renamed `uniq cont` / `uniq diss`, because that is what they always measured -- the distinct minima a search turned up, not how the trajectory's time was spent. A docked candidate's occupancy fields are `null` (`pack_mode: "dock"` already says why -- see the `docking.py` section). Not additive: a pre-0.7.0 `scored.json` lacks `n_frames` on its candidates, so `pool_by_n` now raises on it rather than pooling silently without the counts -- rescore, don't re-report |
 | 0.6.0 | the params block of `sweep.json` / `dock.json` loses `git_commit`, and `report.git_commit` is gone. It was blank on every cluster run (no `.git` in the copied tree, or no `git` in the batch environment), so it pinned nothing where it mattered. Subtractive: an older sweep still carries the field and re-renders unchanged, since the params block is rendered key-by-key with nothing reading `git_commit` by name |
 | 0.5.0 | the params block of `sweep.json` / `dock.json` gains `ase_version`, `numpy_version` and the calculator's own library (`tblite_version`, or `mace_torch_version` / `torch_version`), from installed package metadata. Additive: nothing reads them, so older sweeps re-render unchanged |
@@ -106,16 +110,8 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `ref_solute.xyz`, `ref_solvent.xyz` | `ensemble.assemble` | the relaxed reference geometries `E_int` for this run was measured against (`reference_energies` keeps only energies otherwise). Written into every run directory that shares one reference, redundant but cheap. `dft_export.export_dft` reads either copy to reconstruct `E(solute) + n E(solvent)` at the DFT level |
-| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the sampling diagnostics below |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the two diagnostics below. Each table ends with a one-line column key and points at README's "Reading report.txt", which is where the explanatory prose lives -- once, rather than in a docstring, in every rendered report, and here |
 | `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
-
-`metadata.json` also carries `pack_clustering` and `pack_directions` -- the
-stratification parameter this packing was drawn at and the per-molecule
-hemisphere axes it was constrained to, both `null` for an unstratified
-packing and for `n < 2`. They are the one thing that deliberately differs
-between the seeds at a given n, so they travel with the run rather than being
-recoverable only by re-deriving them from the seed. `run.log`'s Packing block
-prints both.
 
 `run.log` is flushed on every line, so a long run can be followed with
 `tail -f` instead of going silent until it exits. **The footer surfaces the
@@ -140,18 +136,22 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
 (Anything scored before `n_opt_steps` and the mandatory wall fields no longer
 re-renders, since the readers no longer default a missing field. Rescore it
-rather than re-reporting it. The same now applies to the 0.2.0 packing fields:
-a `metadata.json` without `pack_directions`, or a `sweep.json` params block
-without `monolayer_capacity`, raises rather than rendering a report that
-silently omits a column.)
+rather than re-reporting it. The same applies to a `sweep.json` params block
+without `monolayer_capacity`: it raises rather than rendering a report that
+silently omits the `cover` column.)
 
-`E_int` stays the reported number, because it alone is comparable across n.
-`E(cluster)` is now shown beside it everywhere: within a run the two differ
-only by the constant `E(solute) + n E(solvent)`, and `boltzmann_weights`
-subtracts the minimum before exponentiating, so the weights -- and therefore
-the two ensemble averages -- are consistent by construction. It costs nothing
-and gives the large numbers the small differences came from. Absolute energies
-are in eV (ASE's native unit), `E_int` in kcal/mol; the mix is deliberate.
+`E_int(min)` is the reported number, because it alone is comparable across n,
+and at 0.8.0 it is the only energy any table prints. `E_int(ens)` and
+`E(cluster)` are still computed and still in `scored.json` / `sweep.json` --
+within a run `E_int` and `E(cluster)` differ only by the constant
+`E(solute) + n E(solvent)`, and `boltzmann_weights` subtracts the minimum
+before exponentiating, so the two ensemble averages carry identical weights by
+construction -- but they are no longer rendered. Two averages side by side
+invite reporting whichever looks better, which is the same objection this doc
+already raises against giving `E_int(ens)` its own `dE_int`; and `E(cluster)`
+is not comparable across rows of different n, which is what `E_int` exists to
+fix. Absolute energies are in eV (ASE's native unit), `E_int` in kcal/mol; the
+mix is deliberate.
 
 An MD candidate in `scored.json` also carries `n_frames` and `frames` -- how
 many scored frames quenched into that minimum, and their sampling dump
@@ -246,34 +246,30 @@ line of nonzero slope rather than to a flat.
 
 So `report.txt` carries a **`dE_int` column** -- `E_int(min)` at this n minus
 `E_int(min)` at n - 1, over the **pooled** candidates of every packing at each
-n. It is keyed by n alone. It used to pair by seed *index*, which paired
-nothing physical: seed 0 at n = 2 is not seed 0 at n = 1 with a molecule
-added, it is an independent packing, so the pairing had variance
-`var(A) + var(B)` where pairing exists to cancel variance, and under
-stratification it did not even hold the arrangement fixed, since
-`c = (seed + 0.5) / n_seeds_at_this_n` and the seed count varies with n. It
-also silently dropped every row whose index had no counterpart -- with
-`allocate_seeds` giving n = 0 one packing, that was all but one row of the
-table. Convergence is the increment settling to a **constant**, not to zero.
+n. It is keyed by n alone -- pairing by seed *index* would pair nothing
+physical, since seed 0 at n = 2 is not seed 0 at n = 1 with a molecule added
+but an independent packing. Convergence is the increment settling to a
+**constant**, not to zero.
 
-Only `E_int(min)` gets an increment. A second one on the ensemble average
-would only invite reporting whichever of the two looks better.
+Only `E_int(min)` gets an increment, and since 0.8.0 it is the only energy the
+tables print at all: a second increment on the ensemble average, or the
+average beside the minimum, would only invite reporting whichever looks
+better.
 
 **The seeds at one n are pooled, not averaged.** They are independent
 *searches*, not replicas of a physical system: a mean over them penalizes
-searching more widely, and it fights the stratification below head-on, since
-that design exists precisely so that one packing in seven finds the
-both-nitrogens geometry and the mean then dilutes that discovery by the six
-that missed it. Measured on one sweep at n = 2: six packings find -12.12 and
-one finds -11.60, and the mean of the minima is -12.05 -- a number no geometry
-has. So the reported number at each n is the minimum over the pooled
+searching more widely, diluting the one packing that found a geometry nobody
+else did by the ones that missed it. Measured on one sweep at n = 2: six
+packings find -12.12 and one finds -11.60, and the mean of the minima is
+-12.05 -- a number no geometry has. So the reported number at each n is the
+minimum over the pooled
 candidates of every packing, and the pool is deduped across packings with the
 same energy criterion `ensemble` uses within a run (`report.dedupe_energies`,
 1 meV), because seven packings finding one basin would otherwise multiply its
-Boltzmann weight by seven. `E_int(ens)` is pooled the same way and retained:
-Boltzmann weighting at 298 K (kT = 0.594 kcal/mol) is a soft minimum rather
-than a democratic average, and it is continuous in the candidate set where the
-minimum is a step function.
+Boltzmann weight by seven. `E_int(ens)` is pooled the same way and kept in the
+JSON -- Boltzmann weighting at 298 K (kT = 0.594 kcal/mol) is a soft minimum
+rather than a democratic average, and it is continuous in the candidate set
+where the minimum is a step function -- but 0.8.0 stopped printing it.
 
 Pooling is only legitimate because the references are sweep-wide --
 `score_run_grid` computes them once per distinct (solute, solvent, calculator,
@@ -296,10 +292,9 @@ reports, which is the other reason one sweep is one leg. `mean_contacts` and
 `dissolved_fraction` are convergence indicators for the **search**, not the
 **sampling**: both are computed over the pooled *distinct minima*, so they say
 how many kinds of basin were found, not how much of the trajectory actually
-sat in a contact state. They still saturate where `E_int` cannot, because the
-monolayer capacity bounds them, but they are not the honest occupancy claim
-this doc used to make them out to be -- see Basin occupancy below for the
-frame-weighted version of the same question.
+sat in a contact state. They are in the JSON and no longer in any table, since
+`pool` already reports the search; what the `contacts` / `dissolved` columns
+show is the frame-weighted `occupancy_*` pair below.
 
 A solute-free background leg, `E(n solvent) - n E(solvent)` in the same
 continuum, would isolate the bias-plus-cohesion drift directly. Considered and
@@ -348,8 +343,10 @@ every packing that visited a basin into a per-n `basins` list
 plus an "other" row, with a line contrasting `E_int(min)` against the
 frame-share-weighted mean and both pairs of contact statistics -- the gap
 between `mean_contacts` (over distinct minima) and `occupancy_mean_contacts`
-(frame-weighted) is itself the diagnostic: it says how far the minima set
-over-represents rare tight basins.
+(frame-weighted) is itself the diagnostic -- it says how far the minima set
+over-represents rare tight basins -- and the Basin occupancy section is the
+one place both are still printed, since 0.8.0 took the distinct-minima pair
+out of the tables.
 
 **Occupancy is quarantined from every `E_int` in this pipeline, on purpose.**
 The wall volume (`wall_slack`) sets the translational entropy of a dissociated
@@ -358,16 +355,20 @@ raise it and an occupancy number moves -- while leaving `E_int(min)`
 completely untouched, since a dissolved molecule contributes ~0 to `E_int`
 regardless of box size. So occupancy is reported only as a diagnostic, never
 folded into an energy: no thermal-average `E_int` is built from it. Reading
-the section also means holding six caveats that live beside the numbers, not
-just in this doc: sampling is gas-phase (methanol + 4 water: 3.84-4.39
-H-bonds in gas vs 0.00-0.30 in ALPB(water), no overlap); pooling across
-stratified packings is a mixture with hand-picked weights, so agreement
-within one basin's `n_seeds_hit` is the only unbiased evidence; the 1 meV
-dedupe merges isoenergetic distinct minima into one count; frames are
-correlated, so `scored_frame_spacing_fs` has to be read against a
-decorrelation time measured on the system in question, not assumed; these are
-inherent-structure populations, with no vibrational entropy or ZPE; and the
-wall-volume point above.
+the section also means holding five caveats, which live in README's "Reading
+report.txt" rather than being restated in every rendered report: sampling is
+gas-phase (methanol + 4 water: 3.84-4.39 H-bonds in gas vs 0.00-0.30 in
+ALPB(water), no overlap); the 1 meV dedupe merges isoenergetic distinct
+minima into one count; frames are correlated, so `scored_frame_spacing_fs`
+has to be read against a decorrelation time measured on the system in
+question, not assumed; these are inherent-structure populations, with no
+vibrational entropy or ZPE; and the wall-volume point above.
+
+There were six until 0.8.0. The sixth was that pooling across *stratified*
+packings is a mixture with hand-picked weights rather than a sample, since
+`c = (seed + 0.5) / n_seeds` was chosen by design -- which is one of the
+reasons the stratification is gone. The packings pooled here are independent
+draws now.
 
 A docked candidate has no sampling frame and so no occupancy at all --
 `_assemble_dock_n` writes `n_frames` / `frames` as `None`, a real absence
@@ -413,62 +414,35 @@ What sets them, measured rather than assumed:
 | equilibration | 5 ps | ~5 relaxation times. The old 1 ps was **one** |
 | production | 10 ps | ~18 independent shell configurations. The old 3 ps was ~5 |
 | dump interval | 100 steps = 50 fs | 11 dumps per decorrelation time. The old 5 fs recorded each configuration ~100 times |
-| seeds | 3 | now the *average* per n, not the count at each: the total is `--seeds x len(--n)` and `allocate_seeds` spends it by coverage. See below |
+| seeds | 3 | independent packings at each n >= 1; n = 0 gets one, since every packing of a bare solute is the same packing |
 
 Expect all of these to grow with the solute. Re-measure the decorrelation time
 on your own system rather than carrying 0.55 ps over -- it is the one number
 here that is a property of the system rather than of the integrator.
 
-### Stratified packing: spend the seed budget on arrangement diversity
+### Packing: independent draws, and why they were once stratified
 
-At n = 2 on pyrazine/chloroform the lowest geometry is almost certainly one
-chloroform H-bonded to each nitrogen. The sweep finds it easily at n = 3 and
-n = 4 and *not* at n = 2, and `report.txt` correctly said STILL FALLING.
+At small n the packing *is* the answer. A CHCl3 bound to a pyrazine nitrogen
+at ~5.7 kcal/mol does not detach, migrate around the ring and rebind at the
+far N within 10 ps of gas-phase Langevin, so nothing downstream rescues a bad
+draw. And packmol's draw is badly biased: measured on pyrazine + 2 CHCl3 over
+24 packings, as the dot product between the two solvent centroid directions,
+83% came out same face (> +0.5) and only 4% opposed (< -0.5) -- against a
+1.3% site-combinatoric prediction, since `shell_capacity.py` puts pyrazine's
+solvent-centre surface at 457 A^2 and a full first shell at ~13 molecules, so
+n = 2 is 15% of a monolayer.
 
-The cause was the packing, not the MD. `pack_solvent` wrote one packmol block
-for all n molecules, so every molecule was placed independently, and nothing
-downstream rescues a bad draw: a CHCl3 bound to N at ~5.7 kcal/mol does not
-detach, migrate around the ring and rebind at the far N within 10 ps of
-gas-phase Langevin. **At n = 2 the starting geometry effectively is the
-answer.** Brute force cannot fix it either -- `shell_capacity.py` puts
-pyrazine's solvent-centre surface at 457 A^2, a full first shell at ~13
-molecules, so n = 2 is 15% of a monolayer, n = 3 is 23%, n = 4 is 31%. Read as
-13 sites, a random packing occupies both N sites 1.3% of the time at n = 2,
-3.8% at n = 3, 7.7% at n = 4: ~176 packings for 90% confidence at n = 2. (Note
-this also says the n = 3/4 successes are combinatorial rather than a coverage
-effect -- at 31% of a monolayer nothing is forcing an even distribution
-there.)
-
-So stop drawing every seed from one distribution and stratify them over the
-**degree of clustering** instead. `hemisphere_directions(n, c, rng)` returns n
-unit vectors, and `pack_solvent` emits one `structure` block per molecule --
-same ellipsoid, plus `over plane dx dy dz 0.`, i.e. the hemisphere around that
-vector. `c = 0` puts the directions as far apart as they go (antipodal,
-equilateral, tetrahedral at n = 2/3/4, from a Coulomb relaxation rather than a
-table -- the golden spiral is not a max-min-separation set at tiny n), `c = 1`
-collapses them all onto one random focus, and in between each is rotated that
-fraction of the way toward it. The whole set is rigidly rotated by a random
-rotation first, so no orientation relative to the solute is assumed; no site
-is named and no chemistry is used. `run_job_grid` sets
-`c = (seed + 0.5) / n_seeds_at_this_n`, so three packings give 0.17 / 0.50 /
-0.83, and applies it only for `n_solvent >= 2` (at n = 1 there is no mutual
-arrangement, and packmol already randomises the single site).
-
-**This is not an assumption that the solvent spreads out.** The clustered end
-is exactly how "both molecules on one face, sharing a Cl...Cl contact" gets
-sampled -- a live arrangement at n = 2, and the same solvent-solvent cohesion
-blamed above for `E_int`'s nonzero slope.
-
-**It self-attenuates, which is why there is no coverage cutoff.** Two
-hemispheres are disjoint (maximally restrictive, exactly where it is needed);
-three at 120 deg overlap somewhat; four tetrahedral overlap so heavily a
-molecule is barely confined; by n ~ 8 the constraint is vacuous. The fade
-covers n = 2..6, the range where the problem is observed to disappear, and it
-happens long before any solute approaches a monolayer.
-
-Measured on pyrazine + 2 CHCl3, 24 packings per column, as the dot product
-between the two solvent centroid directions -- so `opposed` is roughly the
-both-nitrogens arrangement and `same face` its opposite:
+**Stratified packing** was the answer to that from 0.2.0 to 0.8.0, and it is
+worth recording what it did before someone reinvents it. `pack_solvent` wrote
+one packmol `structure` block per molecule rather than one for all n, each
+constrained to a hemisphere (`over plane dx dy dz 0.`) around its own
+direction; `hemisphere_directions(n, c, rng)` produced those directions with
+`c = 0` spreading them as far apart as they go (antipodal, equilateral,
+tetrahedral at n = 2/3/4, from a Coulomb relaxation rather than a table) and
+`c = 1` collapsing them onto one random focus, the whole set rigidly rotated
+at random first so no orientation relative to the solute was assumed.
+`run_job_grid` set `c = (seed + 0.5) / n_seeds_at_this_n`. Measured, 24
+packings per column:
 
 | packing | mean dot | opposed (< -0.5) | same face (> +0.5) |
 | --- | --- | --- | --- |
@@ -479,59 +453,39 @@ both-nitrogens arrangement and `same face` its opposite:
 | c = 0.83 | +0.10 | 12% | 17% |
 | c = 1.00 | +0.19 | 8% | 38% |
 
-Two things to read off it. First, **packmol's unstratified draw is far more
-biased than the 13-site estimate above** -- 83% same-face against a 1.3%
-site-combinatoric prediction for the opposed one -- so the n = 2 failure is
-sharper than the combinatorics alone suggest, and the stratification is
-correspondingly more valuable: opposed goes 4% -> 29%, and with the 4 packings
-n = 2 now gets, the chance of at least one opposed packing goes from ~15% to
-~70%. Second, **a hemisphere is soft and the gradient across `c` is gentler
-than the idealised description** -- `c = 0` gives 29% opposed, not ~100%,
-because a molecule may sit right against the dividing plane and point almost
-anywhere from the solute centre. The constraint itself is satisfied every time
-(the centroid's projection on its own axis is positive in every packing); it
-is just a weaker statement than "on that face". Softness was the point -- it
-never crowds packmol and needs no radius tuned against an anisotropic solute
--- but do not read `c` as a hard placement.
+It worked -- opposed went 4% -> 29% -- though less sharply than designed: a
+hemisphere is soft (a molecule may sit against the dividing plane and point
+almost anywhere from the solute centre), so `c = 0` gives 29% and not ~100%,
+and c = 0.00 / 0.17 / 0.50 are indistinguishable at 29 / 29 / 21%.
 
-#### The seed budget is spread over n, not shared equally
+**It went at 0.8.0 because it was solving the job `docking.py` now owns.**
+Raising the n = 2 both-nitrogens hit rate is minimum-finding, and docking
+finds that basin by construction. For the two jobs the sweep keeps it was
+working against them: a non-greedy diversity check wants an independently
+drawn packing, not one drawn at a hand-picked `c`; and pooling frame counts
+across packings drawn that way made basin occupancy a mixture with
+hand-picked weights rather than a sample of anything (it was caveat 2 of six,
+and is now neither).
 
-The seeds are not all worth the same. At n = 0 there is no solvent to arrange,
-so every packing is the same packing. Near a monolayer there is little freedom
-in where the molecules go. The room to arrange, and so the value of another
-packing, is largest at small nonzero n -- which is where the problem is. So
-`n_sweep.allocate_seeds` spends a **fixed total** of `n_seeds * len(n_values)`
-unevenly: n = 0 takes 1, the rest are weighted by `1 - min(n/capacity, 1)` and
-handed out by largest remainder over a floor of 2 packings, so every n >= 1
-keeps something to agree with it. Capacity comes from
-`shell_capacity.monolayer_capacity`, computed once per sweep, and lands in the
-params block as
-`monolayer_capacity` alongside `seeds_per_n`.
+The **seed budget** went with it. `allocate_seeds` used to spend a fixed total
+of `n_seeds * len(n_values)` unevenly -- n = 0 took 1, the rest weighted by
+`1 - min(n/capacity, 1)` and handed out by largest remainder over a floor of
+2 -- because a packing bought more where stratification paid best. With
+independent draws a packing at one n is worth what a packing at any other n
+is, so it is `n_seeds` everywhere and 1 at n = 0, where every packing of a
+bare solute is the same packing. `--seeds` is a count again, not an average.
+`monolayer_capacity` is still computed once per sweep and still lands in the
+params block beside `seeds_per_n`, because the `cover` column needs it.
 
-    capacity 13, budget 3 x 4 = 12
-      n=0 -> 1   (was 3)      n=2 -> 4   (was 3)
-      n=1 -> 4   (was 3)      n=3 -> 3   (was 3)
+**Because the packings are independent draws, their scatter is still not an
+error bar** -- they are independent *searches*, not repeat measurements of one
+system. That is why `report.txt` reports **agreement**: `found by` says how
+many of an n's packings reached the pooled minimum, and that is the
+convergence evidence. Disagreement at small n means the arrangement lottery
+has not been won often enough, and the fix is more packings, not more steps.
+The spread is still printed, to be seen rather than propagated.
 
-Same compute, better spent. When the budget cannot meet the floor of 2 --
-notably `--seeds 1` -- the split is abandoned rather than fudged and every n
-gets `n_seeds`, so a single-packing sweep still reports no agreement and
-says so.
-`--seeds` is therefore the *average* packings per n now, not the count at
-each. Nothing downstream assumes an equal count: `report.txt` aggregates by n
-over the pooled candidates and prints how many packings each n got.
-
-**Because the packings differ by design, their scatter is not an error bar.**
-Independent seeds used to differ only in packing and velocities; they now
-differ deliberately, so their spread measures the arrangement lottery as much
-as the sampling noise. That is why `report.txt` reports **agreement** rather
-than scatter: `found by` says how many of an n's packings reached the pooled
-minimum, and that is the convergence evidence -- searches started from
-different arrangements converging on one answer. Disagreement at small n means
-the lottery has not been won often enough, and the fix is more packings, not
-more steps. The spread is still printed, to be seen rather than to be
-propagated.
-
-`report.txt` also gained a **`cover` column**, `n / monolayer_capacity` as a
+`report.txt` also carries a **`cover` column**, `n / monolayer_capacity` as a
 percent, which is what says whether a row is targeted microsolvation or a real
 shell. It is read from `params` with no default, so a pre-0.2.0 sweep no
 longer re-renders.
@@ -548,7 +502,7 @@ spawn, so the `if __name__ == "__main__":` guard below covers both.
 scoring out over run directories gives a default sweep 12 tasks (4 n x 3
 seeds) on an 18-core machine, and they are badly unequal -- n = 0 is a rigid
 10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
-start and the tail is one whole directory long. `score_run` therefore splits
+start and the tail is one whole directory long. Scoring therefore splits
 into `select_frames` -> `relax` per frame -> `assemble`, and `score_run_grid`
 selects every job in the parent, flattens to one `relax` task per candidate,
 and assembles afterwards. That is ~600 near-equal tasks with a tail of one
@@ -580,15 +534,8 @@ first, which did nothing at all: `max_frames` selects by `linspace` over the
 whole trajectory, so it discards whatever thinning `stride` did, and at any
 usable setting the cap always bites.
 
-### The two diagnostics that say whether the sampling was enough
+### The two diagnostics that qualify a sweep's numbers
 
-`E_int(min)` is a running minimum over candidates, so it can only fall. That
-makes *when it last fell* a convergence test, and `report.txt` now runs it:
-
-- **Sampling convergence** -- per run, how far into the trajectory the best
-  candidate was found and what the last 25% took off `E_int(min)`. A minimum
-  found at 100% is an upper bound, not a converged value; a minimum found
-  early and never beaten is evidence the sampling saturated.
 - **Search convergence** -- per n: the pooled minimum, `found by` (how many of
   that n's packings reached it, by the 1 meV dedupe criterion), the spread of
   the per-packing minima, and the pool size. Independent packings are
@@ -599,13 +546,21 @@ makes *when it last fell* a convergence test, and `report.txt` now runs it:
   single-packing sweep has no such evidence and says so in place of the table
   rather than leaving the absence to read as precision. A double difference is
   four of these numbers and inherits the weakness of all four.
+- **Wall diagnostic** -- the worst wall-active fraction over the sweep's runs,
+  with the same 20% warning `run.log`'s footer carries. It says whether any of
+  the pooled energies is contaminated by the confinement rather than held
+  together by the Hamiltonian.
 
-Both are computed from the candidate list already in `scored.json`, so
-`python -m report <dir>` renders them for anything on disk -- no MD, no
-calculator. They separate the two ways an under-sampled sweep fails, which
-otherwise look alike in the table: a run still falling on the final frame
-(too short) and a run whose minimum came from frame 2 and never moved (stuck
-in the basin it was packed into).
+Both are computed from JSON already on disk, so `python -m report <dir>`
+renders them with no MD and no calculator.
+
+There was a third until 0.8.0, **Sampling convergence** -- per run, how far
+into the trajectory the best candidate was found and what the last 25% took
+off `E_int(min)`, on the argument that `E_int(min)` is a running minimum and
+so *when it last fell* is a convergence test. It measured the sweep's
+performance at minimum-finding, which is the job docking took, and it went
+with the stratification that served the same job. Basin occupancy is what
+the sweep reports about its sampling now.
 
 ## `docking.py` -- a second generator, beside the MD sweep
 
@@ -621,7 +576,7 @@ Measured, GFN2-xTB/ALPB(chcl3), against the same references already in
 
 | structure | E_int (kcal/mol) | how found |
 | --- | --- | --- |
-| MD pooled minimum, n = 2 | -11.44 | 10 ps Langevin, 14 candidates, 3 packings |
+| MD pooled minimum, n = 2 | -11.44 | 10 ps Langevin, 14 candidates, 3 packings (stratified, i.e. under the packing 0.8.0 removed -- an independent draw does no better: -11.40 on a shorter run) |
 | both-N, docked | **-13.00** | random placement onto the relaxed n = 1 parent, screened, refined |
 
 All 14 MD candidates at n = 2 share one motif -- a single H-bond at 1.90 A,
@@ -828,16 +783,14 @@ never contains one, only optimised candidates.
   design -- until this commit, and the `metadata.json` key changed with it, so
   older run directories carry `implicit_solvent` instead.
 - `run_job_grid` takes `seeds_per_condition`, a sequence aligned with
-  `conditions`, not an `n_seeds` scalar -- the budget is spread unevenly over
-  n, and an int-or-sequence union would only hide which a caller meant. It is
-  also where the stratification rule lives, because `c` depends on the seed
-  count at that n and nothing else needs to know it. `run_one_job` and
-  `pack_solvent` take `clustering` as a required argument, with no default,
-  the same as every other packing parameter.
-- The packing RNG is `np.random.default_rng(seed + 2_000_000)` -- a third
-  independent stream alongside the initial velocities (`seed`) and the
-  thermostat (`seed + 1_000_000`), and independent of packmol's own `seed`
-  line, which still varies placement *within* the constraints.
+  `conditions`, not an `n_seeds` scalar -- n = 0 gets one packing where every
+  other n gets `n_seeds`, and an int-or-sequence union would only hide which
+  a caller meant.
+- Two independent RNG streams per run: the initial velocities (`seed`) and
+  the thermostat (`seed + 1_000_000`), both independent of packmol's own
+  `seed` line, which is what varies the placement. There was a third,
+  `seed + 2_000_000`, for the stratified hemisphere directions; it went with
+  them at 0.8.0.
 - Packmol's `tolerance` (default 2.0) forbids hydrogen-bond contacts at t = 0
   (H...O/N sit at 1.8-2.0 A). Harmless here -- gas MD forms them within a few
   ps -- but it means a packed structure never starts bonded.
@@ -908,7 +861,14 @@ Those runs predate the `fmax = 0.002` scoring default and the current
 `scored.json` shape, so their energies sit up to ~0.6 kcal/mol above their
 true minima and they no longer re-render. They were also under-sampled -- one
 seed, 15 frames, 3 ps, all well below the current defaults -- which is what
-the two diagnostics were written to catch, and did.
+the diagnostics were written to catch, and did.
+
+The 0.7.1 - 0.8.0 refactor was verified against a fresh short sweep (pyrazine
++ chloroform, n = 0..2, 1 ps, 10 scored frames per run) and a fresh docking
+run, re-run at every step: through 0.7.3 every `energy_eV` and
+`interaction_eV` in every `scored.json` was bit-identical and only the
+intended keys moved, and at 0.8.0 the docking output stayed byte-identical
+while the sweep's changed exactly as the packing change predicts.
 
 Known limitations:
 
@@ -923,10 +883,15 @@ Known limitations:
   microsolvation, and that is the regime where *every* explicit molecule sits
   at the continuum boundary. The sweep now prints the same fraction as the
   `cover` column, so a sweep says which regime each of its rows is in.
-- Stratified packing improves the odds of the right arrangement; it does not
-  guarantee it. At n = 2 the measured chance of at least one opposed packing
-  in the 4 the reallocation buys is ~70%, not 100%. A run that still says
-  STILL FALLING at small n is asking for more packings, not more steps.
+- **The sweep will miss basins at small n, by design of what it is now.**
+  Packmol's independent draw puts both molecules on one face 83% of the time
+  at n = 2 on pyrazine/chloroform, so the both-nitrogens arrangement is
+  mostly not sampled -- measured at 0.8.0, the sweep reports -11.40 kcal/mol
+  where docking reports -13.01 for the same system against the same
+  references. That is not a defect to fix in the sweep: `docking.py` owns
+  minimum-finding, and the sweep is the independently drawn check beside it.
+  Run both. A `found by` of 1/k at small n is asking for more packings, not
+  more steps.
 - MACE-OFF23 as a generator is **untested** here. It needs a model download,
   and it cannot share a process with tblite (see the file boundary above).
 - GFN2 likely **over-binds** the C-H...N contact -- 1.91 A is short against a

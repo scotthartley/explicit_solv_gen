@@ -11,110 +11,38 @@ n. E_int(0) is zero by construction, and a departure from it is exactly "what
 the continuum was missing". If it never departs, the continuum was already
 sufficient and the explicit shell is not what your model is missing.
 
-Two properties of E_int make this work. It is comparable across n, because
-whole solvent molecules are subtracted off. And a solvent molecule that
-optimises away into the continuum contributes ~0 to it, so a run where the
-shell dissolves lands back on the n = 0 answer rather than on some arbitrary
-offset -- "the shell dissolved" and "there was no explicit shell" agree, which
-is what makes dissolution a usable null result rather than a failure mode.
+**E_int(n) does not plateau.** The reference E(solvent) is one solvent
+molecule relaxed in the same continuum, so the intent was that moving a
+molecule from bulk into a bulk-like site costs nothing. That cancellation is
+not clean: the continuum's per-molecule bias and, from n = 2 on,
+solvent-solvent cohesion both survive it, both roughly linear in n and
+neither switching off once the specific sites are filled. Read the
+*increment* instead, dE_int(n) = E_int(n) - E_int(n-1), which `report.txt`
+prints as a column over the pooled candidates of every packing at each n.
+Convergence is the increment settling to a constant, not to zero. Better,
+judge "how much is enough" on a difference at fixed n between two legs (two
+conformers, bound and free, one solute in two solvents), where the bias and
+the cohesion largely cancel and what is left does plateau.
 
-**E_int(n) does not plateau**, and this docstring claimed for a long time that
-it did. The reference E(solvent) is one solvent molecule relaxed in the same
-continuum -- approximately a molecule of bulk liquid -- so the intent was that
-moving a molecule from bulk into a bulk-like site in the shell costs nothing,
-leaving only the specific sites able to move E_int. That cancellation is not
-clean. Two terms survive it, both roughly linear in n, neither of which
-switches off once the specific sites are filled:
-
-  - the continuum's per-molecule bias, which is what the gas -> ALPB binding
-    table in the docs measures: -0.9 kcal/mol for pyrazine...HCCl3, and +6.2
-    for a water in ALPB(water), so not even fixed in sign; and
-  - solvent-solvent cohesion from n = 2 on, which E_int scores as solvation
-    because what it subtracts is isolated solvent molecules.
-
-Add that E_int is a potential energy, with no entropic penalty for condensing
-molecules out of the continuum, and that E_int(min) is a running minimum over
-a configuration space that grows with n, and the curve tends to a line of
-nonzero slope rather than to a flat.
-
-Read the *increment* instead, dE_int(n) = E_int(n) - E_int(n-1), which
-`report.txt` prints as a column of a per-n table: the candidates of every
-packing at one n are pooled and deduped across packings, and the reported
-E_int is the minimum over that pool rather than a mean over the seeds. Seeds
-are independent *searches*, not replicas, so averaging them would penalise
-searching more widely -- `report.txt` prints `found by` and `pool` instead, so
-the search effort behind a minimum is on the page. Convergence is the
-increment settling to a constant -- the specific interaction exhausted, every
-further molecule merely being condensed into a bulk-like site -- rather than
-to zero. Better, judge "how much is enough"
-on a difference at fixed n between two legs (two conformers, bound and free,
-one solute in two solvents): both legs carry n molecules in comparable
-environments, so the bias and the cohesion largely cancel and what is left
-does plateau. `mean_contacts` and `dissolved_fraction` are search-effort
-diagnostics, not occupancy -- both are computed over the *deduped* candidate
-set, so they say how many kinds of basin the search turned up, not how much
-of the trajectory actually sat in a contact state. `report.txt`'s Basin
-occupancy section is the frame-weighted version of that question, and it is
-the only place in this module where an answer to it lives.
+**One sweep is one solute in one solvent.** A double difference such as
+`(A - B)_solvent1 - (A - B)_solvent2` is assembled by hand from four sweeps;
+each writes a params block into `sweep.json` so you can check that all four
+ran under the same settings before subtracting them.
 
 **This is a basin search whose proposal move happens to be MD, not a thermal
-ensemble.** `ensemble.relax` quenches every scored frame to its basin's
-minimum before anything downstream sees it, and the cross-seed dedupe above
-discards duplicate basins the same way `docking.py` discards duplicate
-placements -- what survives is a set of distinct continuum-relaxed minima
-with potential energies, structurally the same object `docking.py` produces,
-and docking finds better ones by construction (BFGS descending from dozens of
-independent unconstrained poses reliably outfinds one 10 ps trajectory at the
-same job -- measured at -11.44 vs -13.00 kcal/mol on pyrazine + 2 chloroform,
-see `docking.py`'s module docstring). So `E_int(ens)` is **not** a thermal
-average: it is a soft minimum (Boltzmann-weighted) over a deduped,
-search-effort-dependent set of quenched energies, with no vibrational or
-configurational entropy in it -- the same caveat `report.ensemble_energy`
-carries, restated here because it is easy to misread a Boltzmann weight as
-"thermal" when it is not one.
-
-What this module gives that docking structurally cannot is **basin
-occupancy** -- how many of the scored frames quenched into each minimum, kept
-now rather than discarded at dedupe (see `ensemble.dedupe`'s docstring for
-why that used to be the wrong call and is not any more) and reported as
-`report.txt`'s Basin occupancy section, frame-weighted and pooled across
-packings. A docked minimum was placed, not visited, so there is no sense in
-which it has an occupancy at all -- `docking.py` writes `None` for it. Read
-occupancy as a diagnostic only, quarantined from every `E_int` in this module:
-the wall volume (`Condition.wall_slack`) sets the population of a dissociated
-molecule and would move an occupancy number, while a dissolved molecule still
-contributes ~0 to `E_int` regardless of box size.
+ensemble.** `ensemble.relax` quenches every scored frame before anything
+downstream sees it, and `docking.py` finds better minima by construction. So
+`E_int(ens)` is not a thermal average, and the sweep is not here to win at
+minimum-finding: it is an independently drawn, non-greedy check on what
+docking's single lineage might not reach, and the only source of **basin
+occupancy** -- how many scored frames quenched into each minimum, which a
+placed structure has no analogue of. Occupancy is a diagnostic, quarantined
+from every E_int here: the wall volume moves it and leaves E_int(min)
+untouched. CLAUDE.md carries the measurements behind all of that, and README
+carries the caveats that come with reading a report.
 
 Sampling is gas-phase by default and scoring is in the continuum: see the
-module docstring of `ensemble.py` for why those are separated. Sampling is
-`Condition.sample_in_continuum`, and there is no second name for it here.
-
-**One sweep is one solute in one solvent.** A comparison across two solutes
-and two solvents -- a double difference such as
-
-    dd = (A - B)_solvent1 - (A - B)_solvent2
-
--- is assembled by hand from four sweeps, because there is no reason for this
-module to know that a difference is what you eventually want. What that gives
-up is the guarantee that both halves ran under identical settings, so each
-sweep writes a **params block** into `sweep.json` recording the whole
-`Condition` it ran under, the package version, and the versions of the
-libraries the numbers actually came out of -- cheap insurance, given that
-`wall_slack` has already changed meaning once (at c429f8a) without changing
-its name, and that a version says nothing about which build of tblite
-evaluated the Hamiltonian.
-
-At small n the packing *is* the answer -- a chloroform bound to a pyrazine
-nitrogen does not detach, migrate around the ring and rebind at the far one
-within 10 ps of Langevin -- and packmol's unconstrained draw is badly biased
-toward putting the molecules together (measured: 83% same-face at n = 2 on
-pyrazine/chloroform, 4% opposed). So the seeds at each n are not repeats:
-`solvate_md.run_job_grid` stratifies them over the degree of clustering, and
-`allocate_seeds` below spreads a fixed total of packings over n by monolayer
-coverage rather than giving each n the same number. `--seeds` is the
-*average* per n. Because the packings differ by design, their scatter is not
-an error bar: what `report.txt` reports is how many of them **agree** on the
-pooled minimum.
+module docstring of `ensemble.py` for why those are separated.
 
 Run one from the command line:
 

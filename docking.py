@@ -1,69 +1,35 @@
 """A second geometry generator: construct microsolvated clusters, don't sample them.
 
-`n_sweep.py` explores by thermal sampling -- gas-phase Langevin inside a
-confining wall -- and quenches whatever basin the trajectory happened to
-visit. That is the right tool for "what does this system actually do at
-298 K", but it has a specific failure as a *generator* for downstream DFT
-refinement: it cannot report a basin the trajectory never visited, and a
-missing basin is a failure no amount of downstream refinement can repair --
-DFT can re-rank the candidates it is handed, but it cannot invent one.
+`n_sweep.py` explores by thermal sampling and quenches whatever basin the
+trajectory happened to visit. That is the right tool for "what does this
+system actually do at 298 K", but as a *generator* for downstream DFT
+refinement it has a specific failure: it cannot report a basin the trajectory
+never visited, and a missing basin is the one thing no amount of downstream
+refinement repairs -- DFT can re-rank the candidates it is handed, but it
+cannot invent one.
 
-Measured on pyrazine + 2 chloroform, GFN2-xTB/ALPB(chcl3): 10 ps of Langevin,
-three stratified packings, 14 deduped candidates, all one motif -- a single
-H-bond at 1.90 A / 177 deg, the second chloroform 3.8-5.6 A away and unbound.
-The both-nitrogens arrangement (one chloroform H-bonded to each ring nitrogen)
-never appears, even though it is 1.56 kcal/mol *lower*: built by hand
-(inverting the bound chloroform through the ring centroid) and relaxed, it
-optimises to -13.00 kcal/mol against the sweep's pooled -11.44, with both
-H...N contacts at 1.94 A / 178 deg.
+This module finds basins by constructing instead: place a solvent molecule at
+a random position and orientation around the (already relaxed) parent
+cluster, and optimise. BFGS only descends, so it cannot climb out of the well
+it lands in -- which is exactly why it works where a *seeded* MD run would
+not: `run_one_job` discards 5 ps of equilibration before recording the first
+frame, so a seeded arrangement would already be gone by the time anything was
+written. Every hit outranks every miss on energy, so a basin sorts to the top
+on its own without ever needing to be suspected.
 
-This module finds that basin by constructing instead of sampling: place a
-solvent molecule at a random position and orientation around the (already
-relaxed) parent cluster, and optimise. BFGS only descends, so it cannot climb
-out of the well it lands in -- which is exactly why it works where a *seeded*
-MD run would not: `run_one_job` discards 5 ps of equilibration before
-recording the first frame, so a seeded both-N arrangement would already be
-gone by the time anything was written. One random pose lands in the both-N
-basin about 7% of the time (measured: 4/60 placements onto the relaxed n = 1
-parent), and every hit outranks every miss on energy, so the basin sorts to
-the top on its own without ever needing to be suspected.
+**Docking owns minimum-finding**, and the MD sweep keeps the two jobs docking
+cannot do -- an independently drawn, non-greedy check, and basin occupancy,
+which a constructed minimum has no sense of at all (`_assemble_dock_n` writes
+`n_frames` / `frames` as `None` for exactly that reason). CLAUDE.md's
+`docking.py` section carries the measurements behind all of that: the
+both-nitrogens result on pyrazine + 2 chloroform, the staged
+screen-then-refine cost, the `1 - 0.93^K` placement-count argument, and where
+this stops working. Not repeated here.
 
-Both programs report the same *kind* of thing -- a continuum-relaxed,
-wall-free local minimum, scored identically (`ensemble.relax`, no wall, even
-the contact count computed on the relaxed geometry rather than the raw
-frame) -- so neither report has to caveat the other. But they are no longer
-peers at the one job both used to claim: **docking owns minimum-finding.**
-`n_sweep.py`'s candidates are potential-energy minima too, reached by 10 ps of
-MD rather than by construction, and BFGS descending from dozens of
-independent, unconstrained random poses reliably outfinds a single thermal
-trajectory at the same job -- the -11.44 vs -13.00 kcal/mol measurement above
-is a case of the sweep's proposal move (10 ps of gas-phase Langevin) simply
-being a worse basin-hopping search than random placement.
-
-That leaves the MD sweep two jobs docking cannot do by construction. First,
-it is a **non-greedy, independently drawn check** at each n: docking's chain
-means the best structure at n need not descend from the best at n - 1 (hence
-`Docking.n_parents` carrying more than one candidate forward), but the whole
-chain still grows from one lineage, and a basin no random pose in that
-lineage happens to land in is invisible to it regardless of how many
-placements are tried -- a fresh, independently packed MD run samples a
-different region of configuration space entirely. Second, and the reason
-CLAUDE.md gives it a dedicated section, MD is the **only source of basin
-occupancy**: a docked minimum was placed, not visited, so there is no sense
-in which BFGS "spent time" in one basin over another, and `_assemble_dock_n`
-below writes `n_frames` / `frames` as `None` for exactly that reason -- a real
-absence, not a population of one. `n_sweep.py` is not modified; this is a
-standalone, either/or alternative beside it, sharing `ensemble.py`'s optimiser
-and `report.py`'s formatting and dedupe/Boltzmann machinery, and only reading
-(never writing) `solvate_md.py`.
-
-Applicability is limited by the same GFN2 gradient cost that limits the MD
-sweep (~N^2.5, measured), compounded by BFGS step count, which is why this
-targets small n on small-to-moderate solutes -- comfortable to ~90 atoms,
-painful at 180, and *combinatorially* (not just computationally) wrong once
-n approaches a monolayer, where no single minimum dominates and
-solvent-solvent cohesion takes over. See CLAUDE.md's Applicability section
-for the numbers.
+`n_sweep.py` and `solvate_md.py` are unmodified by this; it only reads from
+them, adds no Hamiltonian of its own, and relaxes its candidates to
+`Scoring.fmax` -- the criterion the scorer uses -- so a docked and a swept
+minimum stay comparable.
 
 Run one from the command line:
 
