@@ -571,8 +571,8 @@ arrangement (one chloroform H-bonded to each ring nitrogen), so DFT never
 sees it. A missing basin is the one failure downstream refinement cannot
 repair -- DFT can re-rank what it is given, but it cannot invent a motif.
 
-Measured, GFN2-xTB/ALPB(chcl3), against the same references already in
-`s_test/pyrazine_chcl3_n2_seed0/scored.json`:
+Measured, GFN2-xTB/ALPB(chcl3), the MD and docked minima scored against the
+same solute/solvent references (pyrazine + chloroform, n = 2):
 
 | structure | E_int (kcal/mol) | how found |
 | --- | --- | --- |
