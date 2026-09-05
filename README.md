@@ -78,12 +78,12 @@ between two legs: two conformers, two tautomers, bound and free, one solute in
 two solvents. Both legs carry `n` molecules in comparable environments, so the
 bias and the cohesion largely cancel and what is left does plateau. That is
 also the quantity a cluster–continuum study reports in the first place, which
-is why one sweep is one leg. `uniq cont` and `uniq diss` are convergence
-indicators for the *search*, not the *sampling*: computed over the pooled
-distinct minima, they say how many kinds of basin were found, not how much of
-the trajectory sat in one. The monolayer capacity still bounds them, so they
-saturate where `E_int` cannot — but the frame-weighted version of the same
-question lives in [Basin occupancy](#basin-occupancy) below.
+is why one sweep is one leg. The `contacts` / `dissolved` columns of the
+report are the frame-weighted ones — see
+[Basin occupancy](#basin-occupancy) — because the distinct-minima versions,
+still in `sweep.json`, are convergence indicators for the *search* rather
+than the *sampling*: they say how many kinds of basin were found, not how
+much of the trajectory sat in one, which `pool` already reports.
 
 ### Basin occupancy
 
@@ -217,34 +217,119 @@ E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 leg: pyrazine/chcl3
 full first shell: ~13 solvent molecules
 
-  n  cover   E_int(min)   E_int(ens)     dE_int  found by   pool   E(cluster)/eV  uniq cont  uniq diss   wall
-------------------------------------------------------------------------------------------------------------
-  0     0%        -0.03        -0.01          -       1/1      2     -446.915704       0.00       100%     0%
-  1     8%        -6.66        -6.54      -6.63       2/3     18     -890.445167       0.33        67%     4%
-  2    15%       -13.02       -12.63      -6.36       1/2     22    -1333.955483       1.23        14%     0%
+  n  cover   E_int(min)     dE_int  found by   pool  contacts  dissolved   wall
+-------------------------------------------------------------------------------
+  0     0%        -0.03          -       1/1      2      0.00       100%     0%
+  1     8%        -6.65      -6.63       3/3      5      0.90        10%     0%
+  2    15%       -13.01      -6.36       1/2     14      0.90        35%    25%
 ```
 
-One row per `n`, over every packing's candidates pooled together and deduped
-by energy. `cover` is `n` as a percentage of a full first-shell monolayer —
-well under 100% is targeted microsolvation, the regime where every explicit
-molecule sits at the continuum boundary. `E_int` is in kcal/mol and absolute
-energies in eV (ASE's native unit); the mix is deliberate.
-`E_int(min)` is the pooled minimum — the reported number — `E_int(ens)` is
-Boltzmann-averaged over the same pool, and `dE_int` is the per-molecule
-increment in the minimum against `n − 1`, the column to read for convergence
-per the section above. `found by` is how many of that `n`'s packings reached
-the pooled minimum and `pool` how many distinct minima the pooled search
-found: a `1/2` says the number rests on a single draw of the arrangement
-lottery. (This particular sweep is the fast smoke test — 3 ps, 20 frames, two
-packings per `n` on average, all well under the current defaults — so its
-increments are dominated by sampling noise: they do not settle because the
-sampling never did.) `E(cluster)` is shown beside them to give the large
-numbers the small differences came from — it is *not* comparable across rows
-of different `n`, which is precisely what `E_int` is for. `uniq cont` /
-`uniq diss` are averaged over the pooled distinct minima — a search-effort
-diagnostic, not an occupancy one; see [Basin occupancy](#basin-occupancy) for
-the frame-weighted version. A **per-packing detail** table under it carries
-what each search found on its own.
+(This particular sweep is a fast smoke test — 1 ps, 10 frames, two packings
+per `n` on average, all well under the current defaults — so its increments
+are dominated by sampling noise: they do not settle because the sampling
+never did. The 25% wall row is exactly the contamination the wall diagnostic
+exists to catch.)
+
+## Reading `report.txt`
+
+Everything the rendered report used to explain in place lives here instead,
+so that a report is a page of numbers rather than a page of numbers wrapped in
+150 lines of prose that never changes between runs. `dock_report.txt` has the
+same sections, minus the ones a constructed chain has no analogue of.
+
+**The columns.**
+
+| column | what it is |
+| --- | --- |
+| `n` | explicit solvent molecules |
+| `cover` | `n` as a percentage of a full first-shell monolayer. Well under 100% is *targeted microsolvation*, where every explicit molecule sits at the continuum boundary |
+| `E_int(min)` | the reported number: the lowest `E_int` over the pooled candidates at this `n`, kcal/mol |
+| `dE_int` | `E_int(min)` here minus `E_int(min)` at `n − 1` — the column to read, per [the section above](#e_intn-does-not-plateau--read-the-increment) |
+| `found by` | how many independent searches reached that minimum, of how many there were. For a sweep those are packings; for a docking chain, refined placements |
+| `pool` | distinct minima the pooled search turned up — the *search effort* behind the running minimum above it |
+| `contacts`, `dissolved` | solvent molecules in contact with the solute, and the fraction of frames with none, **frame-weighted** over the scored frames — see [Basin occupancy](#basin-occupancy) |
+| `wall` | the worst packing's fraction of sampling frames with a nonzero wall energy |
+
+`E_int` is in kcal/mol and absolute energies in eV (ASE's native unit); the
+mix is deliberate. A `1/2` in `found by` says the number rests on a single
+draw of the arrangement lottery, and the report warns about it.
+
+**What is in the JSON but not in the table.** `E_int(ens)` — the Boltzmann
+average over the pool — and `E(cluster)`, its absolute counterpart, are in
+`sweep.json` / `dock.json` and in every `scored.json`, and are deliberately
+not printed. Showing two averages side by side invites reporting whichever
+looks better, which is the same objection this repo already raises against
+giving the ensemble average its own `dE_int`; and `E(cluster)` is not
+comparable across rows of different `n` — successive rows differ by a whole
+solvent molecule — which is precisely what `E_int` exists to fix. The
+distinct-minima `mean_contacts` / `dissolved_fraction` are there too; they
+describe the search, which `pool` already reports, and the table shows the
+frame-weighted pair instead.
+
+**Best geometry at each n** names the file behind each row: `<run>/best.xyz`,
+which is also frame 0 of that run's `scored_candidates.xyz`, since the pooled
+minimum at an `n` is necessarily its own run's minimum. `weight` is the
+candidate's Boltzmann weight within the pooled set — near 1 means the minimum
+is effectively the whole ensemble, small means it is one of several
+comparable minima. `E_wall/eV` is that sampling frame's wall energy: the one
+place the wall diagnostic bites on the reported number itself rather than on
+an average. Note `best.xyz` is not named after the scoring `out_name`, so
+rescoring the same run directories in a second continuum overwrites it — it
+always reflects the most recent scoring pass.
+
+Each is also copied out as `best_n<N>.xyz` beside the report, with
+`sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` (or the `dock_` forms)
+appended to its comment line. One file per `n` rather than one multi-frame
+xyz, because the atom count changes with `n` and a viewer that reads a
+multi-frame xyz as a trajectory — Avogadro, VMD, most others — takes the
+first frame's atom count and applies it to the rest, silently dropping every
+`n` after the first. A set of chemically distinct clusters is not a
+trajectory, and no single-file XYZ shape expresses that it isn't one.
+
+**Per-packing detail** is one row per packing, its own search alone. These do
+not average to the table above and are not meant to: the pooled minimum is
+the *lowest* of that column, not its mean. `best` marks a packing within
+1 meV of the pooled minimum at its `n` — the same test `found by` counts, so
+the number of `*` at an `n` equals its `found by` numerator.
+
+**Basin occupancy** is how many scored frames quenched into each basin,
+summed across the packings at each `n`; `seeds` is how many of them visited
+it. Six caveats come with reading it, and none is decorative:
+
+1. **Sampling is gas-phase** (`Condition.sample_in_continuum = False`), so
+   occupancy describes the gas-phase search, not solvation in the scoring
+   continuum. Measured on methanol + 4 water: 3.84–4.39 H-bonds in gas
+   against 0.00–0.30 in ALPB(water), no overlap between the two populations.
+2. **Pooling across stratified packings is a mixture with hand-picked
+   weights** (`c = (seed + 0.5) / n_seeds` is chosen by design, not drawn at
+   random), so only *within* one packing is a frame count an unbiased — if
+   correlated — sample. The `seeds` column is the same idiom as `found by`.
+3. **The 1 meV energy dedupe merges isoenergetic distinct minima**, inflating
+   one count. Tolerable for ranking, sharper for counting.
+4. **Frames are correlated.** Compare the reported scored-frame spacing
+   against a decorrelation time measured on *your* system — 0.55 ps for
+   pyrazine + 3 CHCl₃, which is a property of the system rather than of the
+   integrator and is not fabricated for you.
+5. **These are inherent-structure populations, not basin free energies:** no
+   vibrational entropy, no ZPE.
+6. **The wall volume (`wall_slack`) sets any occupancy number** and leaves
+   `E_int(min)` untouched, since a dissolved molecule contributes ≈ 0 to
+   `E_int` regardless of box size. That is why occupancy is a diagnostic here
+   and never an energy.
+
+**Search convergence** prints the per-packing spread beside `found by`. It is
+printed to be seen, not used as an error bar: independent packings are
+independent searches rather than repeat measurements, and under stratification
+they are *designed* to differ, so their scatter measures the arrangement
+lottery as much as the sampling noise. A difference you go on to take between
+two sweeps has to be credible against the widest spread in either, and a
+double difference accumulates four of them.
+
+**Per-parent detail** (docking only) is one row per parent used to grow to
+that `n`. Unlike the sweep's `found by`, several parents landing near one
+minimum is *not* independent corroboration: every parent explores the same
+shell region with independent random poses, not a differently-arranged
+packing.
 
 ## Docking: a constructive alternative
 

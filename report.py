@@ -36,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.7.3"
+VERSION = "0.8.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -542,34 +542,29 @@ def format_scored_log(summary, meta):
                      "----------------------------------------\n"
                      + _candidate_table(candidates, T))
 
+    occ_contacts = summary["occupancy_mean_contacts"]
+    occ_dissolved = summary["occupancy_dissolved_fraction"]
     result = {
-        "E_int      (Boltzmann)": (
-            f"{summary['ensemble_interaction_kcal']:.2f} kcal/mol"
-            "     <- the reported number"),
-        "E_int      (minimum)": f"{summary['min_interaction_kcal']:.2f} kcal/mol",
-        "E(cluster) (Boltzmann)": f"{summary['ensemble_energy_eV']:.6f} eV",
-        "E(cluster) (minimum)": f"{summary['min_energy_eV']:.6f} eV",
+        "E_int (minimum)": (f"{summary['min_interaction_kcal']:.2f} kcal/mol"
+                            "     <- the reported number"),
         "references": (f"E(solute) {e_solute:.6f} eV, "
                        f"{n} x E(solvent) {e_solvent:.6f} eV"),
         "frames scored": (f"{summary['n_frames_scored']} "
                           f"({summary['n_unique']} unique, "
                           f"{100 * summary['converged_fraction']:.0f}"
                           "% converged)"),
-        "mean contacts": f"{summary['mean_contacts']:.2f}",
-        "dissolved": (f"{100 * summary['dissolved_fraction']:.0f}"
-                      "% of unique candidates"),
+        # Frame-weighted, so it says how much of this run's sampling sat in a
+        # contact state -- not how many kinds of contact it turned up, which
+        # is a fact about the search and is `n_unique` above.
+        "contacts": _num(occ_contacts, ".2f") + " (frame-weighted)",
+        "dissolved": ("-" if occ_dissolved is None
+                      else f"{100 * occ_dissolved:.0f}% of scored frames"),
     }
-    parts.append(kv_block("Result", result) + f"""
-
-  The Boltzmann average is over the unique candidates at {T:.1f} K. It is an
-  ensemble-averaged *energy*, not a free energy: no vibrational or
-  configurational entropy is in it, and the weights come from whatever
-  geometries the generator happened to find.
-
-  E_int is the reported number because it alone is comparable across n.
-  E(cluster) differs from it only by the constant offset above, so the two
-  averages carry identical weights -- it is shown as a raw number to
-  sanity-check the small differences of large energies against.""")
+    # The Boltzmann numbers and E(cluster) are in `scored.json` and are
+    # deliberately not printed here: E_int(min) is the reported number, and
+    # showing an average beside it only invites reporting whichever looks
+    # better. See README: Reading report.txt.
+    parts.append(kv_block("Result", result))
 
     # After the Result block rather than up in Provenance: these are the
     # energies the confinement contaminated. None for a docked candidate,
@@ -830,17 +825,25 @@ def format_table(params, pooled):
     `solute_label` of its own.
 
     Both generators render through here: the columns are properties of a set
-    of continuum-relaxed minima, which is what each produces. Only the note
-    under the table differs, because what corroborates a number differs --
-    agreeing packings for a sweep, agreeing random placements for a chain.
+    of continuum-relaxed minima, which is what each produces.
+
+    The columns are the load-bearing ones only. `E_int(ens)` and `E(cluster)`
+    used to sit here too and are still in `sweep.json` / `dock.json`, but
+    showing two averages beside each other invites reporting whichever looks
+    better -- the objection this repo already raises against giving the
+    ensemble average its own `dE_int` -- and `E(cluster)` is not comparable
+    across rows anyway, which is the whole reason `E_int` exists. The
+    contacts pair is the frame-weighted one, over scored frames rather than
+    over distinct minima, because that is the one that answers a question
+    about the system rather than about the search; `pool` already reports the
+    search.
     """
     docked = pooled[0]["pack_mode"] == "dock"
     deltas = _increments(params, pooled)
     capacity = params["monolayer_capacity"]
-    header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'E_int(ens)':>12} "
-              f"{'dE_int':>10} {'found by':>9} {'pool':>6} "
-              f"{'E(cluster)/eV':>15} {'uniq cont':>9} {'uniq diss':>10} "
-              f"{'wall':>6}")
+    header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'dE_int':>10} "
+              f"{'found by':>9} {'pool':>6} {'contacts':>9} "
+              f"{'dissolved':>10} {'wall':>6}")
     lines = [f"leg: {params['solute_label']}/{params['solvent']}"
              + (" (docked)" if docked else ""),
              f"full first shell: ~{capacity:.0f} solvent molecules", "",
@@ -849,100 +852,34 @@ def format_table(params, pooled):
         n = p["n_solvent"]
         delta = deltas.get(n)
         found = f"{p['found_by']}/{p['n_searches']}"
+        diss = p["occupancy_dissolved_fraction"]
         lines.append(
             f"{n:>3} "
             f"{100 * n / capacity:>5.0f}% "
             f"{p['e_int_min_kcal']:>12.2f} "
-            f"{p['e_int_ens_kcal']:>12.2f} "
             + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
             + f"{found:>9} "
             f"{p['pool']:>6} "
-            f"{p['e_cluster_ens_eV']:>15.6f} "
-            f"{p['mean_contacts']:>9.2f} "
-            f"{100 * p['dissolved_fraction']:>9.0f}% "
+            f"{_num(p['occupancy_mean_contacts'], '.2f'):>9} "
+            + (f"{'-':>10} " if diss is None else f"{100 * diss:>9.0f}% ")
             + (f"{'-':>6}" if p["wall"] is None
                else f"{100 * p['wall']:>5.0f}%"))
-    lines.append(_DOCK_TABLE_NOTE if docked else _SWEEP_TABLE_NOTE)
+    lines.append(
+        "\nE_int in kcal/mol. cover = n as a fraction of a full first-shell "
+        "monolayer.\ndE_int = E_int(min) here minus E_int(min) at n - 1: read "
+        "the increment, not\nthe level. found by = independent searches that "
+        "reached the pooled minimum, of\nhow many"
+        + (" refined placements;\npool = distinct minima among them."
+           if docked else
+           " packings; pool = distinct minima in the pool.")
+        + " contacts / dissolved\nare frame-weighted over the scored frames"
+        + (" -- blank here, and so is wall: a docked\nstructure was placed, "
+           "not sampled, so it has neither an occupancy nor a wall."
+           if docked else
+           ", not averaged over distinct minima.\nwall = the worst packing's "
+           "fraction of sampling frames with a nonzero wall\nenergy.")
+        + "\nSee README: Reading report.txt.")
     return "\n".join(lines)
-
-
-_SWEEP_TABLE_NOTE = (
-        "\nOne row per n, over the candidates of every packing at that n "
-        "pooled together\nand deduped by energy. Seeds are independent "
-        "*searches*, not repeat measurements\nof one system, so they are "
-        "pooled rather than averaged: the mean of several\nsearches penalises "
-        "searching more widely, and it is exactly the packing that\nfinds the "
-        "geometry nobody else found that the stratification exists to buy.\n"
-        "'found by' = how many of that n's packings reached the pooled "
-        "minimum; 'pool' =\nhow many distinct minima the pooled search "
-        "turned up. The per-packing numbers\nare in the table below this one.\n"
-        "\nE_int in kcal/mol, E(cluster) in eV (ASE's native unit). 'cover' = n "
-        "as a\npercentage of a full first-shell monolayer; well under 100% is "
-        "targeted\nmicrosolvation, where every explicit molecule sits at the "
-        "continuum boundary.\n'uniq cont' = solvent molecules touching the "
-        "solute after optimisation, averaged\nover the pooled *distinct "
-        "minima* -- how many kinds of basin the search turned up,\nnot how "
-        "often the trajectory actually sat in one. 'uniq diss' = fraction of "
-        "those\ndistinct minima with no contact at all. Both are search-effort "
-        "diagnostics, the\nsame kind as 'pool' -- see the Basin occupancy "
-        "section below for the frame-\nweighted versions, which say how the "
-        "sampling's time was actually spent. 'wall'\n= the worst seed's "
-        "fraction of sampling frames with a nonzero wall energy.\n"
-        "\ndE_int = E_int(min) at this n minus E_int(min) at n - 1: what the "
-        "nth molecule\nwas worth. Read the increment, not the level: E_int(n) "
-        "does not plateau. Every\nadded molecule also collects the continuum's "
-        "per-molecule bias (measured at ~1\nkcal/mol for chloroform, and of "
-        "either sign -- see the binding table in the\ndocs) and, from n = 2 "
-        "on, solvent-solvent cohesion, and neither term switches\noff once the "
-        "specific sites are filled. So the curve tends to a line with a\n"
-        "nonzero slope, not to a flat. Convergence is dE_int settling to a "
-        "*constant*:\nthe specific interaction is exhausted and each further "
-        "molecule is only being\ncondensed out of the continuum into a "
-        "bulk-like site.\n"
-        "\nA minimum is a running minimum over *search effort*, and the effort "
-        "is not\nconstant across n -- the pool column above says how far it "
-        "went at each. Some\nof dE_int's slope is therefore search depth "
-        "rather than chemistry, which is the\nhonest form of the objection "
-        "that would otherwise argue for averaging the seeds.\nThe answer is to "
-        "show the effort, not to average it away: a step is real only "
-        "if\nit survives that reading and the search convergence below.\n"
-        "\nWhat does plateau is a difference taken at fixed n between two legs "
-        "-- two\nconformers, two tautomers, bound and free, one solute in two "
-        "solvents. Both\nlegs carry n molecules in comparable environments, so "
-        "the bias and the cohesion\nlargely cancel and what is left is the "
-        "specific interaction. Judge 'how much\nexplicit solvent is enough' on "
-        "that difference, not on one leg's E_int(n).\n"
-        "\nE(cluster) is Boltzmann-averaged over the same weights as E_int, and is "
-        "here\nto sanity-check the magnitudes it came from. It is NOT comparable "
-        "across rows\nof different n -- successive rows differ by a whole solvent "
-        "molecule. Making\nthat comparison meaningful is exactly what E_int is "
-        "for; subtract those\ninstead.")
-
-
-_DOCK_TABLE_NOTE = (
-        "\nOne row per requested n. Unlike the MD sweep's pooled search over "
-        "several\nindependent packings, a docking row is one constructed "
-        "chain: 'found by' =\nrefined placements within "
-        f"{1000 * DEDUPE_TOL_EV:.0f} meV of this n's minimum, out\nof the "
-        "placements actually refined at the tight criterion ('pool' is the "
-        "number\nof distinct minima among them -- most placements are only "
-        "screened, at a\nlooser fmax, and are not part of either count). "
-        "dE_int = E_int(min) at this n\nminus E_int(min) at n - 1, computed "
-        "over every n walked internally even when\nan intermediate n was "
-        "not requested. E_int(0) = 0 by construction: the chain\nalways "
-        "starts from the bare relaxed solute. 'wall' is blank: a docked "
-        "structure\nwas placed, not sampled, so it never met a confining "
-        "wall.\n"
-        "\nDocking constructs rather than samples -- BFGS only descends, so "
-        "it wins at\nevery n it is pointed at by construction -- so its "
-        "numbers are never pooled\nwith an MD sweep's. Read the two reports "
-        "side by side: a basin docking finds\nthat the sweep never visits "
-        "is the failure this program exists to catch; a\nbasin only "
-        "docking finds is not automatically more real than one only the\n"
-        "sweep finds, since docking never samples thermal motion at all. "
-        "'cover' = n\nas a percentage of a full first-shell monolayer -- "
-        "docking targets targeted\nmicrosolvation and warns past roughly a "
-        "third of capacity.")
 
 
 def format_best_geometry(pooled):
@@ -977,52 +914,24 @@ def format_best_geometry(pooled):
             f"{_num(c['parent'], 'd'):>7} "
             f"{_num(c['wall_energy_eV'], '.6f'):>11} "
             f"{best['run']}")
-    lines.append(_DOCK_BEST_NOTE if docked else _SWEEP_BEST_NOTE)
+    lines.append(
+        "\n  The geometry is <run>/best.xyz, and frame 0 of that run's "
+        "scored_candidates.xyz.\n  weight = its Boltzmann weight within the "
+        "pooled set at this n; contacts and min\n  gap/A are its own, not an "
+        "average. frame = "
+        + ("which refined placement it was,\n  in energy order; parent = "
+           "which of the previous n's survivors it grew from (see\n  the "
+           "table below). A docked structure has no sampling frame, hence no "
+           "E_wall/eV."
+           if docked else
+           "the MD dump it was quenched\n  from; E_wall/eV is that frame's "
+           "wall energy -- the one place the wall diagnostic\n  bites on the "
+           "reported number itself rather than on an average. parent is\n  "
+           "blank: an MD candidate descends from a packing, not from another "
+           "structure.")
+        + "\n  Also copied to best_n<N>.xyz beside this report, one file per "
+        "n. See README:\n  Reading report.txt.")
     return "\n".join(lines)
-
-
-_SWEEP_BEST_NOTE = (
-        "\n  The geometry is <run>/best.xyz above, and equivalently frame "
-        "0 of that\n  packing's scored_candidates.xyz: the pooled minimum at "
-        "an n is necessarily that\n  packing's own minimum, since "
-        "dedupe_energies sorts lowest first. 'weight' is\n  the candidate's "
-        "Boltzmann weight within the pooled set at this n -- near 1 means\n  "
-        "E_int(min) is effectively the ensemble, small means it is one of "
-        "several\n  comparable minima and E_int(ens) is the number to read "
-        "instead. 'frame' is the\n  MD dump index into that packing's "
-        "traj.xyz / energies.json, in the same sense\n  the candidate table "
-        "and sampling convergence use it -- not an index into any xyz\n  of "
-        "candidates. 'E_wall/eV' is that sampling frame's wall energy: "
-        "nonzero means\n  the wall was holding this particular geometry "
-        "together, the one row where the\n  wall diagnostic bites on the "
-        "reported number itself rather than on an average.\n  best.xyz is "
-        "not named after out_name, so a second continuum scored into the "
-        "same\n  run directories overwrites it -- it reflects the most "
-        "recent scoring pass.\n\n  The same geometry is also copied to "
-        "best_n<N>.xyz in the sweep directory, with\n  sweep_n=, "
-        "sweep_E_int_kcal=, and sweep_packing= appended to its comment "
-        "line.\n  That is one file per n, not one file for the whole sweep, "
-        "because the frames\n  differ in atom count as n grows and a "
-        "viewer that reads a multi-frame xyz as a\n  trajectory -- Avogadro, "
-        "VMD, most others -- takes the first frame's atom count\n  and "
-        "applies it to the rest, silently dropping every n after the "
-        "first.")
-
-
-_DOCK_BEST_NOTE = (
-        "\n  The geometry is <run>/best.xyz above. 'parent' is the "
-        "0-based index\n  into the previous n's surviving parents that this "
-        "minimum grew from -- see\n  the per-parent detail table below for "
-        "what each of those parents found on\n  its own. 'frame' is which "
-        "of the refined placements it was, in energy order,\n  not a "
-        "trajectory dump: a docked structure was constructed rather than "
-        "visited,\n  which is also why it has no 'E_wall/eV'. Also copied to "
-        "best_n<N>.xyz alongside\n  dock_report.txt, with dock_n=, "
-        "dock_E_int_kcal=, and dock_parent= appended to\n  its comment line "
-        "-- one file per n, not one multi-frame xyz, for the same\n  reason "
-        "the MD sweep's best_n<N>.xyz is: atom count changes with n, and a "
-        "viewer\n  that reads a multi-frame xyz as a trajectory keeps only "
-        "the first frame's\n  atom count.")
 
 
 def format_seed_detail(summaries, pooled):
@@ -1038,9 +947,8 @@ def format_seed_detail(summaries, pooled):
     """
     tol_kcal = DEDUPE_TOL_EV * EV_TO_KCAL
     best_by_n = {p["n_solvent"]: p["e_int_min_kcal"] for p in pooled}
-    header = (f"{'n':>3} {'seed':>4} {'best':>4} {'E_int(ens)':>12} "
-              f"{'E_int(min)':>12} {'E(cluster)/eV':>15} {'contacts':>9} "
-              f"{'dissolved':>10} {'uniq':>5} {'wall':>6}")
+    header = (f"{'n':>3} {'seed':>4} {'best':>4} {'E_int(min)':>12} "
+              f"{'uniq':>5} {'contacts':>9} {'dissolved':>10} {'wall':>6}")
     lines = ["Per-packing detail", "------------------", header,
              "-" * len(header)]
     for s in sorted(summaries, key=_row_order):
@@ -1053,23 +961,20 @@ def format_seed_detail(summaries, pooled):
             f"{s['n_solvent']:>3} "
             f"{s['seed']:>4} "
             f"{star:>4} "
-            f"{s['ensemble_interaction_kcal']:>12.2f} "
             f"{s['min_interaction_kcal']:>12.2f} "
-            f"{s['ensemble_energy_eV']:>15.6f} "
-            f"{s['mean_contacts']:>9.2f} "
-            f"{100 * s['dissolved_fraction']:>9.0f}% "
             f"{s['n_unique']:>5} "
+            f"{_num(s['occupancy_mean_contacts'], '.2f'):>9} "
+            f"{100 * s['occupancy_dissolved_fraction']:>9.0f}% "
             + (f"{'-':>6}" if frac is None else f"{100 * frac:>5.0f}%"))
     lines.append(
-        "\n  One row per packing: its own candidates, its own Boltzmann "
-        "average over them,\n  and 'uniq' its own count of distinct minima. "
-        "These do not average to the table\n  above and are not meant to -- "
-        "the pooled minimum is the lowest of the\n  E_int(min) column, not "
-        f"the mean of it. 'best' marks a packing within {1000 * DEDUPE_TOL_EV:.0f} "
-        "meV of\n  the pooled minimum at its n -- the same test 'found by' "
-        "counts, so the number\n  of '*' at an n equals its 'found by' "
-        "numerator. The Best geometry section\n  above names the one of "
-        "these whose file to open when several tie.")
+        "\n  One row per packing, its own search alone. These do not average "
+        "to the\n  table above and are not meant to: the pooled minimum is "
+        "the lowest of this\n  E_int(min) column, not the mean of it. uniq = "
+        "its own count of distinct\n  minima; contacts / dissolved are "
+        "frame-weighted over its own scored frames.\n  'best' marks a packing "
+        f"within {1000 * DEDUPE_TOL_EV:.0f} meV of the pooled minimum at its "
+        "n -- the\n  same test 'found by' counts, so the number of '*' at "
+        "an n equals its 'found by'\n  numerator.")
     return "\n".join(lines)
 
 
@@ -1089,33 +994,10 @@ def format_basin_occupancy(params, summaries, pooled):
     section -- a basin can be the reported minimum and still be a rare
     outlier the shell almost never visits.
 
-    Six caveats travel with the numbers rather than living only in the docs,
-    because a table of frame counts invites being read as a Boltzmann
-    population and it is not one:
-
-      1. Sampling is gas-phase (`Condition.sample_in_continuum = False`).
-         Occupancy here describes the gas-phase search, not solvation in the
-         scoring continuum -- measured on methanol + 4 water: 3.84-4.39
-         H-bonds in gas versus 0.00-0.30 in ALPB(water), no overlap between
-         the two populations.
-      2. Pooling across stratified packings is a mixture with hand-picked
-         weights (`c = (seed + 0.5) / n_seeds` is chosen by design, not drawn
-         at random from anything), so only *within* one packing is a frame
-         count an unbiased -- if correlated -- sample. `n_seeds_hit` beside
-         every basin is the same idiom as `found by`: how many independently
-         arranged packings visited it.
-      3. The 1 meV energy dedupe merges isoenergetic distinct minima, which
-         inflates one count. Tolerable for ranking; sharper for counting.
-      4. Frames are correlated. `scored_frame_spacing_fs` below is what to
-         compare against a decorrelation time measured on *this* system (0.55
-         ps for pyrazine + 3 CHCl3) -- not fabricated here, since it is a
-         property of the system, not of the integrator.
-      5. These are inherent-structure populations, not basin free energies:
-         no vibrational entropy, no ZPE.
-      6. The wall volume (`wall_slack`) sets any occupancy number and leaves
-         `E_int(min)` untouched -- a dissolved molecule contributes ~0 to
-         E_int regardless of box size. That is why occupancy is a diagnostic
-         here and never an energy.
+    A table of frame counts invites being read as a Boltzmann population and
+    is not one; the caveats that go with it are in the README, under Reading
+    report.txt, once rather than once here, once in the rendered output and
+    once in CLAUDE.md as they used to be.
 
     Guarded by the caller on `pack_mode == "md"`: a docked run has no
     sampling frames and so no occupancy to report, and `_assemble_dock_n`
@@ -1168,31 +1050,15 @@ def format_basin_occupancy(params, summaries, pooled):
     lines.append(f"scored frame spacing: {spacing_str}")
 
     lines.append(
-        "\n  Caveats, load-bearing rather than decorative:\n"
-        "  1. Sampling is gas-phase (Condition.sample_in_continuum = False); "
-        "occupancy\n     here describes the gas-phase search, not solvation "
-        "in the scoring continuum.\n     Measured on methanol + 4 water: "
-        "3.84-4.39 H-bonds in gas vs 0.00-0.30 in\n     ALPB(water), no "
-        "overlap between the two populations.\n"
-        "  2. Pooling across stratified packings is a mixture with "
-        "hand-picked weights\n     (c = (seed + 0.5) / n_seeds is chosen by "
-        "design, not drawn at random), so\n     only *within* one packing is "
-        "a frame count an unbiased -- if correlated --\n     sample. "
-        "'seeds' beside every basin is the same idiom as 'found by': how\n   "
-        "  many independently arranged packings visited it.\n"
-        "  3. The 1 meV energy dedupe merges isoenergetic distinct minima, "
-        "inflating\n     one count -- tolerable for ranking, sharper for "
-        "counting.\n"
-        "  4. Frames are correlated. Compare the scored frame spacing above "
-        "to a\n     decorrelation time measured on *this* system (0.55 ps "
-        "for pyrazine + 3\n     CHCl3) -- not fabricated here, since it is a "
-        "property of the system.\n"
-        "  5. These are inherent-structure populations, not basin free "
-        "energies: no\n     vibrational entropy, no ZPE.\n"
-        "  6. The wall volume (wall_slack) sets any occupancy number and "
-        "leaves\n     E_int(min) untouched -- a dissolved molecule "
-        "contributes ~0 to E_int\n     regardless of box size. That is why "
-        "occupancy is a diagnostic and never\n     an energy.")
+        "\n  How many of the scored frames quenched into each basin, pooled "
+        "across the\n  packings at that n. 'seeds' = how many of them visited "
+        "it, the same idiom as\n  'found by'. These are inherent-structure "
+        "populations of a gas-phase search,\n  not Boltzmann populations and "
+        "not free energies, and they are a diagnostic\n  only -- no E_int "
+        "here is built from them. The caveats that come with\n  reading them "
+        "are in README: Reading report.txt. Compare the frame spacing\n  "
+        "above against a decorrelation time measured on *this* system "
+        "(0.55 ps for\n  pyrazine + 3 CHCl3).")
     return "\n".join(lines)
 
 
@@ -1218,10 +1084,8 @@ def format_wall_diagnostic(summaries):
         lines += ["", warning]
     else:
         lines.append(
-            f"  Under the {100 * WALL_WARN_FRACTION:.0f}% threshold, so the wall "
-            "is a safety net rather than load-bearing.\n"
-            "  Reference regimes: 4-5% for gas-phase sampling of a self-bound "
-            "shell, 50-60%\n  for a shell the Hamiltonian is dissociating.")
+            f"  Under the {100 * WALL_WARN_FRACTION:.0f}% threshold, so the "
+            "wall is a safety net rather than load-bearing.")
     return "\n".join(lines)
 
 
@@ -1309,11 +1173,11 @@ def format_sampling_convergence(summaries):
             + f"{'STILL FALLING' if conv['still_improving'] else 'settled':>16}")
 
     lines.append(
-        "\n  'best found at' = how far into the sampling trajectory the "
-        "lowest-E_int\n  candidate was found. 'late gain' = what the final "
-        f"{100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% of the trajectory\n  "
-        "took off E_int(min), in kcal/mol; negative means it was still "
-        "finding\n  better geometries at the end.")
+        "\n  'best found at' = how far into the trajectory the lowest-E_int "
+        "candidate was\n  found; 'late gain' = what the final "
+        f"{100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% took off E_int(min) in "
+        "kcal/mol,\n  negative meaning it was still finding better "
+        "geometries at the end.")
 
     unsettled = [s for s, conv in rows if conv["still_improving"]]
     if unsettled:
@@ -1391,16 +1255,14 @@ def format_search_convergence(params, pooled):
 
     lines.append(
         "\n  'found by' = how many of that n's packings reached the pooled "
-        "minimum, by the\n  same energy criterion that dedupes candidates "
-        f"within a run ({1000 * DEDUPE_TOL_EV:.0f} meV).\n  'spread' = the "
-        "full range of the per-packing minima, kcal/mol -- printed to be\n"
-        "  seen, not to be used as an error bar, because independent packings "
-        "are\n  independent searches rather than repeat measurements of one "
-        "system.\n"
-        f"\n  Widest spread in this sweep: {worst:.2f} kcal/mol. A difference "
-        "you go on to\n  take between sweeps has to be credible against that, "
-        "and a double difference\n  of four such numbers accumulates it four "
-        "times.")
+        f"minimum, by the\n  same {1000 * DEDUPE_TOL_EV:.0f} meV criterion "
+        "that dedupes candidates within a run. Their\n  agreement is the "
+        "evidence, not their scatter: 'spread' is the full range of\n  the "
+        "per-packing minima, printed to be seen rather than used as an error "
+        f"bar.\n  Widest here: {worst:.2f} kcal/mol -- a difference you go on "
+        "to take between sweeps\n  has to be credible against that, and a "
+        "double difference accumulates it four\n  times. See README: Reading "
+        "report.txt.")
 
     if alone:
         lines.append(
@@ -1488,11 +1350,11 @@ def format_report(params, summaries):
         parts.append(
             "Self-consistency check\n"
             "----------------------\n"
-            f"  E_int(0) = {values} kcal/mol.\n"
-            "  Zero by construction: the n = 0 cluster *is* the solute reference.\n"
-            "  A departure of more than a few hundredths means the reference\n"
-            "  optimisations and the n = 0 run landed in different minima, and\n"
-            "  every other row is offset by that much.")
+            f"  E_int(0) = {values} kcal/mol, zero by construction: the "
+            "n = 0 cluster *is* the\n  solute reference. More than a few "
+            "hundredths off means the reference\n  optimisations and the "
+            "n = 0 run landed in different minima, and every other\n  row is "
+            "offset by that much.")
     return "\n\n".join(parts) + "\n"
 
 
@@ -1572,16 +1434,13 @@ def format_parent_detail(summaries):
                 f"{parent['e_int_min_kcal']:>12.2f}")
     lines.append(
         "\n  One row per parent used to grow to that n: its own best "
-        "E_int(min) among\n  its own random placements. 'best' marks the "
-        "parent whose descendant became\n  the n's reported minimum -- the "
-        "greedy chain made visible, and the reason\n  docking carries more "
-        "than one parent forward: the best structure at n need\n  not "
-        "descend from the best structure at n - 1. Unlike the MD sweep's "
-        "'found\n  by', several parents landing near the same minimum here "
-        "is not independent\n  corroboration -- every parent explores the "
-        "same shell region with\n  independent random poses, not a "
-        "differently-arranged packing -- so read it\n  as which branch of "
-        "the chain the reported minimum came from, not as agreement.")
+        "E_int(min) among its\n  own random placements. 'best' marks the "
+        "parent whose descendant became the n's\n  reported minimum -- the "
+        "greedy chain made visible, and the reason docking\n  carries more "
+        "than one parent forward. Unlike the sweep's 'found by', several\n  "
+        "parents landing near one minimum is not independent corroboration: "
+        "every\n  parent explores the same shell region with independent "
+        "random poses, not a\n  differently-arranged packing.")
     return "\n".join(lines)
 
 
