@@ -38,7 +38,7 @@ docking's single lineage might not reach, and the only source of **basin
 occupancy** -- how many scored frames quenched into each minimum, which a
 placed structure has no analogue of. Occupancy is a diagnostic, quarantined
 from every E_int here: the wall volume moves it and leaves E_int(min)
-untouched. CLAUDE.md carries the measurements behind all of that, and README
+untouched. DESIGN.md carries the measurements behind all of that, and README
 carries the caveats that come with reading a report.
 
 Sampling is gas-phase by default and scoring is in the continuum: see the

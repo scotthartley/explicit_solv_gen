@@ -377,7 +377,7 @@ only the best are refined at the scorer's tight one: up to `--refine` (default
 10) **per parent**, one per distinct screened basin, so the refined set — and
 with it the next `n`'s parents and what `dft_export` has to choose from —
 carries every basin the screen found rather than the best one several times
-over. See `CLAUDE.md`'s `docking.py` section for the full measurements (staged
+over. See `DESIGN.md`'s `docking.py` section for the full measurements (staged
 screen-then-refine cost, the placement-count confidence argument, per-parent
 detail).
 
@@ -513,8 +513,9 @@ kill -TERM -- -$(ps -o pgid= -p <parent-pid> | tr -d ' ')
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent` |
 | `single_thread.py` | pins the numeric stack to one thread per process — **must be imported before numpy** |
 
-`CLAUDE.md` carries the design rationale in full, including the measurements
-behind every default and a list of gotchas worth reading before changing one.
+`DESIGN.md` carries the design rationale in full, including the measurements
+behind every default; `CLAUDE.md` carries the operating manual and a list of
+gotchas worth reading before changing one.
 
 ## Gotchas worth knowing up front
 

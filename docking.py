@@ -20,7 +20,7 @@ on its own without ever needing to be suspected.
 **Docking owns minimum-finding**, and the MD sweep keeps the two jobs docking
 cannot do -- an independently drawn, non-greedy check, and basin occupancy,
 which a constructed minimum has no sense of at all (`_assemble_dock_n` writes
-`n_frames` / `frames` as `None` for exactly that reason). CLAUDE.md's
+`n_frames` / `frames` as `None` for exactly that reason). DESIGN.md's
 `docking.py` section carries the measurements behind all of that: the
 both-nitrogens result on pyrazine + 2 chloroform, the staged
 screen-then-refine cost, the `1 - 0.93^K` placement-count argument, and where
@@ -127,7 +127,7 @@ class Docking:
     # the refined candidates are deduped at the 1 meV one like everything else.
     screen_dedupe_tol_eV: float = 4e-3
     # Loose first pass so paying for `n_placements` per parent is cheap;
-    # CLAUDE.md measures 1.3 s vs 4.5 s per candidate at 0.05 vs 0.002 on the
+    # DESIGN.md measures 1.3 s vs 4.5 s per candidate at 0.05 vs 0.002 on the
     # pyrazine + 2 chloroform system.
     screen_fmax: float = 0.05
     # FixAtoms on the solute during screening only -- an approximation, off
@@ -424,7 +424,7 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
             "no single minimum dominates near a monolayer, and "
             "solvent-solvent cohesion takes over. The MD sweep is the "
             "right tool past roughly a third of capacity -- see "
-            "CLAUDE.md's Applicability section.")
+            "DESIGN.md's Applicability section.")
 
     start = time.time()
     e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = reference_energies(

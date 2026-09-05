@@ -988,8 +988,8 @@ def format_basin_occupancy(params, summaries, pooled):
 
     A table of frame counts invites being read as a Boltzmann population and
     is not one; the caveats that go with it are in the README, under Reading
-    report.txt, once rather than once here, once in the rendered output and
-    once in CLAUDE.md as they used to be.
+    report.txt, once rather than once here, once in the rendered output, and
+    once in DESIGN.md.
 
     Guarded by the caller on `pack_mode == "md"`: a docked run has no
     sampling frames and so no occupancy to report, and `_assemble_dock_n`
