@@ -36,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -1110,9 +1110,9 @@ def format_search_convergence(params, pooled):
             "  the same n has been measured at whole kcal/mol -- at n = 2 the",
             "  arrangement that puts one solvent molecule on each of pyrazine's",
             "  nitrogens turns up in well under half of packings. Re-run with",
-            "  --seeds 3 before subtracting two sweeps from each other: a double",
-            "  difference is four of these numbers and inherits the weakness of all",
-            "  four."])
+            "  several packings per n (n_sweep's default --seeds) before",
+            "  subtracting two sweeps from each other: a double difference is four",
+            "  of these numbers and inherits the weakness of all four."])
 
     header = (f"{'n':>3} {'packings':>9} {'E_int(min)':>12} {'found by':>9} "
               f"{'spread':>8} {'pool':>6}")

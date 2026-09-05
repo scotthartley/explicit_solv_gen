@@ -109,8 +109,23 @@ class Docking:
     # greedy -- the best structure at n need not descend from the best at
     # n - 1 -- and this is the mitigation.
     n_parents: int = 3
-    # Placements re-relaxed at the scorer's tight fmax, after screening.
+    # Placements re-relaxed at the scorer's tight fmax, after screening --
+    # **per parent**, and chosen among that parent's *distinct* screened
+    # basins (see `screen_dedupe_tol_eV`) rather than by raw screened energy.
+    # It used to be a total over all parents, taken off the raw ranking: ten
+    # of 192 at n >= 2, which could be ten copies of one basin. That starved
+    # `n_parents` -- the next generation's parents were the deduped top-3 of
+    # at most ten refinements -- and capped `dft_export`'s window at ten
+    # candidates per n whatever the window said.
     n_refine: int = 10
+    # Two screened energies this close are one basin for the purpose of
+    # choosing what to refine. Deliberately looser than `report.DEDUPE_TOL_EV`
+    # (1 meV): at `screen_fmax = 0.05` two placements in the same basin can
+    # still differ by up to ~0.6 kcal/mol, so this errs toward refining a
+    # duplicate rather than dropping a basin. ~0.1 kcal/mol. The screened
+    # energies never reach a `scored.json`, so neither does this criterion;
+    # the refined candidates are deduped at the 1 meV one like everything else.
+    screen_dedupe_tol_eV: float = 4e-3
     # Loose first pass so paying for `n_placements` per parent is cheap;
     # CLAUDE.md measures 1.3 s vs 4.5 s per candidate at 0.05 vs 0.002 on the
     # pyrazine + 2 chloroform system.
@@ -197,7 +212,13 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
 
     Builds `len(parents) * docking.n_placements` random placements (see
     `place_one`), screens all of them at `docking.screen_fmax`, and refines
-    only the best `docking.n_refine` at the scorer's tight criterion.
+    up to `docking.n_refine` *per parent* at the scorer's tight criterion:
+    the parent's screened energies are deduped at
+    `docking.screen_dedupe_tol_eV` and the lowest representative of each
+    screened basin is refined, best-first, so the refined set carries every
+    distinct basin the screen found rather than the best basin several times
+    over. Fewer than `n_refine` are refined when a parent's placements
+    collapsed into fewer screened basins than that.
 
     Returns `(refined, sources, n_tried)`: `refined` is a list of
     `ensemble.Relaxed` objects, `sources[i]` is the index into `parents` that
@@ -235,8 +256,20 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
                     for atoms in placements]
     screened = pool_map(relax, screen_tasks, n_workers)
 
-    order = sorted(range(len(screened)), key=lambda i: screened[i].energy_eV)
-    top = order[:docking.n_refine]
+    # Per parent, so a parent whose placements all screened a little higher
+    # than another's still gets its basins refined -- that is what keeps the
+    # chain's `n_parents` lineages alive into the next generation. Within a
+    # parent, one representative per screened basin, lowest first.
+    by_parent = {}
+    for i, parent_index in enumerate(sources):
+        by_parent.setdefault(parent_index, []).append(i)
+    top = []
+    for parent_index in sorted(by_parent):
+        members = by_parent[parent_index]
+        representatives = dedupe_energies(
+            [screened[i].energy_eV for i in members],
+            docking.screen_dedupe_tol_eV)
+        top += [members[r] for r in representatives[:docking.n_refine]]
 
     refine_tasks = [(screened[i].atoms, calculator, solvation,
                      calculator_kwargs, scoring.fmax, scoring.opt_steps, 0)
@@ -449,7 +482,11 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
     the `library_versions` that say which build of the Hamiltonian ran.
     """
     params = {k: v for k, v in asdict(docking).items()}
-    params.update(asdict(scoring))
+    # `max_frames` describes how a trajectory is subsampled, and docking has
+    # no trajectory: `summarise` already writes it as `None` per run, and the
+    # params block should not advertise a setting that did nothing either.
+    params.update({k: v for k, v in asdict(scoring).items()
+                   if k != "max_frames"})
     params.update({
         "solute_label": label,
         "solute_path": str(solute_path),
@@ -493,8 +530,10 @@ def main(argv=None):
                         help="deduped minima carried forward as the next n's "
                              "parents (default: %(default)s)")
     parser.add_argument("--refine", type=int, default=Docking.n_refine,
-                        help="best-screened placements re-relaxed at the "
-                             "scorer's tight fmax (default: %(default)s)")
+                        help="screened placements re-relaxed at the scorer's "
+                             "tight fmax, per parent: one per distinct "
+                             "screened basin, best-first, up to this many "
+                             "(default: %(default)s)")
     parser.add_argument("--screen-fmax", type=float,
                         default=Docking.screen_fmax,
                         help="loose optimiser convergence for the screening "

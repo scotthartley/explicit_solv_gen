@@ -30,7 +30,7 @@ it prepended:
     conda env create -f environment.yml
     conda activate solvate_md
     python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
-      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 5
 
 `n_sweep.py --help` lists the rest; every flag maps onto a field of
 `Condition` or of `Scoring`, and takes its default from there. That is the
@@ -85,6 +85,7 @@ refactor-only commits leave it alone.
 
 | version | what changed |
 | --- | --- |
+| 0.9.0 | the defaults audited against what each generator is for since 0.8.0. **Docking**: `Docking.n_refine` is per parent, and the placements refined are chosen per parent among its *distinct* screened basins (`Docking.screen_dedupe_tol_eV`, 4 meV, new in the params block) rather than as a raw top-10 across every parent -- which could be ten copies of one basin, starving `n_parents` and capping `dft_export`'s window at ten candidates. Changes docking's numbers at identical params: at n >= 2 outright (more and different refined placements -- measured on pyrazine/chloroform, 30 refined and 19 distinct minima at n = 2 against 10 and 10, minimum -13.01 vs -13.00, found by 2/30 vs 1/10, 14 candidates exported at n = 2 vs 10), and at n = 1 by 0.35 meV (-6.6434 vs -6.6514 kcal/mol): the same basin, but refined from one representative placement rather than the best of six duplicates of it, so it converged to a marginally different point of the same minimum, under the 1 meV dedupe tolerance. `dock.json`'s params block loses `max_frames`, which docking never used. **Sweep**: `n_sweep.DEFAULT_SEEDS` is 5 (was a literal 3 in two places) and `Scoring.max_frames` is 30 (was 50) -- the same relaxations per n, spent on independent packings rather than on frames correlated within one trajectory. Changes what a default sweep runs, not how any given `Condition` is scored; a sweep's own params block already tells the two apart |
 | 0.8.0 | two changes, landed together and both non-comparable. **Report shape**: the tables keep only the load-bearing columns -- `E_int(ens)`, `E(cluster)` and the distinct-minima `mean_contacts` / `dissolved_fraction` leave every table and `scored.log`'s Result block (they stay in the JSON), and the frame-weighted `occupancy_*` pair takes the `contacts` / `dissolved` columns. The ~150 lines of fixed prose every report carried move to README's "Reading report.txt". **Packing**: stratification is gone -- every solvent molecule is drawn independently again, `allocate_seeds` collapses to `n_seeds` everywhere and one at n = 0, and the Sampling convergence section goes with them. Changes the packing for **every n >= 2 run**, so sweeps either side are not comparable; `metadata.json` loses `pack_clustering` / `pack_directions` and the params block loses `pack_stratified`. Measured cost on one sweep: the n = 2 pooled minimum went -13.01 -> -11.40 kcal/mol, the both-nitrogens basin stratification used to buy -- which `docking.py` now finds by construction, which is why this is the intended trade |
 | 0.7.3 | one rendering pipeline for both generators. The docking table gains a `wall` column (always `-`) and takes the sweep's column order; both Best geometry tables carry `frame`, `parent` and `E_wall/eV`, `-` where one does not apply. `report.dock_row_from_summary`, `format_dock_table`, `format_dock_best_geometry`, `_dock_increments`, `format_dock_report`, `write_dock_best_geometries` and `render_dock_dir` are gone; `pool_by_n` takes a docking `runs` list and carries `pack_mode` per row. No number moves |
 | 0.7.2 | one candidate and one summary constructor for both generators (`ensemble.summarise`, `Candidate` for docking too). An MD candidate in `scored.json` gains `parent: null`; a docked candidate's `frame` is now its index among the refined placements *before* the dedupe rather than after. No number moves |
@@ -330,8 +331,8 @@ counting them would make the average "an average over how long the trajectory
 happened to loiter somewhere" -- true when `dump_interval` was 5 fs, about
 100x oversampled against the ~0.55 ps shell decorrelation time above. At
 today's defaults -- 20000 x 0.5 fs = 10 ps, dumped every 50 fs = 200 dumps,
-`max_frames = 50` selecting down to ~200 fs of scored-frame spacing -- that
-ratio is ~2.75x, roughly the same ~18 effectively independent configurations
+`max_frames = 30` selecting down to ~333 fs of scored-frame spacing -- that
+ratio is ~1.65x, close to the ~18 effectively independent configurations
 the MD-length defaults were chosen to buy. A frame count is no longer pure
 autocorrelation, and every energy behind it is already computed, so
 `ensemble.dedupe` now returns `(candidate, geometry, members)` groups instead
@@ -414,7 +415,8 @@ What sets them, measured rather than assumed:
 | equilibration | 5 ps | ~5 relaxation times. The old 1 ps was **one** |
 | production | 10 ps | ~18 independent shell configurations. The old 3 ps was ~5 |
 | dump interval | 100 steps = 50 fs | 11 dumps per decorrelation time. The old 5 fs recorded each configuration ~100 times |
-| seeds | 3 | independent packings at each n >= 1; n = 0 gets one, since every packing of a bare solute is the same packing |
+| seeds | 5 | independent packings at each n >= 1; n = 0 gets one, since every packing of a bare solute is the same packing. Every job the sweep still does scales with packings, not steps: `found by` out of 3 can only say 1, 2 or 3; P(every packing same-face at n = 2, pyrazine/chloroform) is 0.83^k = 0.57 at 3 and 0.39 at 5; occupancy's `n_seeds_hit` counts packings. The weighted budget 0.8.0 removed gave the shipped 4-point sweep 1 / 4 / 4 / 3 from `--seeds 3`, so a flat 3 had lost a packing at n = 1 and n = 2 |
+| scored frames | 30 per run | `Scoring.max_frames`, was 50. Sized for minimum-finding when the sweep still did that job; for occupancy, frames closer than the decorrelation time recount the same configuration. 30 over 10 ps is 333 fs of spacing, still under 0.55 ps, and 5 x 30 = 3 x 50 relaxations per n, so the two changes are cost-neutral together and trade correlated frames for independent draws |
 
 Expect all of these to grow with the solute. Re-measure the decorrelation time
 on your own system rather than carrying 0.55 ps over -- it is the one number
@@ -499,13 +501,14 @@ candidate optimizations. Both go through `solvate_md.pool_map`, which uses
 spawn, so the `if __name__ == "__main__":` guard below covers both.
 
 **The granularity is per candidate, not per run directory.** Fanning the
-scoring out over run directories gives a default sweep 12 tasks (4 n x 3
-seeds) on an 18-core machine, and they are badly unequal -- n = 0 is a rigid
-10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
-start and the tail is one whole directory long. Scoring therefore splits
-into `select_frames` -> `relax` per frame -> `assemble`, and `score_run_grid`
-selects every job in the parent, flattens to one `relax` task per candidate,
-and assembles afterwards. That is ~600 near-equal tasks with a tail of one
+scoring out over run directories gives a default sweep 16 tasks (one packing
+at n = 0, then 3 n x 5 seeds) on an 18-core machine, and they are badly
+unequal -- n = 0 is a rigid 10-atom molecule, n = 3 a floppy 25-atom cluster
+-- so cores idle from the start and the tail is one whole directory long.
+Scoring therefore splits into `select_frames` -> `relax` per frame ->
+`assemble`, and `score_run_grid` selects every job in the parent, flattens to
+one `relax` task per candidate, and assembles afterwards. That is ~500
+near-equal tasks with a tail of one
 optimization, and the count is set by `max_frames` regardless of system size.
 Measured on 6 run directories, 62 optimizations, 18 cores: 69.6 s serial,
 34.5 s per directory, **10.2 s per candidate**.
@@ -529,7 +532,11 @@ OpenMP clash the file boundary exists to avoid.
 
 `--max-frames` alone sets scoring cost, and that cost is independent of run
 length -- a longer trajectory is scored at wider spacing for the same price.
-It is 50. There used to be a `--stride` beside it, selecting every Nth dump
+It is 30, down from 50 at 0.9.0: the extra frames bought extra chances at the
+lowest quench, which is docking's job now, and for occupancy a frame closer
+than the decorrelation time to its neighbour mostly recounts the same
+configuration. The 20 relaxations per run that saves pay for `--seeds` going
+3 -> 5 at the same cost per n (see the sampling table above). There used to be a `--stride` beside it, selecting every Nth dump
 first, which did nothing at all: `max_frames` selects by `linspace` over the
 whole trajectory, so it discards whatever thinning `stride` did, and at any
 usable setting the cap always bites.
@@ -652,13 +659,42 @@ zero, and `report.py`'s formatters render it as `-`.
 
 **Staged optimisation, measured to cost nothing in quality.** Every
 placement is first screened at a loose `screen_fmax` (default 0.05) and only
-the best `n_refine` (default 10) are re-relaxed at the scorer's tight
-`fmax = 0.002`. On the same 64 random placements (same RNG draw), two-pass
-screen-then-refine landed at -6.6514 kcal/mol; refining all 64 at the tight
-criterion directly landed at -6.6511 -- a 0.0003 kcal/mol difference, two
-orders of magnitude under the 1 meV (0.023 kcal/mol) dedupe tolerance. The
-two-pass run took 7.3 s combined over two n; refining every placement tightly
-took 5.9 s for n = 1 alone. `--freeze-solute` (FixAtoms on the solute during
+up to `n_refine` (default 10) **per parent** are re-relaxed at the scorer's
+tight `fmax = 0.002`. On the same 64 random placements (same RNG draw),
+two-pass screen-then-refine landed at -6.6514 kcal/mol; refining all 64 at
+the tight criterion directly landed at -6.6511 -- a 0.0003 kcal/mol
+difference, two orders of magnitude under the 1 meV (0.023 kcal/mol) dedupe
+tolerance. The two-pass run took 7.3 s combined over two n; refining every
+placement tightly took 5.9 s for n = 1 alone.
+
+Which placements get refined changed at 0.9.0. `n_refine` used to be a total
+over every parent, taken off the raw screened ranking: ten of 192 at n >= 2,
+and since the screened energies were not deduped, those ten could be ten
+copies of the best basin. That validation above covered the *minimum* only,
+not the diversity of the refined set, and the refined set is what everything
+downstream consumes -- the next generation's parents are its deduped top
+`n_parents`, so a collapsed set starves the greedy-chain mitigation exactly
+where greediness is the documented risk, and `dft_export`'s 3 kcal/mol window
+was in practice a cap of ten candidates per n. Now each parent's screened
+energies are deduped at `Docking.screen_dedupe_tol_eV` -- 4 meV, ~0.1
+kcal/mol, deliberately looser than the 1 meV `DEDUPE_TOL_EV`, since at
+`fmax = 0.05` two placements in one basin can still differ by ~0.6 kcal/mol
+and the error to prefer is refining a duplicate over dropping a basin -- and
+the lowest representative of each screened basin is refined, best-first, up
+to `n_refine` per parent. At most 30 tight relaxations at n >= 2 instead of
+10, ~4.5 s each over the pool. The screened criterion never reaches a
+`scored.json`; the refined candidates are deduped at 1 meV like everything
+else, and `n_refined` / the `found by` denominator read the actual count.
+Measured on the same `--n 1 2` run before and after, same RNG draw: at n = 2,
+30 refined and 19 distinct minima against 10 and 10, the both-N minimum
+-13.01 vs -13.00 kcal/mol and found by 2/30 vs 1/10 -- with a second parent
+lineage now reaching a both-N basin of its own at -12.97 that the old top-10
+never refined -- and `dft_export`'s 3 kcal/mol window admitting 14 candidates
+where it was capped at 10. At n = 1, 5 distinct minima of 10 refined against
+3, and the minimum moved from -6.6514 to -6.6434 kcal/mol: 0.35 meV, under the
+dedupe tolerance, from refining one representative of the best screened basin
+instead of six copies of it. Wall-clock 13.1 s vs 7.2 s over both n.
+`--freeze-solute` (FixAtoms on the solute during
 screening only, off by default) is the other lever, for a large solute whose
 soft modes make BFGS crawl without being relevant to where a solvent
 molecule binds; refinement is always unconstrained regardless.
@@ -891,7 +927,10 @@ Known limitations:
   references. That is not a defect to fix in the sweep: `docking.py` owns
   minimum-finding, and the sweep is the independently drawn check beside it.
   Run both. A `found by` of 1/k at small n is asking for more packings, not
-  more steps.
+  more steps -- and the 0.9.0 default of 5 is the measured form of that
+  advice: on a 3 ps smoke sweep at the new defaults, 2 of the 5 packings at
+  n = 2 reached the both-N basin (-13.01 kcal/mol, `found by` 2/5) that 3
+  packings had missed, which is what 0.83^k = 0.39 rather than 0.57 buys.
 - MACE-OFF23 as a generator is **untested** here. It needs a model download,
   and it cannot share a process with tblite (see the file boundary above).
 - GFN2 likely **over-binds** the C-H...N contact -- 1.91 A is short against a

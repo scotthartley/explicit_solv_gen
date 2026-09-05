@@ -47,7 +47,7 @@ module docstring of `ensemble.py` for why those are separated.
 Run one from the command line:
 
     python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
-      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+      --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 5
 
 A script that calls `run_sweep` itself MUST guard the call, because the job
 grid underneath uses "spawn" and each worker re-imports the calling module:
@@ -75,8 +75,25 @@ from report import (VERSION, format_report, library_versions, pool_by_n,
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
+# Independent packings at each n >= 1, the one sampling default that lives
+# here rather than on `Condition`, because it is a property of the sweep and
+# not of a run. One owner: `run_sweep` and `--seeds` both read it, the same
+# way the MD lengths are read off `Condition` rather than restated.
+#
+# 5, up from 3, because every job the sweep still does scales with packings
+# rather than steps. `found by` out of 3 can only say 1, 2 or 3; the chance
+# that every packing at n = 2 on pyrazine/chloroform draws the same-face
+# arrangement (83% per draw) is 0.57 at 3 packings and 0.39 at 5; and
+# occupancy's `n_seeds_hit` counts packings. The weighted seed budget 0.8.0
+# removed used to give the shipped 4-point sweep 1 / 4 / 4 / 3 packings from
+# `--seeds 3`; a flat 3 lost one at n = 1 and n = 2 exactly where the
+# arrangement lottery bites. Paid for by `Scoring.max_frames` going 50 -> 30:
+# 5 x 30 = 3 x 50 relaxations per n.
+DEFAULT_SEEDS = 5
+
+
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
-              n_seeds=3, n_workers=None, scoring=None, label=None,
+              n_seeds=DEFAULT_SEEDS, n_workers=None, scoring=None, label=None,
               condition_kwargs=None):
     """Generate and score one solute in one solvent at every n and seed.
 
@@ -241,7 +258,7 @@ def main(argv=None):
                         required=True, metavar="N",
                         help="explicit solvent counts to sweep, e.g. 0 1 2 3")
     parser.add_argument("--out", required=True, help="output directory")
-    parser.add_argument("--seeds", type=int, default=3,
+    parser.add_argument("--seeds", type=int, default=DEFAULT_SEEDS,
                         help="independent packings per n (n = 0 gets one: "
                              "every packing of a bare solute is the same "
                              "packing). Packings are independent searches, "
@@ -249,7 +266,10 @@ def main(argv=None):
                              "the only convergence evidence this pipeline "
                              "produces, so one packing reports a number "
                              "nothing corroborates; the report says so when "
-                             "it sees one (default: %(default)s)")
+                             "it sees one. Scoring cost per n is seeds x "
+                             "max-frames, and a packing buys an independent "
+                             "draw where a frame buys a correlated one "
+                             "(default: %(default)s)")
     parser.add_argument("--workers", type=int, default=None,
                         help="parallel workers, for both halves "
                              "(default: all cores)")
@@ -281,8 +301,13 @@ def main(argv=None):
                         default=dataclass_default(Scoring, "max_frames"),
                         help="cap on frames scored per run, spread evenly over "
                              "the whole trajectory. This is what sets scoring "
-                             "cost, and it is independent of run length "
-                             "(default: %(default)s)")
+                             "cost, and it is independent of run length. The "
+                             "default spaces scored frames ~333 fs apart on "
+                             "the 10 ps default, under the ~0.55 ps shell "
+                             "decorrelation time measured on pyrazine + 3 "
+                             "CHCl3; denser than that mostly recounts the "
+                             "same configuration, which is why the budget "
+                             "goes to --seeds instead (default: %(default)s)")
     parser.add_argument("--fmax", type=float,
                         default=dataclass_default(Scoring, "fmax"),
                         help="scoring optimiser convergence, eV/A per-atom max "

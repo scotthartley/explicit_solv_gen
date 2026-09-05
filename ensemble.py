@@ -87,7 +87,17 @@ class Scoring:
     # dump before this cap was applied -- but the cap selects by `linspace`
     # over the whole trajectory, so it discarded whatever thinning `stride`
     # had done, and at any usable setting the cap always bites.
-    max_frames: int = 50
+    #
+    # 30, down from 50, since the sweep stopped being the minimum-finder.
+    # Extra frames bought extra chances at the lowest quench, which is
+    # docking's job now; for basin occupancy, frames closer together than the
+    # shell's ~0.55 ps decorrelation time mostly recount the same
+    # configuration. 30 over the 10 ps default is 333 fs of scored-frame
+    # spacing, still under that time, and the 20 relaxations per run it saves
+    # pay for `n_sweep.DEFAULT_SEEDS` going 3 -> 5 at the same scoring cost
+    # per n -- and a fresh packing is an independent draw, which a denser
+    # scoring of the same trajectory is not.
+    max_frames: int = 30
     # Optimiser convergence, eV/A per-atom max force. Every term of E_int has
     # to be relaxed to convergence, not merely to a stationary-ish geometry:
     # at the old 0.05 a frame is left hanging on whichever soft mode it was
@@ -465,9 +475,9 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     # The counts used to be discarded here, on the grounds that a frame count
     # at the old 5 fs dump interval was pure autocorrelation -- ~100x
     # oversampled against a ~0.55 ps shell decorrelation time. At today's
-    # defaults (50 fs dumps, `max_frames = 50` selecting down to ~200 fs of
-    # scored-frame spacing on a 10 ps trajectory) that ratio is ~2.75x,
-    # roughly the ~18 independent shell configurations the MD lengths were
+    # defaults (50 fs dumps, `max_frames = 30` selecting down to ~333 fs of
+    # scored-frame spacing on a 10 ps trajectory) that ratio is ~1.65x,
+    # close to the ~18 independent shell configurations the MD lengths were
     # chosen to buy, and every energy behind the count was computed anyway.
     #
     # `report.dedupe_groups` rather than a criterion of our own, because the
@@ -527,11 +537,12 @@ def score_run_grid(jobs, scoring, n_workers=None):
     sweep spends a few minutes on MD and the better part of an hour here.
 
     The granularity matters as much as the parallelism. Fanning out over run
-    *directories* gives a default sweep twelve tasks (4 n x 3 seeds) on an
-    eighteen-core machine, and they are badly unequal -- n = 0 is a rigid
-    10-atom molecule, n = 3 a floppy 25-atom cluster -- so cores idle from the
-    start and the tail is one whole run directory long. Flattening to one task
-    per candidate gives ~600 near-equal tasks instead, which is what the
+    *directories* gives a default sweep sixteen tasks (one packing at n = 0,
+    then 3 n x 5 seeds) on an eighteen-core machine, and they are badly
+    unequal -- n = 0 is a rigid 10-atom molecule, n = 3 a floppy 25-atom
+    cluster -- so cores idle from the start and the tail is one whole run
+    directory long. Flattening to one task per candidate gives ~500
+    near-equal tasks instead, which is what the
     machine can actually balance, and the tail shrinks to a single
     optimisation. It also scales the right way with the solute, because
     `max_frames` fixes the task count regardless of system size.

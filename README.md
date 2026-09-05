@@ -100,12 +100,15 @@ search-effort-dependent set of quenched energies.
 What the MD sweep gives that docking structurally cannot is **basin
 occupancy** — how many of the scored frames quenched into each minimum,
 pooled across packings and reported frame-weighted in `report.txt`'s Basin
-occupancy section. At today's defaults (50 fs dumps, `max_frames = 50`
-selecting down to ~200 fs of scored-frame spacing against a ~0.55 ps shell
-decorrelation time) that count is only ~2.75× oversampled, close enough to
+occupancy section. At today's defaults (50 fs dumps, `max_frames = 30`
+selecting down to ~333 fs of scored-frame spacing against a ~0.55 ps shell
+decorrelation time) that count is only ~1.65× oversampled, close enough to
 independent to be a usable inherent-structure population estimate — unlike at
 the old 5 fs dump interval (~100× oversampled), which is why it used to be
-discarded at dedupe.
+discarded at dedupe. `max_frames` was 50 until `0.9.0`; the frames it lost
+were buying extra chances at the lowest quench, which is docking's job, and
+the relaxations they cost now go to two more packings per `n` (`--seeds 5`),
+each an independent draw where a denser scoring of one trajectory is not.
 
 Occupancy is a diagnostic, quarantined from every `E_int` in this repo: the
 wall volume (`wall_slack`) sets the population of a dissociated molecule and
@@ -136,7 +139,7 @@ importing the Python packages is not enough.
 
 ```bash
 python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
-  --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 3
+  --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 5
 ```
 
 One sweep is **one solute in one solvent**. Comparisons — the same solute in
@@ -369,9 +372,14 @@ painful at 180 — and, more fundamentally, docking targets *targeted
 microsolvation*: past roughly a third of a monolayer no single minimum
 dominates and solvent–solvent cohesion takes over, which is the MD sweep's
 regime instead. `run_docking` warns past that fraction, the same convention
-the `cover` column uses. See `CLAUDE.md`'s `docking.py` section for the full
-measurements (staged screen-then-refine cost, the placement-count confidence
-argument, per-parent detail).
+the `cover` column uses. Every placement is screened at a loose `fmax` and
+only the best are refined at the scorer's tight one: up to `--refine` (default
+10) **per parent**, one per distinct screened basin, so the refined set — and
+with it the next `n`'s parents and what `dft_export` has to choose from —
+carries every basin the screen found rather than the best one several times
+over. See `CLAUDE.md`'s `docking.py` section for the full measurements (staged
+screen-then-refine cost, the placement-count confidence argument, per-parent
+detail).
 
 ## Packing: the seeds are independent draws
 
@@ -400,6 +408,11 @@ packings drawn that way made [basin occupancy](#basin-occupancy) a mixture
 with hand-picked weights rather than a sample of anything. So the packings are
 independent draws again, and `--seeds` is the number of them at each `n`.
 `n = 0` gets one, since every packing of a bare solute is the same packing.
+The default is 5: every job the sweep still does scales with packings rather
+than steps — `found by` out of 3 can only say 1, 2 or 3, the chance that every
+packing at `n = 2` draws the same-face arrangement above is 0.83^k (0.57 at 3
+packings, 0.39 at 5), and occupancy's `seeds` column counts packings. Scoring
+cost per `n` is `seeds × max_frames`, and 5 × 30 is what 3 × 50 used to be.
 
 ## The three diagnostics
 
