@@ -27,7 +27,6 @@ import single_thread  # noqa: F401  -- must precede numpy; see its docstring
 
 import json
 import time
-from collections import Counter
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
@@ -37,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.

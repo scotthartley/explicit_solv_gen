@@ -88,18 +88,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
-from ase.constraints import FixAtoms
-from ase.calculators.calculator import all_properties
-from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read, write
-from ase.optimize import BFGS
 
 from ensemble import (
     CONTACT_GAP_A,
+    Candidate,
     Scoring,
     reference_energies,
     relax,
     solvent_molecule_gaps,
+    summarise,
 )
 from report import (
     DEDUPE_TOL_EV,
@@ -107,7 +105,6 @@ from report import (
     VERSION,
     dedupe_energies,
     dock_row_from_summary,
-    ensemble_energy,
     format_dock_report,
     library_versions,
     timestamp,
@@ -119,7 +116,6 @@ from solvate_md import (
     _vdw_volume,
     align_to_principal_axes,
     bulk_molecular_volume,
-    get_calculator,
     pool_map,
     shell_padding,
     solute_semi_axes,
@@ -229,61 +225,6 @@ def place_one(parent_atoms, solvent_unit, region, tolerance, rng, max_tries=2000
     )
 
 
-def _align_parent(atoms, n_solute):
-    """Re-centre and re-rotate `atoms` onto its own solute block's principal axes.
-
-    Duplicates the handful of lines in `solvate_md`'s principal-frame
-    computation rather than reaching into that private helper: a parent here
-    is the *whole* complex (solute plus whatever solvent has already been
-    docked), and only the solute slice should define the frame, but the
-    rotation has to be applied to every atom. `pack_solvent` never needs
-    this because packmol always starts from a freshly aligned solute; a
-    docking parent has been through one or more rounds of BFGS and may have
-    drifted or rotated slightly (nothing here constrains its centre of
-    mass), so the shell region computed from `n_solute` atoms is re-centred
-    every generation to stay correct.
-    """
-    solute_positions = atoms.get_positions()[:n_solute]
-    centroid = solute_positions.mean(axis=0)
-    centered = solute_positions - centroid
-    eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered)
-    order = np.argsort(eigenvalues)[::-1]
-    rotation = eigenvectors[:, order].T
-    if np.linalg.det(rotation) < 0:
-        rotation[2] *= -1.0
-    aligned = atoms.copy()
-    aligned.set_positions((atoms.get_positions() - centroid) @ rotation.T)
-    return aligned
-
-
-def _screen_relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps,
-                  n_solute, freeze_solute):
-    """The loose screening pass. A plain top-level function for `pool_map`.
-
-    Local rather than `ensemble.relax` because this is the one place that
-    needs an optional frozen-solute constraint; `ensemble.relax` stays
-    exactly the scorer's optimiser, unconstrained, always -- refinement below
-    calls it directly, unchanged.
-
-    Returns `(atoms, energy_eV)` rather than a `Relaxed`: the screening pass
-    exists only to rank placements before the expensive tight optimisation,
-    so nothing here is precise enough to report -- `screen_fmax` never
-    reaches `scored.json`.
-    """
-    a = atoms.copy()
-    a.calc = get_calculator(calculator, solvation=solvation,
-                            **(calculator_kwargs or {}))
-    if freeze_solute:
-        a.set_constraint(FixAtoms(indices=list(range(n_solute))))
-    opt = BFGS(a, logfile=None)
-    opt.run(fmax=fmax, steps=steps)
-    energy = float(a.get_potential_energy())
-    a.set_constraint()  # cleared before returning, so nothing downstream inherits it
-    results = {k: v for k, v in a.calc.results.items() if k in all_properties}
-    a.calc = SinglePointCalculator(a, **results)
-    return a, energy
-
-
 def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
               solvation, calculator, calculator_kwargs, seed, n_workers=None):
     """Grow every parent by one solvent molecule, screen, and refine.
@@ -304,7 +245,9 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
 
     placements, sources = [], []
     for parent_index, parent in enumerate(parents):
-        aligned = _align_parent(parent, n_solute)
+        # Only the solute block defines the frame the shell region is
+        # measured in, but the whole complex moves with it.
+        aligned = align_to_principal_axes(parent, n_solute)
         solute_only = aligned[:n_solute]
         semi_axes = solute_semi_axes(solute_only)
         v_solute = _vdw_volume(solute_only)
@@ -316,16 +259,22 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
                                         docking.tolerance, rng))
             sources.append(parent_index)
 
+    # The same optimiser as the refinement below and as the scorer, at a
+    # looser `fmax` and optionally with the solute held fixed. Nothing it
+    # produces reaches a `scored.json`: it exists only to rank placements, so
+    # only its geometry and its energy are read back.
+    freeze_n = n_solute if docking.freeze_solute else 0
     screen_tasks = [(atoms, calculator, solvation, calculator_kwargs,
-                     docking.screen_fmax, scoring.opt_steps, n_solute,
-                     docking.freeze_solute) for atoms in placements]
-    screened = pool_map(_screen_relax, screen_tasks, n_workers)
+                     docking.screen_fmax, scoring.opt_steps, freeze_n)
+                    for atoms in placements]
+    screened = pool_map(relax, screen_tasks, n_workers)
 
-    order = sorted(range(len(screened)), key=lambda i: screened[i][1])
+    order = sorted(range(len(screened)), key=lambda i: screened[i].energy_eV)
     top = order[:docking.n_refine]
 
-    refine_tasks = [(screened[i][0], calculator, solvation, calculator_kwargs,
-                     scoring.fmax, scoring.opt_steps) for i in top]
+    refine_tasks = [(screened[i].atoms, calculator, solvation,
+                     calculator_kwargs, scoring.fmax, scoring.opt_steps, 0)
+                    for i in top]
     refined = pool_map(relax, refine_tasks, n_workers)
     refined_sources = [sources[i] for i in top]
     return refined, refined_sources, len(placements)
@@ -336,61 +285,61 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
     """Turn one n's refined placements into `scored.json` and its files.
 
     `pairs` is `[(Relaxed, parent_index), ...]`, already sorted lowest energy
-    first, for every refined placement at this n (not yet deduped). Mirrors
-    `ensemble.assemble`'s summary shape field-for-field where a field applies
-    -- `run_dir`, `e_solute_ref_eV`, `candidates`, and so on -- so
-    `dft_export` reads a sweep run and a docking run identically. Where it
-    does not apply (there is no MD frame, no sampling wall, no packing seed)
-    the field is written as `None` rather than defaulted, per the repo's
-    "missing is broken, not old" convention -- except here it genuinely is
-    absent, not broken, which is exactly `pack_mode: "dock"`'s job to say.
+    first, for every refined placement at this n (not yet deduped). The
+    summary itself is built by `ensemble.summarise`, the same function
+    `ensemble.assemble` calls, so a docking run and a sweep run cannot drift
+    apart in shape or in what a field means -- which is what `dft_export` and
+    `report` both rely on when they read either without branching.
+
+    Everything specific to construction is what this adds: the placement
+    bookkeeping in `extra`, and the per-parent table that makes the greedy
+    chain visible. What it deliberately does *not* add is an occupancy: a
+    docking dedupe groups constructed placements, not thermal samples, so
+    counting them would look like a frame-weighted population and would not
+    be one. `Candidate.n_frames` is `None` for these, which is what makes
+    `summarise` report no occupancy at all rather than a plausible number.
     """
     e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = references
     n_dir = out_root / f"{label}_n{n}_dock"
     n_dir.mkdir(parents=True, exist_ok=True)
 
-    interactions = [r.energy_eV - e_solute - n * e_solvent for r, _ in pairs]
-    keep_idx = dedupe_energies([r.energy_eV for r, _ in pairs])
-    kept = [pairs[i] for i in keep_idx]
-    kept_interactions = [interactions[i] for i in keep_idx]
-
     candidates = []
-    for i, ((result, parent_index), interaction) in enumerate(
-            zip(kept, kept_interactions)):
+    for i, (result, parent_index) in enumerate(pairs):
         gaps = solvent_molecule_gaps(result.atoms, n_solute, aps)
-        candidates.append({
-            "frame": i,
-            "energy_eV": result.energy_eV,
-            "interaction_eV": interaction,
-            "converged": result.converged,
-            "fmax": result.fmax,
-            "n_contacts": int((gaps < CONTACT_GAP_A).sum()),
-            "n_solvent": n,
-            "min_gap_A": float(gaps.min()) if len(gaps) else float("nan"),
-            "wall_energy_eV": None,
-            "gnorm_Eh_bohr": result.gnorm_Eh_bohr,
-            "n_opt_steps": result.n_opt_steps,
-            "parent": parent_index,
-            # A docked candidate has no sampling frame at all, and so no
-            # basin-occupancy population -- a real absence, the same
-            # convention `wall_energy_eV` above already uses here, and
-            # exactly why `pack_mode: "dock"` exists to say so.
-            "n_frames": None,
-            "frames": None,
-        })
+        candidates.append(Candidate(
+            # No trajectory to index into: this is which refined placement
+            # the geometry came from, in energy order.
+            frame=i,
+            energy_eV=result.energy_eV,
+            interaction_eV=result.energy_eV - e_solute - n * e_solvent,
+            converged=result.converged,
+            fmax=result.fmax,
+            n_contacts=int((gaps < CONTACT_GAP_A).sum()),
+            n_solvent=n,
+            min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
+            # A docked structure has no sampling frame, so no wall energy and
+            # no basin occupancy -- real absences, which is exactly what
+            # `pack_mode: "dock"` exists to say.
+            wall_energy_eV=None,
+            gnorm_Eh_bohr=result.gnorm_Eh_bohr,
+            n_opt_steps=result.n_opt_steps,
+            parent=parent_index,
+            n_frames=None,
+            frames=None,
+        ))
 
-    absolutes = [c["energy_eV"] for c in candidates]
-    e_min = min(kept_interactions)
-    best_i = min(range(len(candidates)),
-                key=lambda i: candidates[i]["interaction_eV"])
-    write(n_dir / "best.xyz", kept[best_i][0].atoms)
-    write(n_dir / "scored_candidates.xyz", [r.atoms for r, _ in kept])
+    keep_idx = dedupe_energies([c.energy_eV for c in candidates])
+    unique = [candidates[i] for i in keep_idx]
+    e_min = min(c.interaction_eV for c in unique)
+
+    write(n_dir / "best.xyz", pairs[keep_idx[0]][0].atoms)
+    write(n_dir / "scored_candidates.xyz", [pairs[i][0].atoms for i in keep_idx])
     write(n_dir / "ref_solute.xyz", ref_solute_atoms)
     write(n_dir / "ref_solvent.xyz", ref_solvent_atoms)
 
     per_parent = {}
-    for (_, parent_index), interaction in zip(pairs, interactions):
-        per_parent.setdefault(parent_index, []).append(interaction)
+    for c in candidates:
+        per_parent.setdefault(c.parent, []).append(c.interaction_eV)
     parent_detail = [
         {"parent": pi,
          "n_placements": len(vals),
@@ -399,54 +348,34 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
         for pi, vals in sorted(per_parent.items())
     ]
 
-    found_by = sum(1 for v in interactions if abs(v - e_min) <= DEDUPE_TOL_EV)
-
-    summary = {
-        "run_dir": str(n_dir),
-        "label": label,
-        "pack_mode": "dock",
-        "seed": None,
-        "n_solvent": n,
-        "sampling_solvation": None,
-        "scoring_solvation": list(solvation),
-        "calculator": docking.calculator,
-        "temperature_K": scoring.temperature_K,
-        "max_frames": None,
-        "opt_fmax": scoring.fmax,
-        "opt_steps": scoring.opt_steps,
-        "n_frames_scored": len(pairs),
-        "n_unique": len(candidates),
-        "e_solute_ref_eV": e_solute,
-        "e_solvent_ref_eV": e_solvent,
-        "min_interaction_kcal": e_min * EV_TO_KCAL,
-        "ensemble_interaction_kcal": ensemble_energy(
-            kept_interactions, scoring.temperature_K) * EV_TO_KCAL,
-        "min_energy_eV": min(absolutes),
-        "ensemble_energy_eV": ensemble_energy(absolutes, scoring.temperature_K),
-        "mean_contacts": float(np.mean([c["n_contacts"] for c in candidates])),
-        "dissolved_fraction": float(
-            np.mean([c["n_contacts"] == 0 for c in candidates])),
-        # A docking dedupe groups constructed *placements*, not thermal
-        # samples -- counting them would look like a frame-weighted
-        # occupancy and would not be one, so these are None rather than a
-        # value pooling code might read as real. `found_by` below is the
-        # docking-appropriate analogue.
-        "scored_frame_spacing_fs": None,
-        "occupancy_mean_contacts": None,
-        "occupancy_dissolved_fraction": None,
-        "converged_fraction": float(np.mean([r.converged for r, _ in pairs])),
-        "n_unconverged_unique": sum(1 for c in candidates if not c["converged"]),
-        "sampling_wall": None,
-        "n_scored_wall_active": 0,
-        "candidates": candidates,
-        # Docking-only bookkeeping, harmless extra keys for anything reading
-        # this as a plain ensemble.assemble summary.
-        "n_placements_tried": n_tried,
-        "n_refined": len(pairs),
-        "n_parents": n_parents_used,
-        "found_by": found_by,
-        "parent_detail": parent_detail,
-    }
+    summary = summarise(
+        run_dir=n_dir,
+        label=label,
+        pack_mode="dock",
+        seed=None,
+        n_solvent=n,
+        candidates=candidates,
+        unique=unique,
+        references=(e_solute, e_solvent),
+        sampling_solvation=None,
+        scoring_solvation=solvation,
+        calculator=docking.calculator,
+        scoring=scoring,
+        sampling_wall=None,
+        scored_frame_spacing_fs=None,
+        extra={
+            "n_placements_tried": n_tried,
+            "n_refined": len(pairs),
+            "n_parents": n_parents_used,
+            # The constructive analogue of the sweep's `found by`: refined
+            # placements that landed on this n's minimum. Not independent
+            # corroboration the way agreeing packings are -- see
+            # `report.format_dock_parent_detail`.
+            "found_by": sum(1 for c in candidates
+                            if abs(c.interaction_eV - e_min) <= DEDUPE_TOL_EV),
+            "parent_detail": parent_detail,
+        },
+    )
     (n_dir / "scored.json").write_text(json.dumps(summary, indent=2))
     return summary
 

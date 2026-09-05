@@ -382,8 +382,15 @@ def get_calculator(name, solvation=None, **kwargs):
         raise ValueError(f"Unknown calculator: {name}")
 
 
-def _principal_frame(atoms):
-    """Centroid and the rotation onto the solute's principal axes.
+def _principal_frame(atoms, n_frame_atoms=None):
+    """Centroid and the rotation onto the principal axes of the solute.
+
+    `n_frame_atoms` is how many leading atoms define the frame; `None` means
+    all of them, which is what a bare solute wants. `docking` passes its
+    solute count instead, because a docking parent is the *whole* complex --
+    solute plus whatever solvent has already been placed -- and only the
+    solute block should say where the axes point, even though the rotation
+    then applies to every atom.
 
     Uses the unweighted centroid, not the centre of mass, because that is
     what Packmol's `fixed 0. 0. 0.` actually places at the origin -- Packmol
@@ -392,6 +399,8 @@ def _principal_frame(atoms):
     region from where the solute really ends up.
     """
     positions = atoms.get_positions()
+    if n_frame_atoms is not None:
+        positions = positions[:n_frame_atoms]
     centroid = positions.mean(axis=0)
     centered = positions - centroid
 
@@ -403,14 +412,21 @@ def _principal_frame(atoms):
     return centroid, rotation
 
 
-def align_to_principal_axes(atoms):
+def align_to_principal_axes(atoms, n_frame_atoms=None):
     """Copy of `atoms` with its centroid at the origin and axes sorted long-first.
 
     Lets an axis-aligned ellipsoid hug the solute regardless of how the input
     file happened to be oriented, and makes the packing region independent of
     any rigid-body transform applied to the input.
+
+    `n_frame_atoms` restricts which atoms define that frame while still
+    moving all of them -- see `_principal_frame`. `pack_solvent` never needs
+    it, because packmol always starts from a freshly aligned bare solute; a
+    docking parent has been through one or more rounds of BFGS and may have
+    drifted or rotated (nothing constrains its centre of mass), so its shell
+    region is re-centred on the solute block every generation.
     """
-    centroid, rotation = _principal_frame(atoms)
+    centroid, rotation = _principal_frame(atoms, n_frame_atoms)
     aligned = atoms.copy()
     aligned.set_positions((atoms.get_positions() - centroid) @ rotation.T)
     return aligned

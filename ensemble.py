@@ -33,6 +33,7 @@ from pathlib import Path
 import numpy as np
 from ase.calculators.calculator import all_properties
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms
 from ase.io import read, write
 from ase.optimize import BFGS
 from ase.units import Bohr, Hartree
@@ -104,8 +105,18 @@ class Scoring:
 
 @dataclass
 class Candidate:
-    """One optimised geometry, scored in the continuum."""
+    """One optimised geometry, scored in the continuum.
 
+    Both generators build these, so `scored.json`'s candidate shape has one
+    definition rather than two kept in step by hand. Where a field cannot
+    apply to one of them it is `None` -- a real absence, which is what
+    `pack_mode` exists to explain -- never a plausible-looking zero.
+    """
+
+    # For an MD candidate, the trajectory dump this was quenched from. For a
+    # docked one there is no trajectory: it is the index of the refined
+    # random placement instead, which is the only provenance a constructed
+    # geometry has.
     frame: int
     energy_eV: float
     # E(cluster) - E(solute) - n * E(solvent), every term relaxed in the same
@@ -133,6 +144,10 @@ class Candidate:
     # floppy cluster -- worth knowing before anyone tries swapping it on a
     # larger system.
     n_opt_steps: int
+    # Which of the previous n's surviving parents a docked candidate grew
+    # from -- the greedy chain made visible. `None` for an MD candidate,
+    # which descends from a packing rather than from another structure.
+    parent: int = None
     # How many scored frames quenched into this minimum, and their sampling
     # dump indices -- the inherent-structure occupancy `n_sweep`'s docstring
     # discusses. 1 / [frame] until `assemble` groups this candidate with its
@@ -191,16 +206,31 @@ class Relaxed:
     n_opt_steps: int
 
 
-def relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps):
+def relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps,
+          freeze_n):
     """Optimise `atoms` in the scoring environment. No wall -- see module doc.
 
-    This is the unit of work the scoring grid fans out: one candidate, or one
-    of the two references, per call. It is a plain top-level function taking
-    picklable arguments for exactly that reason.
+    This is the unit of work both grids fan out: one candidate, one of the two
+    references, or one docking placement per call. It is a plain top-level
+    function taking picklable arguments for exactly that reason.
+
+    `freeze_n` holds the first that many atoms fixed. Zero -- every candidate
+    the scorer reports and every refinement `docking.py` does -- is the
+    unconstrained optimisation `Scoring.fmax` names, and the only one whose
+    result is comparable between the two generators. Nonzero is docking's
+    optional frozen-solute screening pass, whose energies exist only to rank
+    placements before the expensive tight optimisation and never reach a
+    `scored.json`. Required rather than defaulted, like every other argument
+    here: the caller has to say which of the two it means.
+
+    The constraint is cleared before returning, so nothing downstream --
+    a refinement, a `best.xyz` -- inherits it.
     """
     a = atoms.copy()
     a.calc = get_calculator(calculator, solvation=solvation,
                             **(calculator_kwargs or {}))
+    if freeze_n:
+        a.set_constraint(FixAtoms(indices=list(range(freeze_n))))
     opt = BFGS(a, logfile=None)
     opt.run(fmax=fmax, steps=steps)
     # Read all of these before anything else touches the geometry:
@@ -210,6 +240,7 @@ def relax(atoms, calculator, solvation, calculator_kwargs, fmax, steps):
     forces = a.get_forces()
     energy = float(a.get_potential_energy())
     results = {k: v for k, v in a.calc.results.items() if k in all_properties}
+    a.set_constraint()
     a.calc = SinglePointCalculator(a, **results)
     return Relaxed(
         atoms=a,
@@ -238,9 +269,9 @@ def reference_energies(solute_path, solvent_path, calculator, solvation,
     """
     solute = align_to_principal_axes(read(solute_path))
     solute_relaxed = relax(solute, calculator, solvation,
-                           calculator_kwargs, fmax, steps)
+                           calculator_kwargs, fmax, steps, 0)
     solvent_relaxed = relax(read(solvent_path), calculator, solvation,
-                            calculator_kwargs, fmax, steps)
+                            calculator_kwargs, fmax, steps, 0)
     return (solute_relaxed.energy_eV, solvent_relaxed.energy_eV,
             solute_relaxed.atoms, solvent_relaxed.atoms)
 
@@ -272,6 +303,108 @@ def select_frames(run_dir, max_frames):
         frames = [frames[i] for i in sel]
         indices = [indices[i] for i in sel]
     return meta, records, indices, frames
+
+
+def summarise(run_dir, label, pack_mode, seed, n_solvent, candidates, unique,
+              references, sampling_solvation, scoring_solvation, calculator,
+              scoring, sampling_wall, scored_frame_spacing_fs, extra):
+    """The `scored.json` shape, built once for both generators.
+
+    `candidates` is every optimised geometry at this point of the sweep or
+    chain; `unique` is the same list after the basin dedupe, lowest first.
+    Everything here is derived from those two, the references and `scoring`,
+    so a docking run and an MD run cannot disagree about what a field means
+    -- which they could, and did, while `docking.py` rebuilt this dict field
+    by field beside `assemble`'s.
+
+    Where a field describes something one generator does not do, it comes out
+    `None` from the inputs themselves rather than from a branch here: a
+    docked candidate has no sampling frame, so its `n_frames` is `None` and
+    the occupancy fields below are too; it has no sampling wall, so
+    `sampling_wall` is `None` and no candidate has a wall energy to count.
+    `pack_mode` is what says which generator ran, and therefore which
+    absences to expect. `extra` carries the keys only one generator has --
+    docking's placement bookkeeping -- appended rather than interleaved, so
+    the shared shape stays a contiguous block.
+    """
+    e_solute, e_solvent = references
+    interactions = [c.interaction_eV for c in unique]
+    # Absolute energies over the same candidates. `boltzmann_weights`
+    # subtracts the minimum before exponentiating and E_int differs from
+    # E(cluster) only by the constant e_solute + n * e_solvent, so these two
+    # averages carry identical weights and cannot disagree.
+    absolutes = [c.energy_eV for c in unique]
+    n_frames_scored = len(candidates)
+
+    # Frame-weighted, over the deduped basins: how much of the *trajectory*
+    # actually sat in a contact state, as opposed to how many distinct
+    # contact states were found (`mean_contacts` / `dissolved_fraction`
+    # below). Quarantined from every energy in this summary -- occupancy
+    # never enters `interaction_eV` or the Boltzmann averages, only these two
+    # diagnostic fields. `None` throughout when the candidates carry no frame
+    # counts, i.e. for a docked run, where a count of *placements* would look
+    # like a population and would not be one.
+    counted = all(c.n_frames is not None for c in unique)
+    occupancy_mean_contacts = (
+        float(sum(c.n_contacts * c.n_frames for c in unique) / n_frames_scored)
+        if counted else None)
+    occupancy_dissolved_fraction = (
+        (float(sum(c.n_frames for c in unique if c.n_contacts == 0)
+               / n_frames_scored) if n_solvent else 1.0)
+        if counted else None)
+
+    return {
+        "run_dir": str(run_dir),
+        "label": label,
+        "pack_mode": pack_mode,
+        "seed": seed,
+        "n_solvent": n_solvent,
+        "sampling_solvation": sampling_solvation,
+        "scoring_solvation": (list(scoring_solvation) if scoring_solvation
+                              else None),
+        "calculator": calculator,
+        "temperature_K": scoring.temperature_K,
+        # Describes how a trajectory was subsampled, so it is a real absence
+        # for a generator that has no trajectory.
+        "max_frames": scoring.max_frames if pack_mode == "md" else None,
+        "opt_fmax": scoring.fmax,
+        "opt_steps": scoring.opt_steps,
+        "n_frames_scored": n_frames_scored,
+        "n_unique": len(unique),
+        "e_solute_ref_eV": e_solute,
+        "e_solvent_ref_eV": e_solvent,
+        "min_interaction_kcal": min(interactions) * EV_TO_KCAL,
+        "ensemble_interaction_kcal":
+            ensemble_energy(interactions, scoring.temperature_K) * EV_TO_KCAL,
+        "min_energy_eV": min(absolutes),
+        "ensemble_energy_eV": ensemble_energy(absolutes, scoring.temperature_K),
+        # Over the *distinct minima* -- how many kinds of basin the search
+        # turned up, not how the trajectory's time was actually spent. See
+        # `occupancy_mean_contacts` / `occupancy_dissolved_fraction` below
+        # for the frame-weighted analogues.
+        "mean_contacts": float(np.mean([c.n_contacts for c in unique])),
+        # At n = 0 there is no solvent to dissolve, which is 1.0 here rather
+        # than a division by zero.
+        "dissolved_fraction": (
+            float(np.mean([c.n_contacts == 0 for c in unique]))
+            if n_solvent else 1.0),
+        "scored_frame_spacing_fs": scored_frame_spacing_fs,
+        "occupancy_mean_contacts": occupancy_mean_contacts,
+        "occupancy_dissolved_fraction": occupancy_dissolved_fraction,
+        "converged_fraction": float(np.mean([c.converged for c in candidates])),
+        # Counted over the unique candidates because those are the ones that
+        # carry Boltzmann weight. A candidate left with residual force is
+        # exactly the contamination the tight fmax exists to remove, so it is
+        # surfaced rather than dropped -- dropping would bias the ensemble
+        # toward whichever basins happen to relax easily.
+        "n_unconverged_unique": sum(1 for c in unique if not c.converged),
+        # Named `sampling_*` because the scorer applies no wall: this
+        # qualifies the geometries, not the energies computed from them here.
+        "sampling_wall": sampling_wall,
+        "n_scored_wall_active": sum(1 for c in candidates if c.wall_energy_eV),
+        "candidates": [asdict(c) for c in unique],
+        **extra,
+    }
 
 
 def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
@@ -320,7 +453,6 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
         ), result.atoms))
 
     candidates = [c for c, _ in pairs]
-    n_frames_scored = len(candidates)
     # Consecutive MD frames mostly relax into the same basin, so grouping
     # them is what turns a candidate list into an inherent-structure
     # population: each survivor's `n_frames` / `frames` (1 / [its own frame]
@@ -348,35 +480,14 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
          pairs[g[0]][1])
         for g in dedupe_groups([c.energy_eV for c, _ in pairs])
     ]
-    unique_candidates = [c for c, _ in unique]
-    interactions = [c.interaction_eV for c in unique_candidates]
-    # Absolute energies over the same candidates. `boltzmann_weights`
-    # subtracts the minimum before exponentiating and E_int differs from
-    # E(cluster) only by the constant e_solute + n * e_solvent, so these two
-    # averages carry identical weights and cannot disagree.
-    absolutes = [c.energy_eV for c in unique_candidates]
-
     # How far apart, in fs, the frames actually sent to the optimiser are --
-    # what the occupancy section below has to be read against a
-    # decorrelation time measured on the system, never a fabricated one.
-    # `indices` is already ascending (built by `select_frames`); `None` for a
-    # single scored frame, which has no spacing to report.
+    # what the occupancy section has to be read against a decorrelation time
+    # measured on the system, never a fabricated one. `indices` is already
+    # ascending (built by `select_frames`); `None` for a single scored frame,
+    # which has no spacing to report.
     scored_frame_spacing_fs = (
         float(np.mean(np.diff(indices))) * meta["dump_interval"]
         * meta["timestep_fs"] if len(indices) > 1 else None)
-    # Frame-weighted, over the same deduped basins: how much of the
-    # *trajectory* actually sat in a contact state, as opposed to how many
-    # distinct contact states were found (`mean_contacts` /
-    # `dissolved_fraction` below). Quarantined from every energy in this
-    # summary -- occupancy never enters `interaction_eV` or the Boltzmann
-    # averages, only these two diagnostic fields.
-    occupancy_mean_contacts = float(
-        sum(c.n_contacts * c.n_frames for c in unique_candidates)
-        / n_frames_scored)
-    occupancy_dissolved_fraction = (
-        float(sum(c.n_frames for c in unique_candidates if c.n_contacts == 0)
-             / n_frames_scored)
-        if n_solvent else 1.0)
 
     best = min(range(len(pairs)), key=lambda i: pairs[i][0].interaction_eV)
     write(run_dir / "best.xyz", pairs[best][1])
@@ -385,53 +496,23 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     write(run_dir / f"{Path(out_name).stem}_candidates.xyz",
           [geometry for _, geometry in unique])
 
-    summary = {
-        "run_dir": str(run_dir),
-        "label": meta["label"],
-        "pack_mode": "md",
-        "seed": meta["seed"],
-        "n_solvent": n_solvent,
-        "sampling_solvation": meta["solvation"],
-        "scoring_solvation": list(solvation) if solvation else None,
-        "calculator": calculator,
-        "temperature_K": scoring.temperature_K,
-        "max_frames": scoring.max_frames,
-        "opt_fmax": scoring.fmax,
-        "opt_steps": scoring.opt_steps,
-        "n_frames_scored": n_frames_scored,
-        "n_unique": len(unique),
-        "e_solute_ref_eV": e_solute,
-        "e_solvent_ref_eV": e_solvent,
-        "min_interaction_kcal": min(interactions) * EV_TO_KCAL,
-        "ensemble_interaction_kcal":
-            ensemble_energy(interactions, scoring.temperature_K) * EV_TO_KCAL,
-        "min_energy_eV": min(absolutes),
-        "ensemble_energy_eV": ensemble_energy(absolutes, scoring.temperature_K),
-        # Over the *distinct minima* -- how many kinds of basin the search
-        # turned up, not how the trajectory's time was actually spent. See
-        # `occupancy_mean_contacts` / `occupancy_dissolved_fraction` below
-        # for the frame-weighted analogues.
-        "mean_contacts": float(np.mean([c.n_contacts for c in unique_candidates])),
-        "dissolved_fraction": (
-            float(np.mean([c.n_contacts == 0 for c in unique_candidates]))
-            if n_solvent else 1.0),
-        "scored_frame_spacing_fs": scored_frame_spacing_fs,
-        "occupancy_mean_contacts": occupancy_mean_contacts,
-        "occupancy_dissolved_fraction": occupancy_dissolved_fraction,
-        "converged_fraction": float(np.mean([c.converged for c in candidates])),
-        # Counted over the unique candidates because those are the ones that
-        # carry Boltzmann weight. A candidate left with residual force is
-        # exactly the contamination the tight fmax exists to remove, so it is
-        # surfaced rather than dropped -- dropping would bias the ensemble
-        # toward whichever basins happen to relax easily.
-        "n_unconverged_unique": sum(1 for c in unique_candidates
-                                    if not c.converged),
-        # Named `sampling_*` because the scorer applies no wall: this qualifies
-        # the geometries, not the energies computed from them here.
-        "sampling_wall": wall_stats(records),
-        "n_scored_wall_active": sum(1 for c in candidates if c.wall_energy_eV),
-        "candidates": [asdict(c) for c in unique_candidates],
-    }
+    summary = summarise(
+        run_dir=run_dir,
+        label=meta["label"],
+        pack_mode="md",
+        seed=meta["seed"],
+        n_solvent=n_solvent,
+        candidates=candidates,
+        unique=[c for c, _ in unique],
+        references=references,
+        sampling_solvation=meta["solvation"],
+        scoring_solvation=solvation,
+        calculator=calculator,
+        scoring=scoring,
+        sampling_wall=wall_stats(records),
+        scored_frame_spacing_fs=scored_frame_spacing_fs,
+        extra={},
+    )
     (run_dir / out_name).write_text(json.dumps(summary, indent=2))
     (run_dir / (Path(out_name).stem + ".log")).write_text(
         format_scored_log(summary, meta))
@@ -495,8 +576,11 @@ def score_run_grid(jobs, scoring, n_workers=None):
         job["calculator"] = job.get("calculator") or meta["calculator"]
 
     def task(atoms, job):
+        # freeze_n = 0: the scorer never constrains anything. Only docking's
+        # screening pass does, and it is not this grid.
         return (atoms, job["calculator"], job["solvation"],
-                job.get("calculator_kwargs"), scoring.fmax, scoring.opt_steps)
+                job.get("calculator_kwargs"), scoring.fmax, scoring.opt_steps,
+                0)
 
     # References first, so they are in flight before the candidates rather
     # than behind them: `assemble` cannot run for any job until its pair
