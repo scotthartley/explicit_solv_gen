@@ -243,14 +243,6 @@ def format_run_header(meta, extra=None):
     }
     if "shell_fill" in extra:
         packing["shell fill"] = f"{extra['shell_fill']:.2f}"
-    if meta["pack_directions"]:
-        packing["arrangement"] = (
-            f"stratified, clustering {meta['pack_clustering']:.2f} "
-            "(0 = spread, 1 = one face)")
-        packing["hemisphere axes"] = "\n".join(
-            "  ".join(f"{x:+.3f}" for x in d) for d in meta["pack_directions"])
-    else:
-        packing["arrangement"] = "unconstrained (one packmol block)"
     packing["wall distance/A"] = f"{meta['wall_distance']:.3f}"
     if "wall_slack" in extra:
         packing["wall slack"] = f"{extra['wall_slack']:.2f} solvent diameters"
@@ -1089,116 +1081,6 @@ def format_wall_diagnostic(summaries):
     return "\n".join(lines)
 
 
-# A minimum first found in the last quarter of the trajectory, or a
-# last-quarter gain bigger than this, means the run was still turning up new
-# basins when it stopped. 0.25 kcal/mol is far under the ~3 kcal/mol signal
-# this pipeline exists to resolve, and well over the noise a converged
-# optimisation leaves behind.
-LATE_TRAJECTORY_FRACTION = 0.75
-LATE_GAIN_WARN_KCAL = 0.25
-
-
-def sampling_convergence(summary):
-    """Where in the trajectory `E_int(min)` was found, and what arrived late.
-
-    `E_int(min)` is a running minimum over candidates, so it can only ever
-    fall as sampling continues. That makes *when* it last fell a usable
-    convergence test: a minimum found in the middle of a trajectory that then
-    ran on without improving is evidence the sampling saturated, and a
-    minimum found on the last frame is evidence it did not -- the reported
-    number is an upper bound and a longer run would beat it.
-
-    Computed from the candidate list already in `scored.json`, so it costs no
-    MD and no calculator. Each candidate's basin was first *reached* at
-    `min(c["frames"])` -- the representative's own `frame` is arbitrary among
-    a group of members agreeing to within 1 meV, but the earliest of them is
-    when the trajectory first visited this minimum, which is what "best found
-    at" means. A duplicate cannot move a running minimum by more than the
-    dedup tolerance, so working from the deduped list is safe.
-
-    Returns None when there is nothing to say: too few candidates to see a
-    trend, or a trajectory too short for the late-quarter cut to mean
-    anything.
-    """
-    candidates = summary.get("candidates") or []
-    if len(candidates) < 4:
-        return None
-    firsts = [min(c["frames"]) for c in candidates]
-    last = max(firsts)
-    if last <= 0:
-        return None
-
-    cut = LATE_TRAJECTORY_FRACTION * last
-    best_i = min(range(len(candidates)),
-                key=lambda i: candidates[i]["interaction_eV"])
-    early = [candidates[i]["interaction_eV"] for i in range(len(candidates))
-             if firsts[i] <= cut]
-    late = [candidates[i]["interaction_eV"] for i in range(len(candidates))
-            if firsts[i] > cut]
-    # Undefined rather than zero when the trajectory has no candidates on one
-    # side of the cut: there was nothing there to improve on. Clamped at zero
-    # because the quantity being reported is a *running* minimum, which cannot
-    # rise -- a late quarter that found nothing better improved it by nothing,
-    # and printing how much worse its own best was would only invite reading
-    # the sign backwards.
-    gain = (min(min(late) - min(early), 0.0) * EV_TO_KCAL
-            if early and late else None)
-    return {
-        "best_at": firsts[best_i] / last,
-        "late_gain_kcal": gain,
-        "still_improving": (firsts[best_i] > cut
-                            or (gain is not None
-                                and gain < -LATE_GAIN_WARN_KCAL)),
-    }
-
-
-def format_sampling_convergence(summaries):
-    """Per-run: was `E_int(min)` still falling when the trajectory stopped?"""
-    rows = [(s, conv) for s in summaries if (conv := sampling_convergence(s))]
-    if not rows:
-        return None
-
-    lines = ["Sampling convergence", "--------------------",
-             f"{'n':>3} {'seed':>4} {'best found at':>14} "
-             f"{'late gain':>10} {'verdict':>16}",
-             "-" * 52]
-
-    for s, conv in sorted(rows, key=lambda r: _row_order(r[0])):
-        gain = conv["late_gain_kcal"]
-        lines.append(
-            f"{s['n_solvent']:>3} "
-            f"{s['seed']:>4} "
-            f"{100 * conv['best_at']:>13.0f}% "
-            + (f"{'-':>10} " if gain is None else f"{gain:>10.2f} ")
-            + f"{'STILL FALLING' if conv['still_improving'] else 'settled':>16}")
-
-    lines.append(
-        "\n  'best found at' = how far into the trajectory the lowest-E_int "
-        "candidate was\n  found; 'late gain' = what the final "
-        f"{100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% took off E_int(min) in "
-        "kcal/mol,\n  negative meaning it was still finding better "
-        "geometries at the end.")
-
-    unsettled = [s for s, conv in rows if conv["still_improving"]]
-    if unsettled:
-        lines.append(
-            "\n" + "\n".join("  " + line for line in (
-                f"** WARNING: {len(unsettled)} of {len(rows)} runs were still "
-                "improving E_int(min)",
-                f"** in the last {100 - 100 * LATE_TRAJECTORY_FRACTION:.0f}% "
-                "of their trajectory. Those rows are upper bounds, not",
-                "** converged values, and the amount by which they are wrong "
-                "is unknown --",
-                "** it is bounded below by the late gain, not by it. Raise "
-                "--steps until",
-                "** the minima stop moving, and add seeds: an independent "
-                "trajectory finds",
-                "** a different basin, where a longer one may only sit in the "
-                "same well.",
-            )))
-    return "\n".join(lines)
-
-
 def format_search_convergence(params, pooled):
     """Do the independent packings at each n agree on the minimum?
 
@@ -1211,11 +1093,11 @@ def format_search_convergence(params, pooled):
     single draw, and the honest response is more packings.
 
     That is also why this is not an error bar. The spread of the per-packing
-    minima is printed because it is worth seeing, but under stratified packing
-    the packings are *designed* to differ, so their scatter measures the
-    arrangement lottery as much as the sampling noise. A sweep with one
-    packing has none of this evidence at all and must say so, rather than
-    leaving the absence to read as precision.
+    minima is printed because it is worth seeing, but independent packings are
+    independent searches rather than repeat measurements of one system, so
+    their scatter measures the arrangement lottery as much as the sampling
+    noise. A sweep with one packing has none of this evidence at all and must
+    say so, rather than leaving the absence to read as precision.
     """
     if not pooled:
         return None
@@ -1279,18 +1161,6 @@ def format_search_convergence(params, pooled):
                 "longer trajectory",
                 "** mostly sits in the basin it was packed into.",
             )))
-
-    if params["pack_stratified"]:
-        lines.append(
-            "\n  Packing was stratified across the packings at each n (see "
-            "the params block),\n  so they are not repeat draws from one "
-            "distribution: they are deliberately\n  different solvent "
-            "arrangements, spread and clustered. That is what makes "
-            "their\n  agreement meaningful -- searches that started from "
-            "different arrangements and\n  converged on one minimum -- and it "
-            "is why disagreement at small n reads as an\n  arrangement "
-            "lottery not yet won often enough. The fix for that is more "
-            "packings,\n  not more steps.")
     return "\n".join(lines)
 
 
@@ -1337,8 +1207,7 @@ def format_report(params, summaries):
     parts.append(format_seed_detail(summaries, pooled))
     parts.append(format_basin_occupancy(params, summaries, pooled))
 
-    for section in (format_sampling_convergence(summaries),
-                    format_search_convergence(params, pooled),
+    for section in (format_search_convergence(params, pooled),
                     format_wall_diagnostic(summaries)):
         if section:
             parts.append(section)

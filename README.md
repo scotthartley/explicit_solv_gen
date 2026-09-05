@@ -66,9 +66,8 @@ condensed into a bulk-like site — not to zero.
 Both are taken over the **pooled** candidates of every packing at that `n`,
 because the packings are independent *searches* and not replicas: averaging
 them penalizes searching more widely, and it dilutes the one packing that
-found the geometry the stratification below exists to buy. So the reported
-number is the pooled minimum, and `found by` says how many packings reached
-it. What that gives up is that a minimum is a running minimum over *search
+found a geometry nobody else did. So the reported number is the pooled
+minimum, and `found by` says how many packings reached it. What that gives up is that a minimum is a running minimum over *search
 effort*, which is not constant across `n` — the `pool` column says how far the
 search went at each, so some of `dE_int`'s slope is search depth rather than
 chemistry. The answer is to show the effort, not to average it away.
@@ -113,12 +112,12 @@ wall volume (`wall_slack`) sets the population of a dissociated molecule and
 moves an occupancy number, while a dissolved molecule still contributes ~0 to
 `E_int` regardless of box size — no thermal-average `E_int` is built from any
 of this. Read it with its caveats in mind: sampling is gas-phase (see the
-Hamiltonians section below); pooling across stratified packings is a mixture
-with hand-picked weights, so agreement within one basin (`n_seeds_hit`) is the
-only unbiased evidence; the 1 meV dedupe merges isoenergetic distinct minima
-into one count; frames are correlated, so the reported spacing has to be
-compared against a decorrelation time measured on the system in question; and
-these are inherent-structure populations with no vibrational entropy or ZPE.
+Hamiltonians section below); the 1 meV dedupe merges isoenergetic distinct
+minima into one count; frames are correlated, so the reported spacing has to
+be compared against a decorrelation time measured on the system in question;
+and these are inherent-structure populations with no vibrational entropy or
+ZPE. They are listed in full under
+[Reading `report.txt`](#reading-reporttxt).
 A docked candidate has no sampling frame and so no occupancy — its fields are
 `null`, a real absence rather than a population of one.
 
@@ -294,34 +293,35 @@ the number of `*` at an `n` equals its `found by` numerator.
 
 **Basin occupancy** is how many scored frames quenched into each basin,
 summed across the packings at each `n`; `seeds` is how many of them visited
-it. Six caveats come with reading it, and none is decorative:
+it. Five caveats come with reading it, and none is decorative:
 
 1. **Sampling is gas-phase** (`Condition.sample_in_continuum = False`), so
    occupancy describes the gas-phase search, not solvation in the scoring
    continuum. Measured on methanol + 4 water: 3.84–4.39 H-bonds in gas
    against 0.00–0.30 in ALPB(water), no overlap between the two populations.
-2. **Pooling across stratified packings is a mixture with hand-picked
-   weights** (`c = (seed + 0.5) / n_seeds` is chosen by design, not drawn at
-   random), so only *within* one packing is a frame count an unbiased — if
-   correlated — sample. The `seeds` column is the same idiom as `found by`.
-3. **The 1 meV energy dedupe merges isoenergetic distinct minima**, inflating
+2. **The 1 meV energy dedupe merges isoenergetic distinct minima**, inflating
    one count. Tolerable for ranking, sharper for counting.
-4. **Frames are correlated.** Compare the reported scored-frame spacing
+3. **Frames are correlated.** Compare the reported scored-frame spacing
    against a decorrelation time measured on *your* system — 0.55 ps for
    pyrazine + 3 CHCl₃, which is a property of the system rather than of the
    integrator and is not fabricated for you.
-5. **These are inherent-structure populations, not basin free energies:** no
+4. **These are inherent-structure populations, not basin free energies:** no
    vibrational entropy, no ZPE.
-6. **The wall volume (`wall_slack`) sets any occupancy number** and leaves
+5. **The wall volume (`wall_slack`) sets any occupancy number** and leaves
    `E_int(min)` untouched, since a dissolved molecule contributes ≈ 0 to
    `E_int` regardless of box size. That is why occupancy is a diagnostic here
    and never an energy.
 
+The packings pooled here are independent draws, which is what makes a pooled
+frame count a sample rather than a mixture with hand-picked weights. It was
+the latter while the packings were stratified over a clustering parameter
+chosen by design — one of the reasons that stratification is gone.
+
 **Search convergence** prints the per-packing spread beside `found by`. It is
 printed to be seen, not used as an error bar: independent packings are
-independent searches rather than repeat measurements, and under stratification
-they are *designed* to differ, so their scatter measures the arrangement
-lottery as much as the sampling noise. A difference you go on to take between
+independent searches rather than repeat measurements of one system, so their
+scatter measures the arrangement lottery as much as the sampling noise. A
+difference you go on to take between
 two sweeps has to be credible against the widest spread in either, and a
 double difference accumulates four of them.
 
@@ -373,48 +373,38 @@ the `cover` column uses. See `CLAUDE.md`'s `docking.py` section for the full
 measurements (staged screen-then-refine cost, the placement-count confidence
 argument, per-parent detail).
 
-## Packing: the seeds are stratified, not repeated
+## Packing: the seeds are independent draws
 
 At small `n` the packing *is* the answer. A chloroform hydrogen-bonded to a
 pyrazine nitrogen at ~5.7 kcal/mol will not detach, migrate around the ring
 and rebind at the far nitrogen within 10 ps of gas-phase Langevin — so if the
 packing did not put one molecule at each nitrogen, the trajectory will not
-find that geometry. And packmol's unconstrained draw is badly biased toward
-putting them together: measured on pyrazine + 2 CHCl3 over 24 packings, 83%
-came out same-face and only 4% opposed.
+find that geometry. And packmol's draw is badly biased toward putting them
+together: measured on pyrazine + 2 CHCl3 over 24 packings, 83% came out
+same-face and only 4% opposed.
 
-So the seeds are not repeats. Each one constrains every solvent molecule to
-its own hemisphere of the shell, and the hemispheres are spread across the
-seeds — maximally separated for the first, coincident for the last, rotated
-by a random rotation so no orientation relative to the solute is assumed. A
-fixed budget of packings then covers opposite-faces / perpendicular /
-same-face **by design** rather than by chance: opposed arrangements go from 4%
-to 29%, which over the four packings `n = 2` gets is a ~70% chance of at least
-one, against ~15% before.
+The seeds used to be **stratified** to work around that: each one constrained
+every solvent molecule to its own hemisphere of the shell, with the
+hemispheres maximally separated at one end of the range and coincident at the
+other, so that a fixed budget of packings covered opposite-faces /
+perpendicular / same-face by design rather than by chance. It worked —
+opposed arrangements went from 4% to 29% — but it existed to make the MD
+sweep better at *finding the lowest minimum*, and
+[docking](#docking-a-constructive-alternative) now owns that job and finds
+that basin by construction.
 
-This is *not* an assumption that the solvent spreads out. The clustered end of
-the range is exactly how "both molecules on one face, sharing a Cl···Cl
-contact" gets sampled at all — a real arrangement, and the same solvent–solvent
-cohesion that gives `E_int(n)` its nonzero slope. The mechanism also fades on
-its own as `n` grows: two hemispheres are disjoint, four tetrahedral ones
-overlap so heavily a molecule is barely confined, and by `n ≈ 8` the
-constraint says nothing — which is the range over which random packing stops
-being the bottleneck anyway.
+For the two jobs the sweep keeps, stratification was working against it. A
+non-greedy diversity check wants an independently drawn packing, not one
+drawn at a hand-picked clustering value; and pooling frame counts across
+packings drawn that way made [basin occupancy](#basin-occupancy) a mixture
+with hand-picked weights rather than a sample of anything. So the packings are
+independent draws again, and `--seeds` is the number of them at each `n`.
+`n = 0` gets one, since every packing of a bare solute is the same packing.
 
-`--seeds` is therefore the **average** number of packings per `n`, not the
-count at each. The total, `--seeds × len(--n)`, is spread by monolayer
-coverage: `n = 0` has no solvent to arrange and takes one, and the rest are
-weighted toward small nonzero `n` where the room to arrange is largest, with a
-floor of two so every row keeps something to agree with it. With
-`--seeds 3 --n 0 1 2 3` and a 13-molecule shell that is 1 / 4 / 4 / 3 rather
-than 3 / 3 / 3 / 3 — the same
-compute, better spent. `--seeds 1` falls back to one everywhere, so a
-single-packing sweep still reports no agreement and says so.
+## The three diagnostics
 
-## The four diagnostics
-
-Numbers from this kind of workflow are easy to over-read. Four things are
-reported alongside them, and all four can turn a plausible-looking table into
+Numbers from this kind of workflow are easy to over-read. Three things are
+reported alongside them, and all three can turn a plausible-looking table into
 an obviously unfinished one.
 
 **Wall activity.** The confining wall is meant to be a safety net. If it is
@@ -426,12 +416,6 @@ continuum was making the shell dissociate. `run.log`'s footer warns above 20%,
 and the fraction travels into `report.txt` and `scored.log` beside the numbers
 it qualifies.
 
-**Sampling convergence.** `E_int(min)` is a running minimum over candidates,
-so it can only fall — which makes *when it last fell* a convergence test. The
-report gives, per run, how far into the trajectory the best candidate was
-found and what the last 25% took off the minimum. A minimum found on the final
-frame is an upper bound, not a converged value.
-
 **Search convergence.** Independent packings are independent *searches*, so
 the useful question about a set of them is not how far apart their answers
 scattered but how many of them arrived at the same minimum. The report gives,
@@ -439,18 +423,24 @@ per `n`, the pooled minimum, `found by`, the spread of the per-packing minima
 and the pool size. A minimum several packings reached is one the search finds
 reliably; a `1/7` rests entirely on one draw of the arrangement lottery, and
 the report warns about it — the fix there is more packings, not more steps.
-The spread is printed to be seen rather than propagated: since the packings
-are stratified, they are *designed* to differ, so their scatter measures the
-lottery as much as the sampling noise. A single-packing sweep has none of this
-evidence and says so in place of the table, rather than leaving the absence to
-read as precision.
+The spread is printed to be seen rather than propagated: independent packings
+are searches rather than repeat measurements of one system, so their scatter
+measures the lottery as much as the sampling noise. A single-packing sweep has
+none of this evidence and says so in place of the table, rather than leaving
+the absence to read as precision.
 
-**Basin occupancy.** The first three diagnostics all judge the *search* — did
-it converge, did it agree with itself. This one is different: it says how the
+**Basin occupancy.** The first two diagnostics judge the *search* — did it
+converge, did it agree with itself. This one is different: it says how the
 trajectory's time was actually spent, frame-weighted and pooled across
 packings, rather than how many distinct kinds of basin the search happened to
 turn up. See [Basin occupancy](#basin-occupancy) above for what it is, why it
 exists now and did not before, and the caveats that come with reading it.
+
+There used to be a fourth, **sampling convergence** — per run, how far into
+the trajectory the best candidate was found, and what the last 25% took off
+the minimum. It measured the MD sweep's performance at minimum-finding, which
+is the job docking took, so it is gone with the stratification that served the
+same job.
 
 ## Choosing `n`
 
@@ -519,11 +509,10 @@ behind every default and a list of gotchas worth reading before changing one.
   that imports numpy. The OpenMP runtime reads `OMP_NUM_THREADS` once, when it
   loads; setting it afterwards is silently ignored, and getting this wrong
   cost 2.5× on in-process scoring.
-- Stratified packing changes the packing for **every `n ≥ 2` run**, so sweeps
-  from either side of it are not comparable. The `version` (`0.2.0`) and
-  `pack_stratified` fields in the params block are what distinguish them, and
-  `metadata.json` records the `pack_clustering` and `pack_directions` each run
-  was drawn at.
+- Packing changed at `0.2.0` (stratified over a clustering parameter) and
+  again at `0.8.0` (back to independent draws), so sweeps from either side of
+  either change are not comparable at `n ≥ 2`. The `version` field in the
+  params block is what distinguishes them.
 - Packmol's `tolerance` (default 2.0 Å) forbids hydrogen-bond contacts at
   *t* = 0, since H···O/N sit at 1.8–2.0 Å. Harmless — gas-phase MD forms them
   within a few ps — but a packed structure never starts bonded.
