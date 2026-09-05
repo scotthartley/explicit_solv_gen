@@ -104,11 +104,11 @@ from report import (
     EV_TO_KCAL,
     VERSION,
     dedupe_energies,
-    dock_row_from_summary,
-    format_dock_report,
+    format_report,
     library_versions,
+    pool_by_n,
     timestamp,
-    write_dock_best_geometries,
+    write_best_geometries,
 )
 from shell_capacity import monolayer_capacity
 from solvate_md import (
@@ -467,10 +467,9 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
                          solute_path, solvent_path, all_n_min_kcal)
     (out_root / "dock.json").write_text(
         json.dumps({"params": params, "runs": summaries}, indent=2))
-    dock_rows = [dock_row_from_summary(s) for s in summaries]
     (out_root / "dock_report.txt").write_text(
-        format_dock_report(params, dock_rows))
-    write_dock_best_geometries(out_root, dock_rows)
+        format_report(params, summaries))
+    write_best_geometries(out_root, pool_by_n(summaries), "dock")
     return summaries
 
 

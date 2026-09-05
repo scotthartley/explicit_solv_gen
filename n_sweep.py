@@ -142,8 +142,8 @@ from pathlib import Path
 from ase.io import read
 
 from ensemble import Scoring, score_run_grid
-from report import (VERSION, format_sweep_report, library_versions,
-                    pool_by_n, timestamp, write_best_geometries)
+from report import (VERSION, format_report, library_versions, pool_by_n,
+                    timestamp, write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
@@ -243,9 +243,8 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
                           capacity, [seeds_per_n[n] for n in n_values])
     (out_root / "sweep.json").write_text(
         json.dumps({"params": params, "runs": summaries}, indent=2))
-    (out_root / "report.txt").write_text(
-        format_sweep_report(params, summaries))
-    write_best_geometries(out_root, pool_by_n(summaries))
+    (out_root / "report.txt").write_text(format_report(params, summaries))
+    write_best_geometries(out_root, pool_by_n(summaries), "sweep")
     return summaries
 
 
