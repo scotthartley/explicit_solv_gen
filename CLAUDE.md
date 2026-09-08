@@ -59,7 +59,7 @@ with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
 | `n_sweep.py` | `E_int(n)` sweep for **one solute in one solvent**: an independently drawn diversity check, and the only source of basin occupancy. |
 | `docking.py` | a second, constructive generator: random placement + BFGS instead of thermal sampling. Standalone, either/or with `n_sweep.py`; see below. |
 | `dft_export.py` | exports deduped, near-minimum candidates (from either generator) plus a manifest for a downstream DFT single point or reopt. |
-| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`, `dedupe_groups`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
+| `report.py` | all text rendering, plus the ASE-free numeric helpers (`EV_TO_KCAL`, `boltzmann_weights`, `ensemble_energy`, `dedupe_energies`, `dedupe_groups`, `basin_visits`) that `ensemble` and `docking` re-export. No ASE/tblite at module scope. |
 | `shell_capacity.py` | monolayer capacity, for choosing `n_solvent`. |
 
 Every sweep records a **params block** -- the whole `Condition` (via
@@ -94,8 +94,9 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `ref_solute.xyz`, `ref_solvent.xyz` | `ensemble.assemble` | the relaxed reference geometries `E_int` for this run was measured against (`reference_energies` keeps only energies otherwise). Written into every run directory that shares one reference, redundant but cheap. `dft_export.export_dft` reads either copy to reconstruct `E(solute) + n E(solvent)` at the DFT level |
-| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a per-packing detail table under it (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the two diagnostics below. Each table ends with a one-line column key and points at README's "Reading report.txt", which is where the explanatory prose lives -- once, rather than in a docstring, in every rendered report, and here |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a Modal geometry at each n section naming the file behind the basin the shell actually spent the most time in, a per-packing detail table (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the two diagnostics below. Each table ends with a one-line column key and points at README's "Reading report.txt", which is where the explanatory prose lives -- once, rather than in a docstring, in every rendered report, and here |
 | `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
+| `modal_n<N>.xyz` | `n_sweep.run_sweep` | one file per n (sweep only, never docking) -- the modal basin's own geometry, read out of `<run>/scored_candidates.xyz` at `candidate_index`, with `sweep_n=` / `sweep_E_int_kcal=` (the basin's own, not the pooled minimum) / `sweep_frame_share=` / `sweep_n_frames=` / `sweep_visits=` / `sweep_packing=` appended to its comment line. Written unconditionally, even when the modal basin *is* the minimum -- the report says when the two coincide |
 
 `run.log` is flushed on every line, so a long run can be followed with
 `tail -f` instead of going silent until it exits. **The footer surfaces the
@@ -225,14 +226,22 @@ generator, plus a manifest, for a downstream DFT single point or reopt:
 
 Reads either a sweep or a docking output directory -- both write one
 `scored.json` per run in the same shape, so this needs no branch on which
-generator produced them. Per n: pool every run's candidates, dedupe at the
-same 1 meV criterion `pool_by_n` uses, keep everything within `--window-kcal`
-(default 3.0, ~5 kT) of that n's minimum; `--max-per-n` is a safety cap
-applied after the window. Writes `manifest.json`,
+generator produced them. Per n: pool every run's candidates via
+`dedupe_groups` (the same 1 meV criterion `pool_by_n` uses, kept as groups
+rather than representatives so a pooled basin's `n_frames` can be summed),
+keep everything within `--window-kcal` (default 3.0, ~5 kT) of that n's
+minimum, and union in any basin whose pooled `frame_share` is at or above
+`--occupancy-floor` (default 0.10) even outside the window; `--max-per-n` is a
+safety cap applied last, with occupancy-selected structures ordered ahead of
+window-only ones so it never silently evicts one. Writes `manifest.json`,
 `references/{solute,solvent}.xyz` (the relaxed geometries every exported
-`E_int` was measured against), and `n<N>/cand<i>.xyz`. Verified end to end
-against the manifest and against both generators sharing one reference zero
--- see DESIGN.md's `docking.py` section for the numbers.
+`E_int` was measured against), and `n<N>/cand<i>.xyz`. Each manifest structure
+now also carries `n_frames`, `frame_share`, `n_visits`, `n_seeds_hit` and
+`selected_by` (`"window"` / `"occupancy"` / `"both"`) -- `null` /
+`"window"` unconditionally for a docked export, which has no occupancy at
+all. Verified end to end against the manifest and against both generators
+sharing one reference zero -- see DESIGN.md's `docking.py` section for the
+numbers.
 
 Two DFT caveats worth knowing rather than rediscovering: GFN2 over-binds the
 C-H...N contact this pipeline studies (1.91 A against a literature 2.2-2.5),

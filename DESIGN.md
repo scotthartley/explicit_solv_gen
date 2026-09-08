@@ -188,14 +188,18 @@ raise it and an occupancy number moves -- while leaving `E_int(min)`
 completely untouched, since a dissolved molecule contributes ~0 to `E_int`
 regardless of box size. So occupancy is reported only as a diagnostic, never
 folded into an energy: no thermal-average `E_int` is built from it. Reading
-the section also means holding five caveats, which live in README's "Reading
+the section also means holding six caveats, which live in README's "Reading
 report.txt" rather than being restated in every rendered report: sampling is
 gas-phase (methanol + 4 water: 3.84-4.39 H-bonds in gas vs 0.00-0.30 in
 ALPB(water), no overlap); the 1 meV dedupe merges isoenergetic distinct
-minima into one count; frames are correlated, so `scored_frame_spacing_fs`
-has to be read against a decorrelation time measured on the system in
-question, not assumed; these are inherent-structure populations, with no
-vibrational entropy or ZPE; and the wall-volume point above.
+minima into one count (now flagged per basin as `contacts_split`, see below,
+rather than only stated here in general); frames are correlated, so
+`scored_frame_spacing_fs` has to be read against a decorrelation time
+measured on the system in question, not assumed; these are inherent-structure
+populations, with no vibrational entropy or ZPE; the wall-volume point above;
+and the modal basin is the same inherent-structure population as the rest,
+restated because it is now a named geometry rather than only a row in a
+table.
 
 There were six until 0.8.0. The sixth was that pooling across *stratified*
 packings is a mixture with hand-picked weights rather than a sample, since
@@ -210,6 +214,50 @@ already uses there. Docking's own dedupe groups constructed *placements*, not
 thermal samples; counting them would look like a frame-weighted population
 and would not be one, which is exactly what `found_by` already reports
 instead.
+
+**The modal basin is a deliverable now, not just a row in a table.** Through
+0.9.0, occupancy stopped at a frame count: the top-5-by-share table said which
+basin the shell visited most, but naming a geometry meant grepping every
+`scored.json` in the sweep for a matching energy by hand -- the minimum got
+`best.xyz`, a Best geometry table row, and `best_n<N>.xyz`; the mode got
+nothing of the sort. That asymmetry did not match what the two numbers are
+for: `E_int(min)` is the reported energy, but "which geometry did the
+trajectory actually spend its time in" is a real question about the system
+and deserves the same footing -- a file, not just a statistic. 0.10.0 gives
+every pooled `basins` entry an identity (`run`, `seed`, `candidate_index` --
+which doubles as the frame index into that run's `scored_candidates.xyz`,
+guaranteed equal by `ensemble.assemble`) and writes the pooled `frame_share`
+maximum out as `modal_n<N>.xyz`, alongside `best_n<N>.xyz`, unconditionally
+for every n of a sweep.
+
+**`n_visits` is the right companion to `frame_share`, not `mean_dwell` alone.**
+A frame count already says how much of the trajectory a basin held; what it
+cannot say on its own is whether that time was one long loiter or several
+independent returns -- and the difference matters, because a proposal move
+that keeps re-entering a basin from elsewhere is stronger evidence for that
+basin than one that visited it once and got stuck. `basin_visits` answers this
+for free: it partitions a basin's scored-frame dump indices into maximal runs
+*consecutive in selection order* (not in raw dump index -- `select_frames`
+subsamples by `np.linspace`, so scored dumps are not 1 apart in general), and
+`n_visits` is how many such runs there are. `mean_dwell = n_frames / n_visits`
+is printed beside it rather than instead of it, because the two together
+distinguish "12 frames, 1 visit" (one loiter, weak evidence) from "12 frames,
+6 visits" (six independent returns, much stronger) -- a distinction a single
+number in either direction erases.
+
+**`contacts_split` turns a global caveat into a per-basin flag, for free.**
+README's "Reading report.txt" has always admitted that the 1 meV energy
+dedupe can merge isoenergetic distinct minima, "tolerable for ranking,
+sharper for counting" -- a caveat that bites harder here, because occupancy's
+whole job is counting. Reopening RMSD dedupe to fix it was rejected once
+already (see "Considered and not built") and stays rejected; the case for it
+has not changed. But the data to *detect* a merge, rather than prevent it,
+was already on every candidate: if a basin's members disagree on
+`n_contacts`, the 1 meV test provably fused two structures with different
+contact patterns into one count, and `pool_by_n` now flags it as
+`contacts_split`, rendered `!` in Basin occupancy with a one-line count under
+the section. Costs nothing, changes no number, and replaces "this can happen,
+somewhere" with "it happened here, N times."
 
 Every term has to be relaxed *to convergence*, not merely to a stationary-ish
 geometry. The scoring optimizer therefore runs to `fmax = 0.002` eV/A
@@ -570,6 +618,18 @@ than left scattered where they came up:
   ("Packing: independent draws, and why they were once stratified") rather
   than here, since it was built and then removed rather than merely
   considered.
+- **Ranking the modal basin by `n_seeds_hit` instead of pooled `frame_share`**
+  -- i.e. by how many independent packings visited it at all, the same
+  denominator `found_by` uses, rather than by how much of the pooled
+  trajectory time it holds. Not built: `n_seeds_hit` answers "how many
+  searches stumbled into this basin," which is corroboration evidence, not
+  occupancy -- it is already what `found_by` and Search convergence report,
+  and a seed that spends 90% of its 10 ps in one basin should outrank three
+  seeds that each glance off three different ones for a few frames apiece.
+  `frame_share` is a property of the trajectory; `n_seeds_hit` a property of
+  the search; conflating them would double another job into "which basin is
+  modal." `n_seeds_hit` stays the tie-break (then energy), for the cases
+  `frame_share` alone cannot separate.
 
 ## State
 

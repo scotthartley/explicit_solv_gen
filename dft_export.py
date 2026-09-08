@@ -11,7 +11,17 @@ n's minimum. A window rather than a fixed count, so the exported set adapts to
 the system -- 3 kcal/mol is ~5 kT and comfortably spans both motifs measured
 on pyrazine + 2 chloroform (the both-nitrogens minimum and the pooled MD
 minimum are 1.56 kcal/mol apart), which is the concrete test that it is not
-too tight. `max_per_n` is a safety cap only, applied after the window.
+too tight.
+
+A basin whose pooled frame share is at or above `occupancy_floor` (default
+0.10) is unioned in as well, even outside the window -- a structure the shell
+spent a tenth of its scored frames in is not a rare outlier just because it
+sits a few kcal/mol above the minimum, and an energy-only window would drop it
+from the deliverable silently. `--occupancy-floor 1.1` disables this (no basin
+ever reaches 110% share), which is the regression check that the window-only
+behaviour is unchanged. `max_per_n` is a safety cap applied last -- window-only
+picks are truncated before any occupancy pick is, so a floor-selected
+structure is never silently evicted by the cap.
 
     python -m dft_export pyrazine_chcl3/ --out pyrazine_chcl3/dft_export
     python -m dft_export pyrazine_dock/ --out pyrazine_dock/dft_export
@@ -37,7 +47,8 @@ from pathlib import Path
 
 from ase.io import read, write
 
-from report import DEDUPE_TOL_EV, EV_TO_KCAL, boltzmann_weights, dedupe_energies
+from report import (DEDUPE_TOL_EV, EV_TO_KCAL, basin_visits,
+                    boltzmann_weights, dedupe_groups)
 
 
 def _iter_run_dirs(root):
@@ -56,8 +67,10 @@ def _iter_run_dirs(root):
             yield child
 
 
-def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
-    """Export deduped, near-minimum candidates plus a reconstructable manifest.
+def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None,
+               occupancy_floor=0.10):
+    """Export deduped, near-minimum (or high-occupancy) candidates plus a
+    reconstructable manifest.
 
     Writes `<out_dir>/manifest.json`, `<out_dir>/references/{solute,solvent}.xyz`
     (the relaxed references every exported `E_int` was measured against), and
@@ -111,6 +124,7 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
         "e_solvent_ref_eV": e_solvent_ref,
         "window_kcal": window_kcal,
         "max_per_n": max_per_n,
+        "occupancy_floor": occupancy_floor,
         "structures": [],
     }
 
@@ -134,31 +148,85 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
                   for idx, c in enumerate(summary["candidates"])]
         if not tagged:
             continue
-        keep_idx = dedupe_energies([c["energy_eV"] for _, _, _, c in tagged],
-                                   DEDUPE_TOL_EV)
-        deduped = [tagged[i] for i in keep_idx]
+        # Groups, not just representatives, so a basin's pooled `n_frames`
+        # can be summed across every run that contributed a candidate to it
+        # -- same tolerance, same representatives (`group[0]`, ascending
+        # energy), same ordering `dedupe_energies` used to give, just without
+        # discarding the members.
+        basin_groups = dedupe_groups([c["energy_eV"] for _, _, _, c in tagged],
+                                     DEDUPE_TOL_EV)
+        deduped = [tagged[g[0]] for g in basin_groups]
         weights = boltzmann_weights([c["energy_eV"] for _, _, _, c in deduped],
                                     deduped[0][1]["temperature_K"])
 
+        # Occupancy per basin -- the same computation `report.pool_by_n` does
+        # for its own `basins` list, kept in step with it by using the same
+        # `basin_visits` helper. `None` throughout for a docked chain, whose
+        # candidates carry no frame counts at all (constructed, not visited).
+        counted = all(c["n_frames"] is not None for _, _, _, c in tagged)
+        n_frames_pooled = (sum(c["n_frames"] for _, _, _, c in tagged)
+                           if counted else None)
+        occupancy = []
+        for g in basin_groups:
+            members = [tagged[i] for i in g]
+            if not counted:
+                occupancy.append({"n_frames": None, "frame_share": None,
+                                  "n_visits": None, "n_seeds_hit": None})
+                continue
+            frames = sum(c["n_frames"] for _, _, _, c in members)
+            by_summary = {}
+            for _, s, _, c in members:
+                by_summary.setdefault(id(s), (s, []))[1].extend(c["frames"])
+            n_visits = sum(basin_visits(s, fr) for s, fr in by_summary.values())
+            occupancy.append({
+                "n_frames": frames,
+                "frame_share": (frames / n_frames_pooled
+                                if n_frames_pooled else None),
+                "n_visits": n_visits,
+                "n_seeds_hit": len({s["seed"] for _, s, _, _ in members}),
+            })
+
         e_min = min(c["interaction_eV"] for _, _, _, c in deduped)
         window_eV = window_kcal / EV_TO_KCAL
-        selected = [(t, w) for t, w in zip(deduped, weights)
-                    if t[3]["interaction_eV"] - e_min <= window_eV]
+        in_window = {i for i, (_, _, _, c) in enumerate(deduped)
+                    if c["interaction_eV"] - e_min <= window_eV}
+        in_occupancy = {i for i, occ in enumerate(occupancy)
+                        if occ["frame_share"] is not None
+                        and occ["frame_share"] >= occupancy_floor}
+
+        # Occupancy picks ordered ahead of window-only picks, each group
+        # sorted by energy within itself, so `max_per_n` truncates
+        # window-only structures first and never silently evicts one that
+        # was selected by the occupancy floor.
+        occ_first = sorted(in_occupancy,
+                           key=lambda i: deduped[i][3]["interaction_eV"])
+        window_only = sorted(in_window - in_occupancy,
+                             key=lambda i: deduped[i][3]["interaction_eV"])
+        ordered = occ_first + window_only
         if max_per_n is not None:
-            selected = selected[:max_per_n]
+            ordered = ordered[:max_per_n]
 
         n_dir = out_dir / f"n{n}"
         n_dir.mkdir(parents=True, exist_ok=True)
-        for i, ((run_dir, summary, idx, c), weight) in enumerate(selected):
+        for out_i, i in enumerate(ordered):
+            run_dir, summary, idx, c = deduped[i]
+            weight = weights[i]
+            occ = occupancy[i]
             frames = frames_of(run_dir)
             if idx >= len(frames):
                 raise ValueError(
                     f"{run_dir}: scored_candidates.xyz has {len(frames)} "
                     f"frames but candidate {idx} was requested -- the file "
                     "and scored.json have drifted out of step.")
-            out_path = n_dir / f"cand{i:02d}.xyz"
+            out_path = n_dir / f"cand{out_i:02d}.xyz"
             write(out_path, frames[idx])
             pack_mode = summary["pack_mode"]
+            if pack_mode == "md":
+                selected_by = ("both" if i in in_window and i in in_occupancy
+                              else "occupancy" if i in in_occupancy
+                              else "window")
+            else:
+                selected_by = "window"
             manifest["structures"].append({
                 "n": n,
                 "path": str(out_path.relative_to(out_dir)),
@@ -168,6 +236,11 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None):
                 "source_run": str(run_dir),
                 "pack_mode": pack_mode,
                 "frame": c.get("frame") if pack_mode == "md" else None,
+                "n_frames": occ["n_frames"],
+                "frame_share": occ["frame_share"],
+                "n_visits": occ["n_visits"],
+                "n_seeds_hit": occ["n_seeds_hit"],
+                "selected_by": selected_by,
             })
 
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -185,12 +258,20 @@ def main(argv=None):
                              "each n's minimum (default: %(default)s)")
     parser.add_argument("--max-per-n", type=int, default=None,
                         help="safety cap on structures exported per n, "
-                             "applied after the window (default: no cap)")
+                             "applied after the window -- occupancy-selected "
+                             "structures are ordered ahead of window-only "
+                             "ones, so this never silently evicts one "
+                             "(default: no cap)")
+    parser.add_argument("--occupancy-floor", type=float, default=0.10,
+                        help="also export any basin whose pooled frame "
+                             "share is at or above this, even outside the "
+                             "window. 1.1 disables it (default: %(default)s)")
     args = parser.parse_args(argv)
 
     out_dir = export_dft(args.run_or_sweep_dir, args.out,
                          window_kcal=args.window_kcal,
-                         max_per_n=args.max_per_n)
+                         max_per_n=args.max_per_n,
+                         occupancy_floor=args.occupancy_floor)
     print(out_dir / "manifest.json")
 
 

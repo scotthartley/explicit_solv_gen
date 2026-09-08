@@ -322,6 +322,10 @@ def main(argv=None):
     parser.add_argument("--export-dft", action="store_true",
                         help="also export deduped, near-minimum candidates "
                              "for DFT refinement to <out>/dft_export/")
+    parser.add_argument("--occupancy-floor", type=float, default=0.10,
+                        help="with --export-dft, also export any basin "
+                             "whose pooled frame share is at or above this, "
+                             "even outside the window (default: %(default)s)")
     args = parser.parse_args(argv)
 
     run_sweep(
@@ -346,7 +350,7 @@ def main(argv=None):
     if args.export_dft:
         from dft_export import export_dft
         out_dir = Path(args.out) / "dft_export"
-        export_dft(args.out, out_dir)
+        export_dft(args.out, out_dir, occupancy_floor=args.occupancy_floor)
         print(out_dir / "manifest.json")
 
 

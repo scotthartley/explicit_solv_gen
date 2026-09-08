@@ -124,6 +124,12 @@ ZPE. They are listed in full under
 A docked candidate has no sampling frame and so no occupancy — its fields are
 `null`, a real absence rather than a population of one.
 
+The basin with the largest pooled frame share — the **modal** basin, what the
+shell actually spent the most time in — is now a deliverable on the same
+footing the minimum already was: named in a *Modal geometry at each n*
+section and copied out as `modal_n<N>.xyz`, beside `best_n<N>.xyz`. See
+[Reading `report.txt`](#reading-reporttxt) for the columns.
+
 ## Install
 
 ```bash
@@ -194,15 +200,21 @@ Per run directory (`<label>_<solvent>_n<N>_seed<S>/`):
 
 Per sweep: `sweep.json` and `report.txt` — the params block, the `E_int(n)`
 table, a Best geometry at each n section naming the file behind each row, a
-Basin occupancy section (how many scored frames quenched into each basin,
-frame-weighted and pooled across packings — see
-[Basin occupancy](#basin-occupancy) above), and the diagnostics — plus one
-`best_n<N>.xyz` per n: the pooled-minimum
-packing's `best.xyz` at that n, copied out with `sweep_n=` /
-`sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One
-file per n, not one multi-frame file, because the atom count changes with
-n and a viewer that reads a multi-frame xyz as a trajectory — Avogadro, VMD,
-most others — shows only the first frame.
+Modal geometry at each n section naming the file behind the basin the shell
+actually spent the most time in, a Basin occupancy section (how many scored
+frames quenched into each basin, frame-weighted and pooled across packings —
+see [Basin occupancy](#basin-occupancy) above), and the diagnostics — plus one
+`best_n<N>.xyz` and one `modal_n<N>.xyz` per n: the pooled-minimum
+packing's `best.xyz`, and the modal basin's own geometry, copied out with
+`sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` (`modal_n<N>.xyz` also
+carries `sweep_frame_share=` / `sweep_n_frames=` / `sweep_visits=`) appended
+to its comment line. One file per n, not one multi-frame file, because the
+atom count changes with n and a viewer that reads a multi-frame xyz as a
+trajectory — Avogadro, VMD, most others — shows only the first frame.
+`modal_n<N>.xyz` is written even when the modal basin *is* the minimum, so
+the artefact set per n is predictable; the report says when the two coincide.
+Docking has no modal basin — random placements are constructed, not
+visited — so it writes no `modal_n<N>.xyz`.
 Rescoring in a second continuum writes `scored_<name>.json` / `.log` /
 `_candidates.xyz` rather than overwriting.
 
@@ -288,6 +300,17 @@ first frame's atom count and applies it to the rest, silently dropping every
 `n` after the first. A set of chemically distinct clusters is not a
 trajectory, and no single-file XYZ shape expresses that it isn't one.
 
+**Modal geometry at each n** (sweep only — docking has no analogue) names the
+file behind the basin the shell actually spent the most time in: the pooled
+`frame_share` maximum, ties broken by `n_seeds_hit` then by energy. `gap` is
+that basin's own `E_int` minus `E_int(min)` — `0.00` exactly when the modal
+basin *is* the pooled minimum. The geometry is `<run>/scored_candidates.xyz`
+frame `candidate_index`, the same locator Basin occupancy's `run:cand` column
+gives that row, and it is also copied out as `modal_n<N>.xyz` beside the
+report, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_frame_share=` /
+`sweep_n_frames=` / `sweep_visits=` / `sweep_packing=` on its comment line —
+written for every `n`, whether or not `gap` is zero.
+
 **Per-packing detail** is one row per packing, its own search alone. These do
 not average to the table above and are not meant to: the pooled minimum is
 the *lowest* of that column, not its mean. `best` marks a packing within
@@ -295,30 +318,65 @@ the *lowest* of that column, not its mean. `best` marks a packing within
 the number of `*` at an `n` equals its `found by` numerator.
 
 **Basin occupancy** is how many scored frames quenched into each basin,
-summed across the packings at each `n`; `seeds` is how many of them visited
-it. Five caveats come with reading it, and none is decorative:
+summed across the packings at each `n`. `seeds` is `k/n` — how many of that
+`n`'s packings visited it, of how many there were, the same idiom `found by`
+uses. `visits` (`report.basin_visits`) counts maximal runs of *consecutive
+scored frames* — separate returns to the basin, not raw dwell time — and
+`dwell` = `frames / visits`, the mean length of one such run: "12 frames, 1
+visit" is one long loiter, "12 frames, 6 visits" is six independent returns,
+and the two are very different evidence for the same frame count. `run:cand`
+locates the row's own geometry — `<run>/scored_candidates.xyz` frame `<cand>`
+(`candidate_index`) — so a basin's numbers and its structure are one lookup
+apart rather than a grep through every `scored.json` in the sweep. A leading
+flag column marks `+` for the pooled-minimum row (also the Best geometry row),
+`*` for the modal row (also the Modal geometry row), and `!` when a basin's
+members disagree on `n_contacts` — direct evidence caveat 2 below actually
+fired for that basin, not just that it could. A one-line count of `!` rows
+prints under the section when any fired. Six caveats come with reading it,
+and none is decorative:
 
 1. **Sampling is gas-phase** (`Condition.sample_in_continuum = False`), so
    occupancy describes the gas-phase search, not solvation in the scoring
    continuum. Measured on methanol + 4 water: 3.84–4.39 H-bonds in gas
    against 0.00–0.30 in ALPB(water), no overlap between the two populations.
 2. **The 1 meV energy dedupe merges isoenergetic distinct minima**, inflating
-   one count. Tolerable for ranking, sharper for counting.
+   one count. Tolerable for ranking, sharper for counting — and now flagged
+   per basin (`!`, above) rather than only mentioned here in general.
 3. **Frames are correlated.** Compare the reported scored-frame spacing
    against a decorrelation time measured on *your* system — 0.55 ps for
    pyrazine + 3 CHCl₃, which is a property of the system rather than of the
-   integrator and is not fabricated for you.
+   integrator and is not fabricated for you. `visits` is read against the
+   same decorrelation time: a basin whose frames are one run of `visits = 1`
+   spanning several scored-frame spacings is still one correlated episode,
+   not several independent ones.
 4. **These are inherent-structure populations, not basin free energies:** no
    vibrational entropy, no ZPE.
 5. **The wall volume (`wall_slack`) sets any occupancy number** and leaves
    `E_int(min)` untouched, since a dissolved molecule contributes ≈ 0 to
    `E_int` regardless of box size. That is why occupancy is a diagnostic here
    and never an energy.
+6. **The modal basin (`*`) is an inherent-structure population, not a
+   Boltzmann one** — the same caveat as 4, restated because it is now a named
+   geometry (`modal_n<N>.xyz`) rather than only a row in a table, which
+   invites treating it as more than a diagnostic.
 
 The packings pooled here are independent draws, which is what makes a pooled
 frame count a sample rather than a mixture with hand-picked weights. It was
 the latter while the packings were stratified over a clustering parameter
 chosen by design — one of the reasons that stratification is gone.
+
+Occupancy also reaches `dft_export.py` now. `--occupancy-floor` (default
+`0.10`) exports any basin whose pooled `frame_share` is at or above it, even
+outside `--window-kcal` — a basin holding a tenth of a run's scored frames is
+not a rare outlier just because it sits a few kcal/mol above the minimum, and
+an energy-only window used to drop it from the deliverable silently.
+`manifest.json` entries carry `n_frames` / `frame_share` / `n_visits` /
+`n_seeds_hit` and `selected_by` (`"window"`, `"occupancy"`, or `"both"`),
+`null` / `"window"` for a docked export, which has no occupancy at all.
+`--max-per-n` still caps the export, but occupancy-selected structures are
+ordered ahead of window-only ones so the cap never silently evicts one;
+`--occupancy-floor 1.1` disables the floor (no basin reaches 110% share) and
+reproduces the energy-window-only behaviour exactly.
 
 **Search convergence** prints the per-packing spread beside `found by`. It is
 printed to be seen, not used as an error bar: independent packings are

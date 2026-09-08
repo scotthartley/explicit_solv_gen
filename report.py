@@ -36,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -159,6 +159,39 @@ def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
     which candidates a representative absorbed.
     """
     return [group[0] for group in dedupe_groups(energies_eV, tol_eV)]
+
+
+def basin_visits(summary, member_frames):
+    """Maximal runs of consecutive *scored* frames -- revisits, not dwell.
+
+    `member_frames` is one run's own contribution to a basin -- a candidate's
+    `frames` list, dump indices into that run's trajectory. The run's full
+    scored-frame index list is the sorted union of every candidate's `frames`
+    in `summary`: `select_frames` subsamples a trajectory with `np.linspace`,
+    so consecutive scored dump indices are not 1 apart in general, and a
+    revisit means two scored frames adjacent in *selection order*, not in raw
+    dump index. `n_visits` is then how many maximal runs of consecutive
+    positions in that ordering `member_frames` forms -- one long loiter is one
+    visit no matter how many frames it covers; several separated blocks are
+    several genuine returns to the basin.
+
+    `None` when any candidate in `summary` carries `frames = None`, i.e. a
+    docked run: a constructed candidate has no sampling frame to place in an
+    ordering at all.
+    """
+    candidates = summary["candidates"]
+    if any(c["frames"] is None for c in candidates):
+        return None
+    order = {f: i for i, f in enumerate(sorted({f for c in candidates
+                                                for f in c["frames"]}))}
+    positions = sorted(order[f] for f in member_frames)
+    if not positions:
+        return 0
+    visits = 1
+    for prev, cur in zip(positions, positions[1:]):
+        if cur != prev + 1:
+            visits += 1
+    return visits
 
 
 def boltzmann_weights(energies_eV, temperature_K=298.0):
@@ -424,12 +457,18 @@ class RunLogger:
 # Scoring
 # --------------------------------------------------------------------------
 
-def _candidate_table(candidates, temperature_K):
+def _candidate_table(summary, temperature_K):
+    """One row per unique candidate. `n_frames` / `visits` are this run's own
+    occupancy -- how many scored frames quenched here, and how many separate
+    times (`basin_visits`) rather than one loiter -- which the aggregates in
+    the Result block below cannot show for a single candidate."""
+    candidates = summary["candidates"]
     weights = boltzmann_weights([c["energy_eV"] for c in candidates],
                                 temperature_K)
     lines = [f"{'frame':>7} {'E(cluster)/eV':>16} {'E_int/kcal':>12} "
              f"{'weight':>8} {'contacts':>9} {'min gap/A':>10} {'conv':>5} "
-             f"{'fmax':>7} {'gnorm':>9} {'steps':>6} {'E_wall/eV':>11}"]
+             f"{'fmax':>7} {'gnorm':>9} {'steps':>6} {'E_wall/eV':>11} "
+             f"{'frames':>6} {'visits':>6}"]
     for c, w in zip(candidates, weights):
         # NaN when there is no solvent to measure a gap to, i.e. at n = 0.
         gap = c["min_gap_A"]
@@ -446,12 +485,17 @@ def _candidate_table(candidates, temperature_K):
         # frame and so no wall energy to report -- a real absence, not a
         # zero.
         wall_s = _num(c["wall_energy_eV"], ".6f")
+        frames_s = _num(c["n_frames"], "d")
+        visits_s = _num(
+            None if c["frames"] is None else basin_visits(summary, c["frames"]),
+            "d")
         lines.append(
             f"{c['frame']:>7d} {c['energy_eV']:>16.6f} "
             f"{c['interaction_eV'] * EV_TO_KCAL:>12.2f} "
             f"{w:>8.3f} {c['n_contacts']:>9d} {gap_s:>10} "
             f"{'yes' if c['converged'] else 'NO':>5} {c['fmax']:>7.4f} "
-            f"{gnorm_s:>9} {steps_s:>6} {wall_s:>11}".rstrip())
+            f"{gnorm_s:>9} {steps_s:>6} {wall_s:>11} "
+            f"{frames_s:>6} {visits_s:>6}".rstrip())
     return "\n".join(lines)
 
 
@@ -532,7 +576,7 @@ def format_scored_log(summary, meta):
     if candidates:
         parts.append("Candidates (unique minima, lowest first)\n"
                      "----------------------------------------\n"
-                     + _candidate_table(candidates, T))
+                     + _candidate_table(summary, T))
 
     occ_contacts = summary["occupancy_mean_contacts"]
     occ_dissolved = summary["occupancy_dissolved_fraction"]
@@ -666,15 +710,37 @@ def pool_by_n(summaries):
     rather than old, so this raises rather than pooling them anyway.
 
     Each record also carries `basins` -- one entry per pooled distinct
-    minimum, richest first would defeat the point, so `format_basin_occupancy`
-    sorts by frame share -- and `occupancy_mean_contacts` /
-    `occupancy_dissolved_fraction`, the frame-weighted analogues of
-    `mean_contacts` / `dissolved_fraction` below. The two pairs answer
-    different questions and must not be confused: `mean_contacts` is a
-    property of the *search* (how many kinds of basin were found), the
-    `occupancy_*` pair a property of the *trajectory* (how much of it sat in
-    each). Quarantined from every energy in this record -- occupancy never
-    enters `e_int_min_kcal` or `e_int_ens_kcal`.
+    minimum, in ascending-energy order (so `basins[0]` is always the pooled
+    minimum -- `format_basin_occupancy` sorts a copy by frame share for
+    display) -- and `occupancy_mean_contacts` / `occupancy_dissolved_fraction`,
+    the frame-weighted analogues of `mean_contacts` / `dissolved_fraction`
+    below. The two pairs answer different questions and must not be confused:
+    `mean_contacts` is a property of the *search* (how many kinds of basin
+    were found), the `occupancy_*` pair a property of the *trajectory* (how
+    much of it sat in each). Quarantined from every energy in this record --
+    occupancy never enters `e_int_min_kcal` or `e_int_ens_kcal`.
+
+    Each basin carries its own identity, not just its statistics -- `run`,
+    `seed`, `candidate_index` (its index within that run's own
+    `summary["candidates"]`, and therefore its frame index into that run's
+    `scored_candidates.xyz`, guaranteed equal by `ensemble.assemble`), `frame`,
+    `min_gap_A` and `wall_energy_eV`, so a reader (or `write_best_geometries`)
+    can go straight to the geometry a basin's numbers describe instead of
+    grepping every `scored.json` in the sweep for a matching energy. `n_visits`
+    / `mean_dwell` (`basin_visits`, summed over every run that contributed to
+    the basin) separate "many genuine revisits" from "one long loiter" with
+    the same frame count; `n_seeds` is the same denominator `found_by` uses,
+    so `n_seeds_hit` / `n_seeds` prints like `found by`. `contacts_split` flags
+    when the 1 meV dedupe provably fused distinct minima -- its members
+    disagree on `n_contacts`, which cannot happen for one real basin. `None`
+    throughout the occupancy fields for a docked chain, the same as
+    `n_frames_pooled` above.
+
+    `pooled[n]["modal"]` names the basin the shell actually spent the most
+    time in -- the pooled `frame_share` maximum, ties broken by `n_seeds_hit`
+    then by energy -- on the same footing `best` already gives the minimum:
+    `run`, `seed`, `candidate_index`, `weight`, and the basin dict itself.
+    `None` for a docked chain, which visited nothing.
 
     Returns one record per n, sorted by n.
     """
@@ -696,11 +762,12 @@ def pool_by_n(summaries):
         # forming any group, so this ordering never changes which candidates
         # survive -- only which packing gets the credit when several tie.
         group = sorted(group, key=_row_order)
-        tagged = [(s, c) for s in group for c in s["candidates"]]
-        basin_groups = dedupe_groups([c["energy_eV"] for _, c in tagged])
+        tagged = [(s, idx, c) for s in group
+                  for idx, c in enumerate(s["candidates"])]
+        basin_groups = dedupe_groups([c["energy_eV"] for _, _, c in tagged])
         keep = [tagged[g[0]] for g in basin_groups]
-        interactions = [c["interaction_eV"] for _, c in keep]
-        absolutes = [c["energy_eV"] for _, c in keep]
+        interactions = [c["interaction_eV"] for _, _, c in keep]
+        absolutes = [c["energy_eV"] for _, _, c in keep]
         e_min = min(interactions)
         temperature = group[0]["temperature_K"]
         pack_mode = group[0]["pack_mode"]
@@ -713,7 +780,7 @@ def pool_by_n(summaries):
         # minimum -- it is the pooled minimum, and therefore its own
         # packing's minimum too: that packing's `best.xyz` is the geometry
         # behind `e_int_min_kcal` below.
-        weights = boltzmann_weights([c["energy_eV"] for _, c in keep],
+        weights = boltzmann_weights([c["energy_eV"] for _, _, c in keep],
                                     temperature)
 
         # Occupancy: sum `n_frames` -- the scored frames that quenched into
@@ -726,22 +793,45 @@ def pool_by_n(summaries):
         # `None` throughout for a docked chain, whose candidates carry no
         # frame counts because they were placed rather than visited -- see
         # `docking._assemble_dock_n`.
-        counted = all(c["n_frames"] is not None for _, c in tagged)
-        n_frames_pooled = (sum(c["n_frames"] for _, c in tagged)
+        counted = all(c["n_frames"] is not None for _, _, c in tagged)
+        n_frames_pooled = (sum(c["n_frames"] for _, _, c in tagged)
                            if counted else None)
         basins = []
-        for basin, (_, rep_c), weight in zip(basin_groups, keep, weights):
+        for basin, (s_rep, idx_rep, rep_c), weight in zip(basin_groups, keep,
+                                                           weights):
             members = [tagged[i] for i in basin]
-            frames = (sum(c["n_frames"] for _, c in members)
+            frames = (sum(c["n_frames"] for _, _, c in members)
                       if counted else None)
+            n_visits = mean_dwell = None
+            if counted:
+                by_summary = {}
+                for s, _, c in members:
+                    by_summary.setdefault(id(s), (s, []))[1].extend(c["frames"])
+                n_visits = sum(basin_visits(s, fr)
+                              for s, fr in by_summary.values())
+                mean_dwell = frames / n_visits if n_visits else None
             basins.append({
                 "e_int_kcal": rep_c["interaction_eV"] * EV_TO_KCAL,
+                "run": Path(s_rep["run_dir"]).name,
+                "seed": s_rep["seed"],
+                "candidate_index": idx_rep,
+                "frame": rep_c["frame"],
+                "min_gap_A": rep_c["min_gap_A"],
+                "wall_energy_eV": rep_c["wall_energy_eV"],
                 "n_frames": frames,
                 "frame_share": (frames / n_frames_pooled
                                 if n_frames_pooled else None),
-                "n_seeds_hit": len({s["seed"] for s, _ in members}),
+                "n_visits": n_visits,
+                "mean_dwell": mean_dwell,
+                "n_seeds_hit": len({s["seed"] for s, _, _ in members}),
+                "n_seeds": len(group),
                 "weight": float(weight),
                 "n_contacts": rep_c["n_contacts"],
+                # The 1 meV dedupe cannot tell two isoenergetic but distinct
+                # minima apart; members disagreeing on n_contacts is direct
+                # evidence it just fused two of them into one basin.
+                "contacts_split": len({c["n_contacts"]
+                                       for _, _, c in members}) > 1,
             })
 
         # What corroborates the reported minimum, and out of how many tries.
@@ -759,7 +849,19 @@ def pool_by_n(summaries):
                            if abs(m - e_min) <= DEDUPE_TOL_EV)
             n_searches = len(group)
 
-        s_best, c_best = keep[0]
+        s_best, _idx_best, c_best = keep[0]
+        # The pooled `frame_share` maximum -- ties broken by how many seeds
+        # hit it, then by energy -- on the same footing `best` gives the
+        # minimum. `None` for a docked chain: `basins` carries no occupancy
+        # to rank by, and a constructed geometry has nothing to have visited.
+        modal_basin = (max(basins, key=lambda b: (b["frame_share"],
+                                                   b["n_seeds_hit"],
+                                                   -b["e_int_kcal"]))
+                      if pack_mode != "dock" and basins else None)
+        modal = ({"run": modal_basin["run"], "seed": modal_basin["seed"],
+                 "candidate_index": modal_basin["candidate_index"],
+                 "weight": modal_basin["weight"], "basin": modal_basin}
+                if modal_basin is not None else None)
         pooled.append({
             "n_solvent": n,
             "pack_mode": pack_mode,
@@ -777,11 +879,12 @@ def pool_by_n(summaries):
             # Over the *distinct minima* -- a property of how many kinds of
             # basin the search turned up, not of how the trajectory's time
             # was spent. See `occupancy_*` below for the latter.
-            "mean_contacts": float(np.mean([c["n_contacts"] for _, c in keep])),
+            "mean_contacts": float(np.mean([c["n_contacts"]
+                                            for _, _, c in keep])),
             # At n = 0 there is no solvent to dissolve, and `assemble` calls
             # that 1.0 rather than dividing by zero.
             "dissolved_fraction": (
-                float(np.mean([c["n_contacts"] == 0 for _, c in keep]))
+                float(np.mean([c["n_contacts"] == 0 for _, _, c in keep]))
                 if n else 1.0),
             "n_frames_pooled": n_frames_pooled,
             "basins": basins,
@@ -804,6 +907,7 @@ def pool_by_n(summaries):
                      "seed": s_best["seed"],
                      "weight": float(weights[0]),
                      "candidate": c_best},
+            "modal": modal,
         })
     return pooled
 
@@ -973,18 +1077,28 @@ def format_seed_detail(summaries, pooled):
 _OCCUPANCY_TOP_N = 5
 
 
-def format_basin_occupancy(params, summaries, pooled):
+def format_basin_occupancy(params, summaries, pooled, top_n=_OCCUPANCY_TOP_N):
     """How the trajectory's time was actually spent, per n -- not just which
     distinct minima the search turned up.
 
     `pool_by_n` already summed `n_frames` -- scored frames that quenched into
     each basin -- across every packing at this n, into `pooled[n]["basins"]`.
-    This only formats it: the top 5 basins by frame share, an "other" row for
-    the rest, and a line contrasting `E_int(min)` against the frame-share-
-    weighted mean and the two contact statistics (over distinct minima versus
-    over frames) against each other. That contrast is the point of the
-    section -- a basin can be the reported minimum and still be a rare
+    This only formats it: the top `top_n` basins by frame share, an "other"
+    row for the rest, and a line contrasting `E_int(min)` against the
+    frame-share-weighted mean and the two contact statistics (over distinct
+    minima versus over frames) against each other. That contrast is the point
+    of the section -- a basin can be the reported minimum and still be a rare
     outlier the shell almost never visits.
+
+    `run:cand` locates the row's own geometry: `run` under the sweep's output
+    directory, `cand` its index into that run's `scored_candidates.xyz`
+    (`candidate_index`, guaranteed equal by `ensemble.assemble`). `+` marks
+    the pooled minimum's row (`basins[0]` by construction -- see
+    `pool_by_n`), `*` the modal row (`pooled[n]["modal"]`), and `!` a basin
+    whose members disagree on `n_contacts` -- direct evidence the 1 meV
+    dedupe fused two distinct minima into one count (README's "Reading
+    report.txt" caveat 2, now flagged per basin instead of only mentioned in
+    general).
 
     A table of frame counts invites being read as a Boltzmann population and
     is not one; the caveats that go with it are in the README, under Reading
@@ -996,29 +1110,43 @@ def format_basin_occupancy(params, summaries, pooled):
     writes `None` for exactly that reason -- a real absence, not a zero.
     """
     lines = ["Basin occupancy", "----------------"]
-    header = (f"  {'E_int/kcal':>11} {'frames':>7} {'share':>7} "
-              f"{'seeds':>6} {'weight':>7} {'contacts':>9}")
+    header = (f"  {'':>3} {'E_int/kcal':>11} {'frames':>7} {'share':>7} "
+              f"{'seeds':>7} {'visits':>7} {'dwell':>6} {'weight':>7} "
+              f"{'contacts':>9}  run:cand")
     rule = "  " + "-" * (len(header) - 2)
 
+    n_collisions = 0
     for p in pooled:
         basins = sorted(p["basins"], key=lambda b: -(b["frame_share"] or 0.0))
-        top, rest = basins[:_OCCUPANCY_TOP_N], basins[_OCCUPANCY_TOP_N:]
+        top, rest = basins[:top_n], basins[top_n:]
+        min_basin = p["basins"][0] if p["basins"] else None
+        modal_basin = p["modal"]["basin"] if p["modal"] else None
         lines.append(f"n = {p['n_solvent']}  ({p['n_frames_pooled']} scored "
                      "frames pooled)")
         lines += [header, rule]
         for b in top:
+            if b["contacts_split"]:
+                n_collisions += 1
+            flags = (("+" if b is min_basin else "")
+                     + ("*" if b is modal_basin else "")
+                     + ("!" if b["contacts_split"] else ""))
+            seeds_s = f"{b['n_seeds_hit']}/{b['n_seeds']}"
+            locator = f"{b['run']}:{b['candidate_index']}"
             lines.append(
-                f"  {b['e_int_kcal']:>11.2f} {b['n_frames']:>7} "
-                f"{100 * b['frame_share']:>6.1f}% {b['n_seeds_hit']:>6} "
-                f"{b['weight']:>7.3f} {b['n_contacts']:>9}")
+                f"  {flags:>3} {b['e_int_kcal']:>11.2f} {b['n_frames']:>7} "
+                f"{100 * b['frame_share']:>6.1f}% {seeds_s:>7} "
+                f"{_num(b['n_visits'], 'd'):>7} "
+                f"{_num(b['mean_dwell'], '.1f'):>6} {b['weight']:>7.3f} "
+                f"{b['n_contacts']:>9}  {locator}")
         if rest:
+            n_collisions += sum(1 for b in rest if b["contacts_split"])
             other_frames = sum(b["n_frames"] for b in rest)
             other_share = sum(b["frame_share"] for b in rest)
             other_weight = sum(b["weight"] for b in rest)
             lines.append(
-                f"  {'other (' + str(len(rest)) + ')':>11} {other_frames:>7} "
-                f"{100 * other_share:>6.1f}% {'-':>6} {other_weight:>7.3f} "
-                f"{'-':>9}")
+                f"  {'':>3} {'other (' + str(len(rest)) + ')':>11} "
+                f"{other_frames:>7} {100 * other_share:>6.1f}% {'-':>7} "
+                f"{'-':>7} {'-':>6} {other_weight:>7.3f} {'-':>9}  -")
         occ_mean = p["occupancy_mean_contacts"]
         occ_diss = p["occupancy_dissolved_fraction"]
         weighted_mean = sum(b["e_int_kcal"] * (b["frame_share"] or 0.0)
@@ -1040,17 +1168,68 @@ def format_basin_occupancy(params, summaries, pooled):
                    f"{spacings[0]:.0f} fs" if len(spacings) == 1 else
                    ", ".join(f"{s:.0f} fs" for s in spacings))
     lines.append(f"scored frame spacing: {spacing_str}")
+    if n_collisions:
+        lines.append(
+            f"basins flagged '!' (members disagree on n_contacts -- the 1 "
+            f"meV dedupe fused\ndistinct minima): {n_collisions}")
 
     lines.append(
         "\n  How many of the scored frames quenched into each basin, pooled "
         "across the\n  packings at that n. 'seeds' = how many of them visited "
-        "it, the same idiom as\n  'found by'. These are inherent-structure "
-        "populations of a gas-phase search,\n  not Boltzmann populations and "
-        "not free energies, and they are a diagnostic\n  only -- no E_int "
-        "here is built from them. The caveats that come with\n  reading them "
-        "are in README: Reading report.txt. Compare the frame spacing\n  "
-        "above against a decorrelation time measured on *this* system "
-        "(0.55 ps for\n  pyrazine + 3 CHCl3).")
+        "it, the same idiom as\n  'found by'. 'visits' (basin_visits) counts "
+        "maximal runs of consecutive\n  scored frames -- separate returns to "
+        "the basin, not raw dwell time -- and\n  'dwell' = frames / visits, "
+        "the mean length of one such run. 'run:cand' locates\n  the row's "
+        "own geometry: <run>/scored_candidates.xyz frame <cand>. These are\n"
+        "  inherent-structure populations of a gas-phase search, not "
+        "Boltzmann\n  populations and not free energies, and they are a "
+        "diagnostic only -- no\n  E_int here is built from them. The caveats "
+        "that come with reading them are\n  in README: Reading report.txt. "
+        "Compare the frame spacing above against a\n  decorrelation time "
+        "measured on *this* system (0.55 ps for pyrazine + 3\n  CHCl3).")
+    return "\n".join(lines)
+
+
+def format_modal_geometry(pooled):
+    """Where the shell actually spent its time: the file behind each n's
+    modal basin, on the same footing `format_best_geometry` gives the
+    minimum.
+
+    `pool_by_n` already picked the basin with the largest pooled
+    `frame_share` (ties: more seeds hit it, then lower energy) as
+    `pooled[n]["modal"]`; this only formats it. `gap` is that basin's own
+    `E_int` minus the pooled minimum -- 0.00 exactly when the modal basin
+    *is* the minimum, which the geometry sections otherwise leave the reader
+    to notice on their own by comparing two file names.
+    """
+    header = (f"{'n':>3} {'E_int/kcal':>11} {'gap':>7} {'share':>7} "
+              f"{'visits':>7} {'seeds':>7} {'run:cand'}")
+    lines = ["Modal geometry at each n", "------------------------",
+             header, "-" * len(header)]
+    for p in pooled:
+        modal = p["modal"]
+        if modal is None:
+            continue
+        b = modal["basin"]
+        gap = b["e_int_kcal"] - p["e_int_min_kcal"]
+        seeds_s = f"{b['n_seeds_hit']}/{b['n_seeds']}"
+        lines.append(
+            f"{p['n_solvent']:>3} "
+            f"{b['e_int_kcal']:>11.2f} "
+            f"{gap:>7.2f} "
+            f"{100 * b['frame_share']:>6.1f}% "
+            f"{_num(b['n_visits'], 'd'):>7} "
+            f"{seeds_s:>7} "
+            f"{modal['run']}:{modal['candidate_index']}")
+    lines.append(
+        "\n  The geometry is <run>/scored_candidates.xyz frame candidate_index "
+        "-- the same\n  locator the Basin occupancy table's 'run:cand' column "
+        "gives its '*' row --\n  copied out as modal_n<N>.xyz beside this "
+        "report, written whether or not the\n  modal basin coincides with "
+        "the minimum (gap = 0.00 when it does). share and\n  visits are that "
+        "basin's own occupancy, pooled across the packings at this n.\n  "
+        "These are inherent-structure populations of a gas-phase search, not "
+        "a\n  Boltzmann population -- see README: Reading report.txt.")
     return "\n".join(lines)
 
 
@@ -1204,6 +1383,7 @@ def format_report(params, summaries):
         parts.append(format_parent_detail(summaries))
         return "\n\n".join(parts) + "\n"
 
+    parts.append(format_modal_geometry(pooled))
     parts.append(format_seed_detail(summaries, pooled))
     parts.append(format_basin_occupancy(params, summaries, pooled))
 
@@ -1227,12 +1407,40 @@ def format_report(params, summaries):
     return "\n\n".join(parts) + "\n"
 
 
+def _xyz_frame_lines(path, index):
+    """Lines `[natoms, comment, *coords]` of frame `index` (0-based) of a
+    multi-frame xyz, or `None` if the file is missing or has too few frames.
+
+    Pure text -- a natoms-line read plus a block walk -- which is all
+    extracting one frame from a multi-frame xyz needs, and what keeps
+    `write_best_geometries` ASE-free at module scope like the rest of this
+    file.
+    """
+    if not path.is_file():
+        return None
+    lines = path.read_text().splitlines()
+    pos = frame = 0
+    while pos < len(lines) and lines[pos].strip():
+        try:
+            natoms = int(lines[pos].strip())
+        except ValueError:
+            return None
+        block = lines[pos:pos + natoms + 2]
+        if frame == index:
+            return block
+        pos += natoms + 2
+        frame += 1
+    return None
+
+
 def write_best_geometries(out_dir, pooled, prefix):
-    """Copy each n's winning `best.xyz` to `<out_dir>/best_n<N>.xyz`.
+    """Copy each n's winning `best.xyz` to `<out_dir>/best_n<N>.xyz`, and
+    (for a sweep) its modal basin's geometry to `<out_dir>/modal_n<N>.xyz`.
 
     The deliverable of a run, not just its report: `pooled` already knows, per
-    n, which run directory's `best.xyz` is the minimum (see `pool_by_n`), so
-    this only has to read those files and copy them out, one per n.
+    n, which run directory's `best.xyz` is the minimum and which basin is
+    modal (see `pool_by_n`), so this only has to read those files and copy
+    them out, one pair per n.
 
     One file per n, not one multi-frame xyz, because the frames differ in atom
     count -- n = 0..k goes 10, 15, 20, ... atoms for a fixed solute and
@@ -1255,29 +1463,55 @@ def write_best_geometries(out_dir, pooled, prefix):
     the run directory a packing wrote, `dock_parent=` the branch of the chain
     a construction descended from.
 
-    Skips an n whose run directory or `best.xyz` is missing -- a `sweep.json`
-    copied without its run directories, say -- and returns an empty list if
-    none are present. The run directory is looked up by name under `out_dir`
-    rather than by the absolute path recorded at write time, so a run that
-    has been moved or copied still resolves.
+    `modal_n<N>.xyz` is written unconditionally for every n of a sweep --
+    even when the modal basin *is* the pooled minimum, so the artefact set
+    per n is predictable rather than depending on whether the two coincide;
+    the report says when they do. It reads frame `candidate_index` out of
+    `<modal.run>/scored_candidates.xyz` (guaranteed to be the same ordering
+    as that run's own `scored.json["candidates"]` by `ensemble.assemble`) and
+    always tags the comment line `sweep_*`, since a modal basin only exists
+    for MD sampling -- `pool_by_n` leaves `modal` `None` for a docked chain,
+    so this is a no-op for `prefix == "dock"` without a separate branch.
+
+    Skips an n whose run directory or `best.xyz` / `scored_candidates.xyz` is
+    missing -- a `sweep.json` copied without its run directories, say -- and
+    returns an empty list if none are present. The run directory is looked up
+    by name under `out_dir` rather than by the absolute path recorded at
+    write time, so a run that has been moved or copied still resolves.
     """
     out_dir = Path(out_dir)
     written = []
     for p in pooled:
         run = p["best"]["run"]
         best_xyz = out_dir / run / "best.xyz"
-        if not best_xyz.is_file():
-            continue
-        lines = best_xyz.read_text().splitlines()
-        if len(lines) < 2:
-            continue
-        origin = (f"dock_parent={p['best']['candidate']['parent']}"
-                  if prefix == "dock" else f"sweep_packing={run}")
-        lines[1] = (f"{lines[1].rstrip()} {prefix}_n={p['n_solvent']} "
-                    f"{prefix}_E_int_kcal={p['e_int_min_kcal']:.6f} {origin}")
-        out = out_dir / f"best_n{p['n_solvent']}.xyz"
-        out.write_text("\n".join(lines) + "\n")
-        written.append(out)
+        if best_xyz.is_file():
+            lines = best_xyz.read_text().splitlines()
+            if len(lines) >= 2:
+                origin = (f"dock_parent={p['best']['candidate']['parent']}"
+                          if prefix == "dock" else f"sweep_packing={run}")
+                lines[1] = (f"{lines[1].rstrip()} {prefix}_n={p['n_solvent']} "
+                            f"{prefix}_E_int_kcal={p['e_int_min_kcal']:.6f} "
+                            f"{origin}")
+                out = out_dir / f"best_n{p['n_solvent']}.xyz"
+                out.write_text("\n".join(lines) + "\n")
+                written.append(out)
+
+        modal = p["modal"]
+        if modal is not None:
+            b = modal["basin"]
+            block = _xyz_frame_lines(
+                out_dir / modal["run"] / "scored_candidates.xyz",
+                modal["candidate_index"])
+            if block is not None and len(block) >= 2:
+                block[1] = (f"{block[1].rstrip()} sweep_n={p['n_solvent']} "
+                            f"sweep_E_int_kcal={b['e_int_kcal']:.6f} "
+                            f"sweep_frame_share={b['frame_share']:.4f} "
+                            f"sweep_n_frames={b['n_frames']} "
+                            f"sweep_visits={_num(b['n_visits'], 'd')} "
+                            f"sweep_packing={modal['run']}")
+                out = out_dir / f"modal_n{p['n_solvent']}.xyz"
+                out.write_text("\n".join(block) + "\n")
+                written.append(out)
     return written
 
 
