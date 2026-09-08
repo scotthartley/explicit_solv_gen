@@ -726,6 +726,147 @@ molecule binds; refinement is always unconstrained regardless.
 `1 - 0.93^K` gives 90% confidence at K = 32 and 99% at K = 64 --
 `Docking.n_placements` default.
 
+### Systematic placement: coverage instead of confidence
+
+`1 - 0.93^K` buys **confidence**, not **coverage**. A basin captured by 7% of
+random poses is 99% certain to be hit at K = 64; one captured by 0.5% is at
+27%, and nothing in a random run's output distinguishes "this basin does not
+exist" from "we did not draw it". Since the entire reason `docking.py` exists
+is that a missing basin is the one thing downstream DFT cannot repair, a
+search whose completeness is probabilistic is a weaker foundation than it
+needs to be. `Docking.place_mode = "grid"` enumerates instead: positions
+crossed with orientations, every pose that clears `tolerance` screened.
+
+The algorithm is otherwise untouched -- scan the solvent around the parent,
+optimise, carry the best forward, repeat. Only the scan becomes systematic.
+Site detection, per-site coverage reporting, site-restricted placement at
+n > 1, a site-additivity ranking and an energy-window parent set were each
+considered and dropped: what the run is for is how many molecules it takes to
+satisfy the solute's sites, and under that goal the identity of the first
+molecule's site does not matter -- only that every site is filled by high
+enough n.
+
+**Positions come from a surface, not a volume.** `place_one` draws uniformly
+inside an ellipsoidal shell, and `shell_padding`'s own docstring already
+concedes that sizing a convex region around an appreciable solute "scatters
+them through empty space instead of onto the solute". A Shrake-Rupley surface
+is topology-correct where an ellipsoid is not: it puts points in concave
+pockets, a macrocycle cavity, and the rim of a stacked aggregate.
+`shell_capacity.surface_points` is `sasa` keeping the exposure mask's points
+instead of collapsing it to an area -- a deliberately duplicated loop, since
+`sasa` feeds the params block's `monolayer_capacity` and the report's `cover`
+column, and perturbing a live number to save a dozen lines is a bad trade.
+Orientations come from a super-Fibonacci spiral over SO(3) (Alexa, CVPR
+2022): quasi-uniform quaternions in about eight lines, no symmetry detection
+and no per-solvent table.
+
+**The grid is radial, and one shell is not enough -- measured.** The obvious
+region is the solvent-*centre* surface `sasa` measures, at a probe equal to
+the solvent's bulk-density sphere radius. That is the contact distance for a
+*sphere*, and it is measurably wrong for a directional contact. On pyrazine +
+chloroform, the both-nitrogens minimum puts each chloroform centroid **3.17 A**
+from the nearest parent atom; that single shell puts centroids at **4.37-4.92
+A**, uniformly 1.2-1.8 A too far out, and BFGS from there settles into
+whatever shallow dispersion basin it started above. Scanning shells at
+fractions of the solvent radius, screening each, on the relaxed n = 1 parent:
+
+| probe | positions | poses kept | screened E_min (eV) | both-N poses |
+| --- | --- | --- | --- | --- |
+| 1.27 A (0.40 r) | 120 | 475 | -1333.9649 | 13 |
+| 1.58 A (0.50 r) | 141 | 1024 | -1333.9607 | 27 |
+| 1.90 A (0.60 r) | 157 | 1548 | -1333.9683 | 23 |
+| 2.38 A (0.75 r) | 181 | 2117 | -1333.9569 | 1 |
+| 3.17 A (1.00 r) | 222 | 2664 | -1333.8801 | **0** |
+
+The sphere-model surface is the only one that finds nothing, and a full n = 1
+2 3 run on it alone reproduced the *MD sweep's* -11.44 kcal/mol at n = 2 --
+the single-H-bond motif -- rather than docking's -13.00. So
+`Docking.grid_probe_fracs` defaults to `(0.4, 0.7, 1.0)`, three shells.
+Points are voxel-downsampled (`_voxel_downsample`) per shell, not
+over the union -- a `grid_spacing_A` voxel is wider than the gap between
+adjacent shells, so pooling first would collapse the radial axis. Voxel
+downsampling rather than a greedy minimum-separation filter: O(M) and
+deterministic, at the cost of occasionally keeping two points closer than the
+spacing across a cell boundary, which for a placement grid is harmless
+redundancy.
+
+**What each shell costs, and an open question about the outer one.** Equal
+150-pose samples off the relaxed n = 1 parent, screened through the same pool:
+
+| shell | poses kept | mean BFGS steps | throughput |
+| --- | --- | --- | --- |
+| 0.4 r (1.27 A) | 468 | 27.2 | 24 ms/pose |
+| 0.7 r (2.22 A) | 1960 | 16.1 | 16 ms/pose |
+| 1.0 r (3.17 A) | 2808 | **1.3** | 6 ms/pose |
+
+The radial axis, not grid mode itself, is where the cost is: a single-shell
+`--n 1 2 3` run screened 7728 poses in 28.8 s, three shells 15,542 in 144 s --
+2x the poses for 5x the wall-clock, because an inner-shell pose starts in
+contact and BFGS does real work on it. The refinement half does not scale at
+all: `n_refine` is 10 per parent whatever the mode, so a run does 30 tight
+relaxations either way.
+
+That table also puts the outer shell in question. It is 54% of the poses and
+converges in a **median of one BFGS step** -- those placements never relax
+into contact at all, they are accepted by the loose screen sitting exactly
+where they were put, which is consistent with the zero both-N hits and the
+2 kcal/mol higher screened minimum above. It is kept on the argument that a
+bulky orientation may clear `tolerance` only further out, on a solute the
+inner shells reject outright -- but that argument is *not* measured, and on
+this system the shell is measurably buying nothing for ~30% of the run time.
+Dropping to `(0.4, 0.7)` is the obvious test and has not been run.
+
+**The parent is the new solute, literally.** At n = k the surface is computed
+on the whole relaxed n = k - 1 complex, with no solute/solvent distinction
+anywhere in the placement code. Shrake-Rupley buries the contact patch under
+each bound molecule on its own, but a molecule sitting on a surface exposes
+more than it buries, so the grid grows with n -- 3351 poses per parent at
+n = 1 to 6955 at n = 3 on pyrazine, sublinearly, since surface goes as
+volume^(2/3). This does include second-layer positions on top of already-bound
+solvent, and a solvent-solvent stack could in principle win a greedy step and
+spend a molecule without reaching a new solute site. Restricting the grid to
+the solute's own exposed surface would prevent that (`n_solute` is already
+threaded through `dock_at_n`, so the distinction is free), but that is
+site-restriction in another guise, dropped for the same reason: a mechanism
+to save effort on a search that is already affordable. It cost nothing here
+-- grid wins at every n below.
+
+**Measured, pyrazine + chloroform, n = 1 2 3, one parent, everything else at
+defaults:**
+
+| | random | grid |
+| --- | --- | --- |
+| E_int(min), n = 1 | -6.6514 | **-6.6667** |
+| E_int(min), n = 2 | -12.9971 | **-13.0025** |
+| E_int(min), n = 3 | -18.1672 | **-18.3497** |
+| both-N at n = 2 | yes, found by 2 of 10 | yes, found by **6 of 10** |
+| pool (distinct minima) 1/2/3 | 3 / 9 / 10 | 1 / 5 / 9 |
+| placements screened | 192 | 15,542 |
+| wall-clock (18 cores) | 13.2 s | 144 s |
+
+Grid is lower at every n and reaches the both-nitrogens basin from three
+times as many refined placements. The cost is 11x wall-clock -- still under
+three minutes -- and, less obviously, a **narrower** pool: `n_refine` is a
+fixed 10 per parent taken off the lowest *screened* representatives, so
+against 5236 screened poses instead of 64 those ten all land in the best few
+basins. That is the right trade for minimum-finding and the wrong one for
+`dft_export`, which wants diversity inside its 3 kcal/mol window; raise
+`--refine` when exporting from a grid run.
+
+**`n_parents` still earns its keep under a systematic scan**, which was the
+open question -- with random placement a bad parent choice compounds with
+placement luck, while with a systematic scan parent choice is the only
+remaining source of error. Same runs at `--parents 3`: identical at n = 1 and
+n = 2 (the grid's n = 1 pool is a single basin, so there is only one parent to
+carry), and -18.4039 against -18.3497 at n = 3, for 320 s against 144 s. It
+buys 0.054 kcal/mol, so `n_parents` stays at 3.
+
+**Both defaults deliberately unchanged.** `place_mode` stays `"random"` and
+`n_parents` stays 3; grid mode is reachable at `--place-mode grid`. The
+numbers above are one system, and moving a default wants more than that.
+`n_placements` is ignored in grid mode, so the params block's `place_mode` is
+what says which number was live.
+
 ### Applicability: where this stops working
 
 The same ~N^2.5 GFN2 gradient cost that limits the MD sweep limits docking,

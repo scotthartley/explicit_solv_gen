@@ -9,8 +9,9 @@ refinement repairs -- DFT can re-rank the candidates it is handed, but it
 cannot invent one.
 
 This module finds basins by constructing instead: place a solvent molecule at
-a random position and orientation around the (already relaxed) parent
-cluster, and optimise. BFGS only descends, so it cannot climb out of the well
+a position and orientation around the (already relaxed) parent cluster --
+drawn at random, or, at `place_mode="grid"`, scanned systematically over the
+parent's solvent-accessible surface -- and optimise. BFGS only descends, so it cannot climb out of the well
 it lands in -- which is exactly why it works where a *seeded* MD run would
 not: `run_one_job` discards 5 ps of equilibration before recording the first
 frame, so a seeded arrangement would already be gone by the time anything was
@@ -35,6 +36,8 @@ Run one from the command line:
 
     python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
       --solvent chcl3 --n 1 2 3 --out pyrazine_dock/ --placements 64
+    python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
+      --solvent chcl3 --n 1 2 3 --out pyrazine_grid/ --place-mode grid
 
 `dock_at_n` fans placements out through `solvate_md.pool_map`, which uses
 spawn, so a script calling `run_docking` itself MUST guard the call:
@@ -79,7 +82,7 @@ from report import (
     timestamp,
     write_best_geometries,
 )
-from shell_capacity import monolayer_capacity
+from shell_capacity import monolayer_capacity, surface_points
 from solvate_md import (
     _random_rotation,
     _vdw_volume,
@@ -108,6 +111,40 @@ class Docking:
     # hitting a basin found in 7% of random poses (the measured both-N rate
     # on pyrazine/chloroform) at K = 32 and 99% at K = 64.
     n_placements: int = 64
+    # How the poses are generated. "random" is the historical behaviour and
+    # still the default: `n_placements` independent draws per parent, sized
+    # by the `1 - 0.93^K` argument above. "grid" enumerates instead --
+    # positions from the parent's solvent-accessible surface, crossed with
+    # `n_orientations` quasi-uniform rotations -- which buys coverage rather
+    # than confidence: nothing in a random run's output distinguishes "this
+    # basin does not exist" from "we did not draw it", and a missing basin is
+    # the one thing downstream DFT cannot repair. `n_placements` is ignored
+    # in grid mode, so the params block's `place_mode` is what says which of
+    # the two numbers was live.
+    place_mode: str = "random"
+    # Grid mode only. Surface points are voxel-downsampled to roughly this
+    # separation, so each position stands for ~`grid_spacing_A**2` of
+    # surface; 2.0 A puts ~220 positions on the outermost shell of pyrazine.
+    grid_spacing_A: float = 2.0
+    # Grid mode only, and the reason the grid is radial rather than a single
+    # surface. Each entry is a probe radius as a fraction of the solvent's
+    # bulk-density sphere radius, and each generates its own shell of
+    # positions. 1.0 is the solvent-*centre* surface `shell_capacity.sasa`
+    # measures -- the right contact distance for a sphere, and measurably the
+    # wrong one for a directional contact: a real C-H...N puts the chloroform
+    # centroid 3.17 A from the nearest pyrazine atom where that shell puts it
+    # at 4.4-4.9 A, and a scan of that shell alone found the both-nitrogens
+    # basin in 0 of 2664 poses against 13-27 of a few hundred at 0.4-0.6.
+    # The outer shell is kept on the argument that a bulky orientation may
+    # clear `tolerance` only further out -- an argument that is not measured,
+    # and on pyrazine that shell is 54% of the poses at a median of one BFGS
+    # step, i.e. buying nothing for ~30% of the run. See DESIGN.md's
+    # "Systematic placement" for the scan and for that open question.
+    grid_probe_fracs: tuple = (0.4, 0.7, 1.0)
+    # Grid mode only. Quasi-uniform rotations per position, from a
+    # super-Fibonacci spiral over SO(3). No symmetry detection and no
+    # per-solvent table -- BFGS absorbs the residual misorientation.
+    n_orientations: int = 12
     # Top-m deduped minima carried forward as next n's parents. The chain is
     # greedy -- the best structure at n need not descend from the best at
     # n - 1 -- and this is the mitigation.
@@ -164,6 +201,15 @@ class Docking:
 # hard cutoff -- a warning, matching how `run_sweep` treats `cover`.
 MONOLAYER_WARN_FRACTION = 1.0 / 3.0
 
+# Grid placements per parent per n, above which `grid_placements` raises
+# rather than screening. Measured at the defaults: pyrazine is 3351 poses per
+# parent at n = 1 and 6955 at n = 3 (a 25-atom parent), and the count grows as
+# surface, i.e. sublinearly in atom count -- so this leaves better than an
+# order of magnitude of headroom on anything docking is applicable to, and
+# only catches a typo. `--grid-spacing 0.2` on pyrazine is 237,300 poses per
+# parent, a multi-day run entered by accident, and is what this stops.
+MAX_GRID_PLACEMENTS = 200_000
+
 
 def _random_point_in_ellipsoid(semi_axes, rng, max_tries=10000):
     """A point uniform over the volume of the ellipsoid with these semi-axes.
@@ -178,6 +224,119 @@ def _random_point_in_ellipsoid(semi_axes, rng, max_tries=10000):
         if p @ p <= 1.0:
             return p * semi_axes
     raise RuntimeError("could not sample a point inside the shell ellipsoid")
+
+
+def _voxel_downsample(points, spacing):
+    """One representative point per occupied cell of a `spacing` lattice.
+
+    O(M) and deterministic, which is the whole reason it is this and not a
+    greedy minimum-separation filter: two points either side of a cell
+    boundary can survive closer together than `spacing`, and for a placement
+    grid that is harmless redundancy rather than a defect.
+    """
+    keys = np.round(np.asarray(points, dtype=float) / spacing).astype(np.int64)
+    _, first = np.unique(keys, axis=0, return_index=True)
+    return np.asarray(points, dtype=float)[np.sort(first)]
+
+
+def _orientation_quaternions(n):
+    """`n` quasi-uniform unit quaternions -- a super-Fibonacci spiral on SO(3).
+
+    Alexa, "Super-Fibonacci Spirals: Fast, Low-Discrepancy Sampling of SO(3)"
+    (CVPR 2022). A low-discrepancy sequence in four lines, needing no
+    rejection, no symmetry detection and no per-solvent table -- the
+    orientational analogue of `_unit_sphere_points`, which is the same trick
+    one dimension down.
+    """
+    phi = np.sqrt(2.0)
+    psi = 1.533751168755204288118041
+    i = np.arange(n) + 0.5
+    t = i / n
+    d = 2.0 * np.pi * i
+    r, R = np.sqrt(t), np.sqrt(1.0 - t)
+    alpha, beta = d / phi, d / psi
+    return np.c_[r * np.sin(alpha), r * np.cos(alpha),
+                 R * np.sin(beta), R * np.cos(beta)]
+
+
+def _quaternion_to_matrix(q):
+    """Rotation matrix from a unit quaternion, `_random_rotation`'s convention."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def grid_placements(parent_atoms, solvent_unit, docking):
+    """Every position x orientation pose of `solvent_unit` around the parent.
+
+    The systematic counterpart of `place_one`, and the reason `place_mode`
+    exists: `n_placements` random draws buy *confidence* that a basin found
+    in some fraction of poses was hit, not *coverage*, and nothing in the
+    output of such a run distinguishes a basin that does not exist from one
+    that was never drawn.
+
+    Positions come from `shell_capacity.surface_points`, voxel-downsampled to
+    `docking.grid_spacing_A`, rather than from the ellipsoidal volume
+    `place_one` draws in, because a surface follows the parent's topology and
+    an ellipsoid does not. It is a *set* of surfaces, one per entry of
+    `docking.grid_probe_fracs`, because no single one is right: the outermost
+    is the solvent-centre surface, which is the contact distance for a sphere
+    and about 1.5 A too far out for a directional H-bond. Orientations come
+    from `_orientation_quaternions`. Poses whose closest
+    interatomic approach to the parent is under `docking.tolerance` are
+    dropped -- the identical test `place_one` redraws on -- so the returned
+    count is already post-rejection, which is what `n_placements_tried`
+    reports.
+
+    **The parent is the whole complex**, with no solute/solvent distinction
+    anywhere here: at n = k the surface is computed on the relaxed n = k - 1
+    cluster, and Shrake-Rupley buries the contact patch under each bound
+    molecule on its own. A bound molecule exposes more surface than it
+    buries, so the grid grows slowly with n -- sublinearly, since surface
+    goes as volume^(2/3) -- and it includes second-layer positions on top of
+    already-bound solvent. That is deliberate rather than overlooked; see
+    DESIGN.md's "Systematic placement".
+    """
+    probe = solvent_radius(docking.solvent, solvent_unit)
+    # Downsampled per shell, not over the union: a `grid_spacing_A` voxel is
+    # wider than the gap between adjacent shells, so pooling them first would
+    # collapse the radial axis this loop exists to add.
+    positions = np.concatenate([
+        _voxel_downsample(surface_points(parent_atoms, probe * frac),
+                          docking.grid_spacing_A)
+        for frac in docking.grid_probe_fracs])
+    quaternions = _orientation_quaternions(docking.n_orientations)
+
+    n_poses = len(positions) * len(quaternions)
+    if n_poses > MAX_GRID_PLACEMENTS:
+        raise ValueError(
+            f"grid_placements: {len(positions)} surface positions over "
+            f"{len(docking.grid_probe_fracs)} shells x "
+            f"{docking.n_orientations} orientations = {n_poses} poses per "
+            f"parent, over MAX_GRID_PLACEMENTS = {MAX_GRID_PLACEMENTS}. "
+            "Raise grid_spacing_A, or lower n_orientations or the number of "
+            "grid_probe_fracs (or raise the ceiling deliberately -- this "
+            "exists to catch a typo, not to cap a real run).")
+
+    parent_positions = parent_atoms.get_positions()
+    unit_positions = solvent_unit.get_positions()
+    centered = unit_positions - unit_positions.mean(axis=0)
+
+    placements = []
+    for q in quaternions:
+        rotated = centered @ _quaternion_to_matrix(q).T
+        for point in positions:
+            coords = rotated + point
+            d = np.linalg.norm(
+                coords[:, None, :] - parent_positions[None, :, :], axis=2)
+            if d.min() >= docking.tolerance:
+                placed = solvent_unit.copy()
+                placed.set_positions(coords)
+                placements.append(parent_atoms + placed)
+    return placements
 
 
 def place_one(parent_atoms, solvent_unit, region, tolerance, rng, max_tries=2000):
@@ -221,8 +380,10 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
               solvation, calculator, calculator_kwargs, seed, n_workers=None):
     """Grow every parent by one solvent molecule, screen, and refine.
 
-    Builds `len(parents) * docking.n_placements` random placements (see
-    `place_one`), screens all of them at `docking.screen_fmax`, and refines
+    Builds the placements -- `len(parents) * docking.n_placements` random
+    ones (see `place_one`), or, at `place_mode="grid"`, every surface
+    position x orientation pose that clears the tolerance (see
+    `grid_placements`) -- screens all of them at `docking.screen_fmax`, and refines
     up to `docking.n_refine` *per parent* at the scorer's tight criterion:
     the parent's screened placements are deduped at
     `docking.screen_dedupe_tol_eV` / `docking.screen_geom_tol_A` -- the same
@@ -235,29 +396,43 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
 
     Returns `(refined, sources, n_tried)`: `refined` is a list of
     `ensemble.Relaxed` objects, `sources[i]` is the index into `parents` that
-    `refined[i]` descended from, and `n_tried` is the total number of random
-    placements attempted (screened, not all of which were refined) -- the
+    `refined[i]` descended from, and `n_tried` is the total number of
+    placements screened (not all of which were refined) -- the
     denominator the docking report shows the search effort against.
     """
-    v_solvent = bulk_molecular_volume(docking.solvent, solvent_unit)
-    r_solvent = solvent_radius(docking.solvent, solvent_unit)
-    rng = np.random.default_rng(seed)
-
     placements, sources = [], []
-    for parent_index, parent in enumerate(parents):
-        # Only the solute block defines the frame the shell region is
-        # measured in, but the whole complex moves with it.
-        aligned = align_to_principal_axes(parent, n_solute)
-        solute_only = aligned[:n_solute]
-        semi_axes = solute_semi_axes(solute_only)
-        v_solute = _vdw_volume(solute_only)
-        padding = shell_padding(semi_axes, v_solute, n_total, v_solvent,
-                                docking.shell_fill, min_padding=r_solvent)
-        region = semi_axes + padding
-        for _ in range(docking.n_placements):
-            placements.append(place_one(aligned, solvent_unit, region,
-                                        docking.tolerance, rng))
-            sources.append(parent_index)
+    if docking.place_mode == "grid":
+        # No principal-axis alignment and no ellipsoid: the surface points
+        # are computed in the parent's own frame, and the placement region
+        # *is* the parent's surface, so nothing here depends on the
+        # orientation of the input or on `n_total`.
+        for parent_index, parent in enumerate(parents):
+            poses = grid_placements(parent, solvent_unit, docking)
+            placements += poses
+            sources += [parent_index] * len(poses)
+    elif docking.place_mode == "random":
+        v_solvent = bulk_molecular_volume(docking.solvent, solvent_unit)
+        r_solvent = solvent_radius(docking.solvent, solvent_unit)
+        rng = np.random.default_rng(seed)
+
+        for parent_index, parent in enumerate(parents):
+            # Only the solute block defines the frame the shell region is
+            # measured in, but the whole complex moves with it.
+            aligned = align_to_principal_axes(parent, n_solute)
+            solute_only = aligned[:n_solute]
+            semi_axes = solute_semi_axes(solute_only)
+            v_solute = _vdw_volume(solute_only)
+            padding = shell_padding(semi_axes, v_solute, n_total, v_solvent,
+                                    docking.shell_fill, min_padding=r_solvent)
+            region = semi_axes + padding
+            for _ in range(docking.n_placements):
+                placements.append(place_one(aligned, solvent_unit, region,
+                                            docking.tolerance, rng))
+                sources.append(parent_index)
+    else:
+        raise ValueError(
+            f"unknown place_mode {docking.place_mode!r}; expected "
+            '"random" or "grid"')
 
     # The same optimiser as the refinement below and as the scorer, at a
     # looser `fmax` and optionally with the solute held fixed. Nothing it
@@ -509,6 +684,10 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
     the `library_versions` that say which build of the Hamiltonian ran.
     """
     params = {k: v for k, v in asdict(docking).items()}
+    # JSON has no tuple, so `python -m report` re-rendering from dock.json
+    # would print a list where the run itself printed a tuple. Normalise at
+    # the source, so a report and its re-render stay byte-identical.
+    params["grid_probe_fracs"] = list(docking.grid_probe_fracs)
     # `max_frames` describes how a trajectory is subsampled, and docking has
     # no trajectory: `summarise` already writes it as `None` per run, and the
     # params block should not advertise a setting that did nothing either.
@@ -557,8 +736,30 @@ def main(argv=None):
                              "swept)")
     parser.add_argument("--out", required=True, help="output directory")
     parser.add_argument("--placements", type=int, default=Docking.n_placements,
-                        help="random placements tried per parent per n "
+                        help="random placements tried per parent per n; "
+                             "ignored under --place-mode grid "
                              "(default: %(default)s)")
+    parser.add_argument("--place-mode", default=Docking.place_mode,
+                        choices=("random", "grid"),
+                        help="how poses are generated: independent random "
+                             "draws, or a systematic scan of the parent's "
+                             "solvent-accessible surface x a quasi-uniform "
+                             "set of orientations (default: %(default)s)")
+    parser.add_argument("--grid-spacing", type=float,
+                        default=Docking.grid_spacing_A,
+                        help="grid mode: separation of surface positions, A "
+                             "(default: %(default)s)")
+    parser.add_argument("--orientations", type=int,
+                        default=Docking.n_orientations,
+                        help="grid mode: orientations per surface position "
+                             "(default: %(default)s)")
+    parser.add_argument("--grid-probe-fracs", type=float, nargs="+",
+                        default=list(Docking.grid_probe_fracs),
+                        metavar="F",
+                        help="grid mode: one shell of positions per value, "
+                             "each a probe radius as a fraction of the "
+                             "solvent's sphere radius (default: "
+                             "%(default)s)")
     parser.add_argument("--parents", type=int, default=Docking.n_parents,
                         help="deduped minima carried forward as the next n's "
                              "parents (default: %(default)s)")
@@ -601,6 +802,10 @@ def main(argv=None):
 
     docking = Docking(
         n_placements=args.placements,
+        place_mode=args.place_mode,
+        grid_spacing_A=args.grid_spacing,
+        n_orientations=args.orientations,
+        grid_probe_fracs=tuple(args.grid_probe_fracs),
         n_parents=args.parents,
         n_refine=args.refine,
         screen_fmax=args.screen_fmax,

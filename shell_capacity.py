@@ -54,6 +54,36 @@ def sasa(atoms, probe, n_points=4096):
     return total
 
 
+def surface_points(atoms, probe, n_points=4096):
+    """The exposed points of that same surface, rather than its area.
+
+    `sasa` collapses the per-atom exposure mask with `.mean()` to get an
+    area; this keeps the points the mask selected, as an (M, 3) array of
+    candidate solvent-*centre* positions. That is what makes it the right
+    placement region for `docking.grid_placements`: it traces the parent's
+    actual topology -- a concave pocket, a macrocycle cavity, the rim of a
+    stacked aggregate -- where an ellipsoid sized around the same solute
+    scatters points through empty space (`solvate_md.shell_padding`'s own
+    docstring concedes as much).
+
+    Deliberately a second loop rather than a refactor of `sasa`: `sasa`
+    feeds `monolayer_capacity` -> the params block's `monolayer_capacity` ->
+    the report's `cover` column, and perturbing an existing number to save a
+    dozen duplicated lines is a bad trade.
+    """
+    positions = atoms.get_positions()
+    radii = _vdw_radii_array(atoms) + probe
+    unit = _unit_sphere_points(n_points)
+
+    kept = []
+    for k in range(len(positions)):
+        points = positions[k] + radii[k] * unit
+        d = np.linalg.norm(points[:, None, :] - positions[None, :, :], axis=2)
+        d[:, k] = np.inf
+        kept.append(points[(d > radii).all(axis=1)])
+    return np.concatenate(kept) if kept else np.zeros((0, 3))
+
+
 def monolayer_capacity(atoms, solvent):
     """(area, area per molecule, molecules in a complete first shell)."""
     r = solvent_radius(solvent)
