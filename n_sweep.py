@@ -70,8 +70,9 @@ from pathlib import Path
 from ase.io import read
 
 from ensemble import Scoring, score_run_grid
-from report import (VERSION, format_report, library_versions, pool_by_n,
-                    timestamp, write_best_geometries)
+from report import (DEDUPE_TOL_EV, GEOM_TOL_A, VERSION, format_report,
+                    library_versions, pool_by_n, timestamp,
+                    write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
@@ -224,6 +225,14 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
         # Aligned with `n_values`, because n = 0 gets one packing rather
         # than `n_seeds` of them.
         "seeds_per_n": list(seeds_per_n),
+        # The basin criterion, from `report`'s module constants rather than
+        # from either dataclass -- so a params block still says what "one
+        # basin" meant for this sweep. It moves `pool`, `found by`,
+        # `n_seeds_hit` and every occupancy number without moving
+        # `E_int(min)`, which is precisely the kind of silent change
+        # `wall_slack` taught this repo to record.
+        "dedupe_tol_eV": DEDUPE_TOL_EV,
+        "geom_tol_A": GEOM_TOL_A,
         "version": VERSION,
         "timestamp": timestamp(),
     })

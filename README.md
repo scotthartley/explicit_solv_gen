@@ -115,8 +115,9 @@ wall volume (`wall_slack`) sets the population of a dissociated molecule and
 moves an occupancy number, while a dissolved molecule still contributes ~0 to
 `E_int` regardless of box size — no thermal-average `E_int` is built from any
 of this. Read it with its caveats in mind: sampling is gas-phase (see the
-Hamiltonians section below); the 1 meV dedupe merges isoenergetic distinct
-minima into one count; frames are correlated, so the reported spacing has to
+Hamiltonians section below); the basin criterion has its own blind spot, and
+moving either of its two tolerances moves every count; frames are correlated,
+so the reported spacing has to
 be compared against a decorrelation time measured on the system in question;
 and these are inherent-structure populations with no vibrational entropy or
 ZPE. They are listed in full under
@@ -313,9 +314,11 @@ written for every `n`, whether or not `gap` is zero.
 
 **Per-packing detail** is one row per packing, its own search alone. These do
 not average to the table above and are not meant to: the pooled minimum is
-the *lowest* of that column, not its mean. `best` marks a packing within
-1 meV of the pooled minimum at its `n` — the same test `found by` counts, so
-the number of `*` at an `n` equals its `found by` numerator.
+the *lowest* of that column, not its mean. `best` marks a packing whose own
+best candidate *is* the pooled minimum at its `n` — within 5 meV **and**
+0.15 Å of contact descriptor, the same basin test `found by` counts (caveat 2
+under Basin occupancy), so the number of `*` at an `n` equals its `found by`
+numerator.
 
 **Basin occupancy** is how many scored frames quenched into each basin,
 summed across the packings at each `n`. `seeds` is `k/n` — how many of that
@@ -339,9 +342,24 @@ and none is decorative:
    occupancy describes the gas-phase search, not solvation in the scoring
    continuum. Measured on methanol + 4 water: 3.84–4.39 H-bonds in gas
    against 0.00–0.30 in ALPB(water), no overlap between the two populations.
-2. **The 1 meV energy dedupe merges isoenergetic distinct minima**, inflating
-   one count. Tolerable for ranking, sharper for counting — and now flagged
-   per basin (`!`, above) rather than only mentioned here in general.
+2. **The basin criterion is geometric, and has its own blind spot.** Two
+   candidates are one basin when their energies agree to 5 meV *and* their
+   contact descriptors to 0.15 Å — a permutation- and rigid-motion-invariant
+   fingerprint of which solute atoms each solvent molecule is near, plus how
+   the shell packs against itself. That descriptor is invariant under
+   relabelling same-element solute atoms, which for a small rigid aromatic is
+   exactly its symmetry (pyrazine's two nitrogens are genuinely equivalent),
+   but for a **large floppy solute with many same-element atoms it is a
+   superset** of the true symmetry, so it can merge two structures that
+   differ only in which of several equivalent-looking carbons a molecule sits
+   on. The energy window is the guard against that; where it fails, the merge
+   still shows up as a `!` flag (above) when the members disagree on
+   `n_contacts`. Through 0.10.0 this was a 1 meV energy test alone, which
+   fused distinct minima wholesale — 82% of its merges at n = 2 joined
+   structures a geometric criterion calls different. See DESIGN.md's
+   "Geometric basin dedupe" for the measurements, and note that changing
+   either tolerance moves every count in this section, and none of the
+   `E_int` values.
 3. **Frames are correlated.** Compare the reported scored-frame spacing
    against a decorrelation time measured on *your* system — 0.55 ps for
    pyrazine + 3 CHCl₃, which is a property of the system rather than of the

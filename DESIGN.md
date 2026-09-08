@@ -103,9 +103,9 @@ packings find -12.12 and one finds -11.60, and the mean of the minima is
 -12.05 -- a number no geometry has. So the reported number at each n is the
 minimum over the pooled
 candidates of every packing, and the pool is deduped across packings with the
-same energy criterion `ensemble` uses within a run (`report.dedupe_energies`,
-1 meV), because seven packings finding one basin would otherwise multiply its
-Boltzmann weight by seven. `E_int(ens)` is pooled the same way and kept in the
+same criterion `ensemble` uses within a run (`report.dedupe_energies`: 5 meV
+of energy and 0.15 A of contact descriptor), because seven packings finding
+one basin would otherwise multiply its Boltzmann weight by seven. `E_int(ens)` is pooled the same way and kept in the
 JSON -- Boltzmann weighting at 298 K (kT = 0.594 kcal/mol) is a soft minimum
 rather than a democratic average, and it is continuous in the candidate set
 where the minimum is a step function -- but 0.8.0 stopped printing it.
@@ -191,9 +191,9 @@ folded into an energy: no thermal-average `E_int` is built from it. Reading
 the section also means holding six caveats, which live in README's "Reading
 report.txt" rather than being restated in every rendered report: sampling is
 gas-phase (methanol + 4 water: 3.84-4.39 H-bonds in gas vs 0.00-0.30 in
-ALPB(water), no overlap); the 1 meV dedupe merges isoenergetic distinct
-minima into one count (now flagged per basin as `contacts_split`, see below,
-rather than only stated here in general); frames are correlated, so
+ALPB(water), no overlap); the basin criterion has a blind spot of its own,
+and moving either of its two tolerances moves every count here (flagged per
+basin as `contacts_split` when it provably fired, see below); frames are correlated, so
 `scored_frame_spacing_fs` has to be read against a decorrelation time
 measured on the system in question, not assumed; these are inherent-structure
 populations, with no vibrational entropy or ZPE; the wall-volume point above;
@@ -246,18 +246,180 @@ distinguish "12 frames, 1 visit" (one loiter, weak evidence) from "12 frames,
 number in either direction erases.
 
 **`contacts_split` turns a global caveat into a per-basin flag, for free.**
-README's "Reading report.txt" has always admitted that the 1 meV energy
-dedupe can merge isoenergetic distinct minima, "tolerable for ranking,
-sharper for counting" -- a caveat that bites harder here, because occupancy's
-whole job is counting. Reopening RMSD dedupe to fix it was rejected once
-already (see "Considered and not built") and stays rejected; the case for it
-has not changed. But the data to *detect* a merge, rather than prevent it,
-was already on every candidate: if a basin's members disagree on
-`n_contacts`, the 1 meV test provably fused two structures with different
-contact patterns into one count, and `pool_by_n` now flags it as
-`contacts_split`, rendered `!` in Basin occupancy with a one-line count under
-the section. Costs nothing, changes no number, and replaces "this can happen,
-somewhere" with "it happened here, N times."
+README's "Reading report.txt" has always admitted that the energy dedupe can
+merge isoenergetic distinct minima, "tolerable for ranking, sharper for
+counting" -- a caveat that bites harder here, because occupancy's whole job
+is counting. The data to *detect* a merge, rather than prevent it, was
+already on every candidate: if a basin's members disagree on `n_contacts`,
+the test provably fused two structures with different contact patterns into
+one count, and `pool_by_n` flags it as `contacts_split`, rendered `!` in
+Basin occupancy with a one-line count under the section. Costs nothing,
+changes no number, and replaces "this can happen, somewhere" with "it
+happened here, N times."
+
+At 0.10.0 this paragraph went on to say that reopening RMSD dedupe to fix the
+merges "stays rejected; the case for it has not changed." **It did change,
+and the flag is what changed it** -- which is the point of having built it. A
+production sweep at n = 3 and 4 came back with **58 basins flagged `!`**:
+not a stray flag on a marginal basin but the criterion failing at scale, and
+the measurement that opened the next section.
+
+### Geometric basin dedupe: what the energy-only criterion was doing
+
+Through 0.10.0 two candidates were one basin iff their optimised energies
+were within 1 meV. The rejection of anything geometric was scoped precisely:
+*"energy dedupe already separates distinct minima **at the counts docking
+produces**."* Docking produces ~19 distinct minima at n = 2. A five-seed
+sweep produces 75-79 at n = 3-4. That is a different regime, and it was
+measured rather than argued.
+
+**The energy axis was saturated.** Pooling the 76 candidates of one n = 2
+sweep: they span 284 meV with a **median nearest-neighbour gap of 1.08 meV**,
+against a 1 meV merge window. Within one run every survivor is pairwise
+>1 meV apart *by construction*, so that median is entirely a cross-run
+effect -- a window that decides almost nothing. Worse, pooling those 76
+candidates into 52 basins merged **24** of them, and a null model in which
+**no two runs ever share a basin** -- energies drawn i.i.d. from the pooled
+empirical density, kept pairwise >1 meV apart within each run exactly as the
+code's own dedupe does -- predicts 20 to 31 merges as its one free parameter
+(the kernel bandwidth) runs from 10 meV to 0.5 meV. The observed 24 sits
+squarely inside that, and below the two tighter bandwidths. The cross-seed
+dedupe was not demonstrably identifying shared basins at all, and
+`n_seeds_hit`, pooled `frame_share` and `found_by` all rested on it.
+
+**Both failure modes were real and both were large.** Computing a
+permutation- and rigid-motion-invariant contact descriptor (below) for all 76
+and comparing it against the energy verdict:
+
+| geom threshold (A) | energy says SAME, geometry says different | energy says DIFFERENT, geometry says same |
+| --- | --- | --- |
+| 0.15 | **31 of 38 pairs (82%)** | 9 (5 same-run / 4 cross-run) |
+| 0.25 | 30 of 38 (79%) | 40 |
+| 0.50 | 28 of 38 (71%) | 136 |
+
+Roughly seven of thirty-eight energy-merges were real. The rest fused
+structures up to 4.2 A apart.
+
+**A naive RMSD would have been worse than what was there**, which is worth
+saying because it is what "RMSD dedupe" usually means. Solvent molecules
+occupy a fixed block layout but are chemically interchangeable, so two
+structures identical up to swapping solvent 1 and 2 get a large coordinate
+RMSD and would be split, where the energy test fused them correctly. Any
+geometric criterion here has to be permutation-invariant, and that -- not
+RMSD's cost -- is the real work. `ensemble.contact_descriptor` does it by
+quotienting the symmetry out of the descriptor rather than searching over
+superpositions:
+
+- an `n_mol x n_solute` matrix whose `(m, i)` entry is the distance from
+  solute atom `i` to solvent molecule `m`, minimised over `m`'s own atoms --
+  which absorbs intra-solvent atom permutations (chloroform's three Cl,
+  acetone's methyl rotation) for free;
+- each row sorted *within each solute element block*, elements in a fixed
+  order, making it invariant under same-element relabelling of the solute.
+  For a small rigid aromatic that is exactly its automorphism group, so
+  pyrazine's two equivalent nitrogens stay one basin and no automorphism
+  search is needed. For a large floppy solute with many same-element atoms it
+  is a superset of the true symmetry and can under-split: the documented
+  limit;
+- distances only, so rigid-body motion is quotiented out with no Kabsch and
+  no superposition;
+- plus the sorted vector of pairwise solvent-solvent van der Waals gaps, so
+  two structures with identical solute contacts but different shell packing
+  are still distinguished. Sorted, hence already invariant under solvent
+  relabelling.
+
+Comparing two of them minimises the max per-feature deviation over
+*assignments of solvent molecules* -- a permutation search in descriptor
+space, not in Cartesian space. Brute-force `itertools.permutations` up to
+`report.MAX_DESCRIPTOR_MOLECULES = 8` (8! = 40320 comparisons of small
+arrays; `monolayer_capacity` is what says real n stays well under it), and it
+raises above that rather than degrading silently, because there is no scipy
+in `environment.yml` to reach for a Hungarian solver. Cost is negligible
+regardless: the greedy dedupe compares each candidate against group
+*representatives* only, never pairwise, so a sweep's ~150 candidates against
+~50 groups is milliseconds against an hour of BFGS.
+
+**Both tolerances were picked from gaps in the data, not guessed.** Over all
+2850 pairs of that n = 2 pool the descriptor distances run 0.01-0.12 A for
+sixteen pairs, then stop dead until 0.16 A, with the bulk of the
+distribution only starting at 0.19 -- a within-basin cluster, an empty band,
+and then everything else. `GEOM_TOL_A = 0.15` sits in the empty band. That
+the within-basin cluster is that tight is also the evidence that
+`Scoring.fmax = 0.002` is converged enough for the criterion to be stable; at
+the 0.05 `Scoring.fmax` used to be, it would not be. And pairs the
+descriptor calls identical differ in energy by up to **2.07 meV** -- above
+the old 1 meV window, which was therefore splitting them -- so
+`DEDUPE_TOL_EV` went 1 meV -> 5 meV, covering that with margin while staying
+an order of magnitude under the ~29 meV separating the nearest pairs the
+descriptor cannot resolve but energy can.
+
+So the criterion is `|dE| <= DEDUPE_TOL_EV` **and** `descriptor distance <=
+GEOM_TOL_A`. Geometry is the real test; energy stays as a cheap guard against
+the descriptor's own lossiness and as the pre-sort that keeps the greedy pass
+deterministic. Widening the energy window is what fixes the false splits, the
+geometry veto is what fixes the false merges, and both live beside
+`EV_TO_KCAL` in `report.py` for the reason that module's comment already
+gave -- `ensemble`, `pool_by_n` and `dft_export` must apply the same test by
+construction, and `pool_by_n` is handed summaries rather than a `Scoring` to
+read a setting off. They are recorded in every summary and every params block
+besides, since a criterion change that silently moves basin counts is exactly
+the `wall_slack` hazard.
+
+**What does not move: `E_int(min)`, the headline number.** It is `min` over
+group representatives, and groups partition the candidates, so the set
+minimum is the same however it is partitioned -- invariant under any
+regrouping, which is what makes this a fix to the diagnostics rather than a
+change to the reported energy. What does move: `pool`, `found_by`, every
+`basins` entry, `frame_share`, `n_seeds_hit`, `weight`, `E_int(ens)`,
+`modal_n<N>.xyz`, and `dft_export`'s selection. `found_by` and `n_seeds_hit`
+falling is the honest outcome given the null-model result above, not a
+regression: it is corroboration evidence being corrected downward.
+
+**Measured on the shipped example** -- `--n 0 1 2 3 --seeds 5`,
+pyrazine/chloroform, 480 candidates -- by re-pooling that one sweep's own
+candidates under both criteria:
+
+| | old (1 meV) | new (5 meV + 0.15 A) |
+| --- | --- | --- |
+| `E_int(min)`, n = 0..3 | -0.03 / -6.65 / -13.03 / -18.38 | **identical, to 0.00e+00 kcal/mol** |
+| `pool` at n = 1 / 2 / 3 | 20 / 41 / 66 | 41 / 114 / 137 |
+| basins flagged `!` | 41 of 128 | **0 of 293** |
+| basins hit by >1 packing | 71 | 22 |
+| `found by`, n = 1 / 2 / 3 | 5 / 2 / 1 | 5 / 2 / 1 |
+| `dft_export` structures | 75 | 200 |
+
+`pool` rising rather than falling is the 82% figure showing up at scale: the
+criterion is splitting far more than the widened energy window merges.
+`contacts_split` going to exactly zero is the strongest single result -- the
+detector that motivated the change cannot find a fused basin any more. And
+re-running the coincidence null on the new grouping settles the other half:
+under it, energy and geometry agreement are independent, so a cross-run pair
+merges by chance at `P(|dE| <= 5 meV) x P(dG <= 0.15 A)`, which predicts 5.9 /
+4.3 / 0.7 shared basins at n = 1 / 2 / 3 against 30 / 17 / 7 observed -- **4x
+to 10x above coincidence**, where the old criterion sat at or below it. The
+packings really do re-find each other's basins; the energy-only test simply
+could not show it.
+
+`found by` not moving is worth noting rather than glossing: the packings that
+reached the pooled minimum reached it geometrically too, so the headline
+corroboration column is unaffected even though `n_seeds_hit` across all basins
+falls by two thirds. What does cost something downstream is the export --
+75 structures to 200, because basins the old criterion fused inside the
+3 kcal/mol window are now distinct structures worth their own DFT point.
+`--max-per-n` is the lever if that is more than a DFT budget allows.
+
+Three places compared two named candidates with an inline `abs(dE) <= tol`
+and so bypassed `dedupe_groups` entirely -- `found_by`, the `best` marker in
+the per-packing table, and docking's per-parent table. A two-axis criterion
+would have moved the pooling and left all three behind, silently disagreeing
+with it, so they now go through `report.same_basin`, and `found_by_seeds`
+carries the packings themselves into `format_seed_detail` rather than having
+it recompute the test. Docking's screening pass takes the same two-axis test
+at its own looser tolerances (`screen_dedupe_tol_eV`, `screen_geom_tol_A`):
+a screened geometry is relaxed only to `screen_fmax = 0.05`, so a criterion
+tuned for converged minima would shatter one screened basin into a dozen
+near-copies and spend every `n_refine` slot on them -- the exact starvation
+0.9.0's per-parent refinement budget exists to prevent.
 
 Every term has to be relaxed *to convergence*, not merely to a stationary-ish
 geometry. The scoring optimizer therefore runs to `fmax = 0.002` eV/A
@@ -420,7 +582,7 @@ usable setting the cap always bites.
 ### The two diagnostics that qualify a sweep's numbers
 
 - **Search convergence** -- per n: the pooled minimum, `found by` (how many of
-  that n's packings reached it, by the 1 meV dedupe criterion), the spread of
+  that n's packings reached it, by the same dedupe criterion), the spread of
   the per-packing minima, and the pool size. Independent packings are
   independent *searches*, so their **agreement on the minimum** is the
   evidence, not an error bar on a mean: a minimum several packings reached is
@@ -475,7 +637,7 @@ discards 5 ps of equilibration before recording the first frame, so a seeded
 both-N start would already be gone by frame 1). On pyrazine + chloroform,
 docking n = 1 -> n = 2 with 3 parents x 64 placements reproduces the
 both-N basin as its overall minimum: E_int(2) = -13.00 kcal/mol, both H...N
-contacts at 1.94 A, 4 of the 10 refined placements landing within 1 meV of it
+contacts at 1.94 A, 4 of the 10 refined placements landing in the same basin as it
 (the "found by" column). The n = 1 parent itself came in at -6.65 kcal/mol,
 matching the -6.6 single-complex value in the binding table above. Total
 wall-clock for both n on 18 cores: 7.3 s -- 256 placements screened, 20
@@ -520,7 +682,7 @@ up to `n_refine` (default 10) **per parent** are re-relaxed at the scorer's
 tight `fmax = 0.002`. On the same 64 random placements (same RNG draw),
 two-pass screen-then-refine landed at -6.6514 kcal/mol; refining all 64 at
 the tight criterion directly landed at -6.6511 -- a 0.0003 kcal/mol
-difference, two orders of magnitude under the 1 meV (0.023 kcal/mol) dedupe
+difference, four orders of magnitude under the 5 meV (0.115 kcal/mol) dedupe
 tolerance. The two-pass run took 7.3 s combined over two n; refining every
 placement tightly took 5.9 s for n = 1 alone.
 
@@ -533,15 +695,18 @@ downstream consumes -- the next generation's parents are its deduped top
 `n_parents`, so a collapsed set starves the greedy-chain mitigation exactly
 where greediness is the documented risk, and `dft_export`'s 3 kcal/mol window
 was in practice a cap of ten candidates per n. Now each parent's screened
-energies are deduped at `Docking.screen_dedupe_tol_eV` -- 4 meV, ~0.1
-kcal/mol, deliberately looser than the 1 meV `DEDUPE_TOL_EV`, since at
-`fmax = 0.05` two placements in one basin can still differ by ~0.6 kcal/mol
-and the error to prefer is refining a duplicate over dropping a basin -- and
+placements are deduped at `Docking.screen_dedupe_tol_eV` /
+`Docking.screen_geom_tol_A` -- 10 meV and 0.5 A since 0.11.0, both
+deliberately looser than the scorer's `DEDUPE_TOL_EV` / `GEOM_TOL_A`, since
+at `fmax = 0.05` two placements in one basin can still differ by ~0.6
+kcal/mol and by far more than the scorer's 0.15 A, and the error to prefer is
+refining a duplicate over dropping a basin -- and
 the lowest representative of each screened basin is refined, best-first, up
 to `n_refine` per parent. At most 30 tight relaxations at n >= 2 instead of
 10, ~4.5 s each over the pool. The screened criterion never reaches a
-`scored.json`; the refined candidates are deduped at 1 meV like everything
-else, and `n_refined` / the `found by` denominator read the actual count.
+`scored.json`; the refined candidates are deduped at the scorer's criterion
+like everything else, and `n_refined` / the `found by` denominator read the
+actual count.
 Measured on the same `--n 1 2` run before and after, same RNG draw: at n = 2,
 30 refined and 19 distinct minima against 10 and 10, the both-N minimum
 -13.01 vs -13.00 kcal/mol and found by 2/30 vs 1/10 -- with a second parent
@@ -606,13 +771,20 @@ than left scattered where they came up:
   file boundary exists to avoid.
 - **Quasi-RRHO free energies** -- not built: GFN2-level thermochemistry is
   triage at best, and DFT supersedes it.
-- **RMSD-based dedupe** -- not built: energy dedupe already separates
-  distinct minima at the counts docking produces.
 - **Pooling docked and swept candidates together** -- not built: docking wins
   at every n by construction, so pooling would let it silently take over the
   headline number and erase the informative comparison between what each
   search actually finds. See `CLAUDE.md`'s invariant that the two are never
   pooled.
+- **RMSD-based dedupe**, in retrospect -- listed here through 0.10.0, on the
+  grounds that "energy dedupe already separates distinct minima at the counts
+  docking produces," and reversed at 0.11.0 once a five-seed sweep was shown
+  to produce four times those counts and the energy axis to be saturated at
+  them. The bullet is gone from this list because the thing was built. What
+  replaced it is deliberately *not* an RMSD -- a naive one would have been
+  worse than the criterion it replaced -- for the reasons under "Geometric
+  basin dedupe" above, which is also where the measurements that reversed the
+  decision live.
 - **Stratified packing itself**, in retrospect -- kept from 0.2.0 to 0.8.0,
   removed once `docking.py` took over minimum-finding. Recorded in full above
   ("Packing: independent draws, and why they were once stratified") rather

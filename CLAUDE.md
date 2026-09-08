@@ -24,9 +24,13 @@ what was tried and removed. Read the named section before you touch:
 - docking's `n_refine` / `n_placements` -- "`docking.py` -- a second
   generator, beside the MD sweep" (`1 - 0.93^K` sets the default; `n_refine`
   is per parent and per distinct screened basin since 0.9.0)
-- a solute-free background leg, RMSD dedupe, quasi-RRHO, overlapping the two
-  halves of a sweep, or pooling docked and swept candidates -- "Considered
-  and not built"
+- `report.DEDUPE_TOL_EV`, `report.GEOM_TOL_A`, the contact descriptor, or
+  `Docking.screen_*_tol` -- "Geometric basin dedupe: what the energy-only
+  criterion was doing" (both tolerances are picked from measured gaps in a
+  real pool, and the descriptor is deliberately not an RMSD -- a naive one
+  would be worse than the criterion it replaced)
+- a solute-free background leg, quasi-RRHO, overlapping the two halves of a
+  sweep, or pooling docked and swept candidates -- "Considered and not built"
 
 ## Environment
 
@@ -117,11 +121,12 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 
     python -m report /path/to/sweep_or_run_dir/
 
-(Anything scored before `n_opt_steps` and the mandatory wall fields no longer
-re-renders, since the readers no longer default a missing field. Rescore it
-rather than re-reporting it. The same applies to a `sweep.json` params block
-without `monolayer_capacity`: it raises rather than rendering a report that
-silently omits the `cover` column.)
+(Anything scored before `n_opt_steps`, the mandatory wall fields or the
+mandatory per-candidate `descriptor` (0.11.0) no longer re-renders, since the
+readers no longer default a missing field. Rescore it rather than
+re-reporting it. The same applies to a `sweep.json` params block without
+`monolayer_capacity`: it raises rather than rendering a report that silently
+omits the `cover` column.)
 
 `E_int(min)` is the reported number, because it alone is comparable across n,
 and at 0.8.0 it is the only energy any table prints. `E_int(ens)` and
@@ -135,6 +140,18 @@ raises against giving `E_int(ens)` its own `dE_int`; and `E(cluster)`
 is not comparable across rows of different n, which is what `E_int` exists to
 fix. Absolute energies are in eV (ASE's native unit), `E_int` in kcal/mol; the
 mix is deliberate.
+
+**Every candidate in `scored.json` carries a `descriptor`** (0.11.0): the
+permutation- and rigid-motion-invariant contact fingerprint two candidates
+are grouped into one basin by, alongside a 5 meV energy window. Both
+tolerances are recorded in each summary and each params block
+(`dedupe_tol_eV` / `geom_tol_A`) because moving either moves `pool`,
+`found by`, `n_seeds_hit`, every weight and every occupancy number while
+leaving `E_int(min)` exactly where it was -- so **check them before comparing
+two sweeps' basin counts**, the same way you check `wall_slack` before
+subtracting two energies. DESIGN.md's "Geometric basin dedupe" has the
+measurements; `report.MAX_DESCRIPTOR_MOLECULES = 8` caps the brute-force
+assignment search and raises above it.
 
 An MD candidate in `scored.json` also carries `n_frames` and `frames` -- how
 many scored frames quenched into that minimum, and their sampling dump
@@ -227,8 +244,9 @@ generator, plus a manifest, for a downstream DFT single point or reopt:
 Reads either a sweep or a docking output directory -- both write one
 `scored.json` per run in the same shape, so this needs no branch on which
 generator produced them. Per n: pool every run's candidates via
-`dedupe_groups` (the same 1 meV criterion `pool_by_n` uses, kept as groups
-rather than representatives so a pooled basin's `n_frames` can be summed),
+`dedupe_groups` (the same 5 meV + 0.15 A criterion `pool_by_n` uses, reading
+each candidate's stored `descriptor`, kept as groups rather than
+representatives so a pooled basin's `n_frames` can be summed),
 keep everything within `--window-kcal` (default 3.0, ~5 kT) of that n's
 minimum, and union in any basin whose pooled `frame_share` is at or above
 `--occupancy-floor` (default 0.10) even outside the window; `--max-per-n` is a

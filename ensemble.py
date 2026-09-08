@@ -39,7 +39,9 @@ from ase.optimize import BFGS
 from ase.units import Bohr, Hartree
 
 from report import (
+    DEDUPE_TOL_EV,
     EV_TO_KCAL,
+    GEOM_TOL_A,
     dedupe_groups,
     ensemble_energy,
     format_scored_log,
@@ -154,6 +156,14 @@ class Candidate:
     # floppy cluster -- worth knowing before anyone tries swapping it on a
     # larger system.
     n_opt_steps: int
+    # The permutation- and rigid-motion-invariant contact fingerprint this
+    # candidate is deduped by, from `contact_descriptor`. Required, not
+    # optional: the basin criterion is `|dE| <= tol AND descriptor distance
+    # <= tol`, and a candidate without one cannot be grouped at all. Both
+    # generators fill it, so a `scored.json` missing it is a broken run rather
+    # than an old one -- and reading it fails loudly, as CLAUDE.md's rule for
+    # every other mandatory field says it should.
+    descriptor: dict
     # Which of the previous n's surviving parents a docked candidate grew
     # from -- the greedy chain made visible. `None` for an MD candidate,
     # which descends from a packing rather than from another structure.
@@ -190,6 +200,79 @@ def solvent_molecule_gaps(atoms, n_solute, atoms_per_solvent):
         d = np.linalg.norm(positions[sel][:, None, :] - solute_p[None, :, :], axis=2)
         gaps[m] = float((d - radii[sel][:, None] - solute_r[None, :]).min())
     return gaps
+
+
+def contact_descriptor(atoms, n_solute, atoms_per_solvent):
+    """A permutation- and rigid-motion-invariant fingerprint of one geometry.
+
+    What `report.descriptors_match` compares to decide whether two optimised
+    candidates are the same basin. Energy alone cannot: pooling one n = 2
+    sweep, the median nearest-neighbour gap between candidates is 1.08 meV
+    against the 1 meV merge window that used to be the whole criterion, so
+    isoenergetic-but-distinct minima were being fused wholesale: 82% of the
+    merges at n = 2 joined structures the descriptor calls different, some of
+    them 4 A apart. DESIGN.md's "Geometric basin dedupe" has the numbers.
+
+    Two blocks, both in Angstrom so one tolerance covers them:
+
+      * `contacts`, an `n_mol x n_solute` matrix. Entry `(m, i)` is the
+        distance from solute atom `i` to solvent molecule `m`, minimised over
+        `m`'s own atoms -- which absorbs intra-solvent atom permutations
+        (chloroform's three Cl, acetone's methyl rotation) for free. Within
+        each row the distances are then sorted *within each solute element
+        block*, elements in ascending atomic number, making the descriptor
+        invariant under same-element relabelling of the solute. For a small
+        rigid aromatic that is exactly its automorphism group -- pyrazine's
+        two equivalent nitrogens stay one basin instead of splitting -- and
+        no automorphism search is needed. For a large floppy solute with many
+        same-element atoms it is a *superset* of the true symmetry and can
+        under-split; that is the documented limit.
+      * `solvent_gaps`, the sorted vector of pairwise closest van der Waals
+        gaps between solvent molecules, so two structures with identical
+        solute contacts but different shell packing are still distinguished.
+        Sorted, hence already invariant under solvent relabelling, so it takes
+        no part in the assignment search `descriptors_match` runs.
+
+    Distances only: rigid-body motion is quotiented out by construction, with
+    no superposition and no Kabsch. Plain lists, so it serialises into
+    `scored.json` through `dataclasses.asdict` like every other field.
+    """
+    positions = atoms.get_positions()
+    numbers = atoms.get_atomic_numbers()[:n_solute]
+    radii = _vdw_radii_array(atoms)
+    solute_p = positions[:n_solute]
+
+    n_solvent_atoms = len(atoms) - n_solute
+    n_mol = (n_solvent_atoms // atoms_per_solvent
+             if atoms_per_solvent > 0 and n_solvent_atoms > 0 else 0)
+    # Fixed element order, so two candidates' rows line up feature by feature.
+    blocks = [np.flatnonzero(numbers == z)
+              for z in sorted(set(numbers.tolist()))]
+
+    contacts = np.empty((n_mol, n_solute))
+    for m in range(n_mol):
+        lo = n_solute + m * atoms_per_solvent
+        sel = slice(lo, lo + atoms_per_solvent)
+        d = np.linalg.norm(positions[sel][:, None, :] - solute_p[None, :, :],
+                           axis=2).min(axis=0)
+        at = 0
+        for block in blocks:
+            contacts[m, at:at + len(block)] = np.sort(d[block])
+            at += len(block)
+
+    gaps = []
+    for a in range(n_mol):
+        la = n_solute + a * atoms_per_solvent
+        sa = slice(la, la + atoms_per_solvent)
+        for b in range(a + 1, n_mol):
+            lb = n_solute + b * atoms_per_solvent
+            sb = slice(lb, lb + atoms_per_solvent)
+            d = np.linalg.norm(positions[sa][:, None, :]
+                               - positions[sb][None, :, :], axis=2)
+            gaps.append(float((d - radii[sa][:, None]
+                               - radii[sb][None, :]).min()))
+
+    return {"contacts": contacts.tolist(), "solvent_gaps": sorted(gaps)}
 
 
 @dataclass
@@ -379,6 +462,15 @@ def summarise(run_dir, label, pack_mode, seed, n_solvent, candidates, unique,
         "max_frames": scoring.max_frames if pack_mode == "md" else None,
         "opt_fmax": scoring.fmax,
         "opt_steps": scoring.opt_steps,
+        # The basin criterion these candidates were grouped by. Recorded with
+        # the numbers it shaped because changing it silently moves every basin
+        # count, `n_seeds_hit`, weight and occupancy in this file without
+        # moving `min_interaction_kcal` at all -- exactly the `wall_slack`
+        # hazard CLAUDE.md warns about. They are module constants in `report`
+        # rather than `Scoring` fields (`pool_by_n` is handed summaries, not a
+        # `Scoring`), so they are recorded here rather than arriving via one.
+        "dedupe_tol_eV": DEDUPE_TOL_EV,
+        "geom_tol_A": GEOM_TOL_A,
         "n_frames_scored": n_frames_scored,
         "n_unique": len(unique),
         "e_solute_ref_eV": e_solute,
@@ -459,6 +551,7 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
             wall_energy_eV=float(records[index]["wall_energy_eV"]),
             gnorm_Eh_bohr=result.gnorm_Eh_bohr,
             n_opt_steps=result.n_opt_steps,
+            descriptor=contact_descriptor(result.atoms, n_solute, aps),
             frames=[index],
         ), result.atoms))
 
@@ -483,12 +576,16 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
     # `report.dedupe_groups` rather than a criterion of our own, because the
     # same question -- is this the same minimum? -- is asked again by
     # `report.pool_by_n` when the candidates of every packing at one n are
-    # pooled, and the two answers have to agree by construction.
+    # pooled, and the two answers have to agree by construction. It is the
+    # energy *and* the geometry that answer it: energy alone fused distinct
+    # minima wholesale (see `contact_descriptor` and DESIGN.md), so every
+    # candidate's descriptor goes in beside its energy.
     unique = [
         (replace(pairs[g[0]][0], n_frames=len(g),
                  frames=sorted(pairs[i][0].frame for i in g)),
          pairs[g[0]][1])
-        for g in dedupe_groups([c.energy_eV for c, _ in pairs])
+        for g in dedupe_groups([c.energy_eV for c, _ in pairs],
+                               [c.descriptor for c, _ in pairs])
     ]
     # How far apart, in fs, the frames actually sent to the optimiser are --
     # what the occupancy section has to be read against a decorrelation time

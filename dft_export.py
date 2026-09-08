@@ -5,13 +5,14 @@ directory -- both write one `scored.json` per run, in the same shape (see
 `ensemble.assemble` and `docking._assemble_dock_n`), so this needs no branch
 on which generator produced them.
 
-Per n: pool every run's candidates, dedupe at `report.DEDUPE_TOL_EV` (the same
-criterion `pool_by_n` uses), and keep everything within `window_kcal` of that
-n's minimum. A window rather than a fixed count, so the exported set adapts to
-the system -- 3 kcal/mol is ~5 kT and comfortably spans both motifs measured
-on pyrazine + 2 chloroform (the both-nitrogens minimum and the pooled MD
-minimum are 1.56 kcal/mol apart), which is the concrete test that it is not
-too tight.
+Per n: pool every run's candidates, dedupe at `report.DEDUPE_TOL_EV` +
+`report.GEOM_TOL_A` (the same two-axis criterion `pool_by_n` uses, reading
+each candidate's stored contact `descriptor`), and keep everything within
+`window_kcal` of that n's minimum. A window rather than a fixed count, so the
+exported set adapts to the system -- 3 kcal/mol is ~5 kT and comfortably
+spans both motifs measured on pyrazine + 2 chloroform (the both-nitrogens
+minimum and the pooled MD minimum are 1.56 kcal/mol apart), which is the
+concrete test that it is not too tight.
 
 A basin whose pooled frame share is at or above `occupancy_floor` (default
 0.10) is unioned in as well, even outside the window -- a structure the shell
@@ -47,8 +48,8 @@ from pathlib import Path
 
 from ase.io import read, write
 
-from report import (DEDUPE_TOL_EV, EV_TO_KCAL, basin_visits,
-                    boltzmann_weights, dedupe_groups)
+from report import (EV_TO_KCAL, basin_visits, boltzmann_weights,
+                    dedupe_groups)
 
 
 def _iter_run_dirs(root):
@@ -150,11 +151,14 @@ def export_dft(run_or_sweep_dir, out_dir, window_kcal=3.0, max_per_n=None,
             continue
         # Groups, not just representatives, so a basin's pooled `n_frames`
         # can be summed across every run that contributed a candidate to it
-        # -- same tolerance, same representatives (`group[0]`, ascending
+        # -- same tolerances, same representatives (`group[0]`, ascending
         # energy), same ordering `dedupe_energies` used to give, just without
-        # discarding the members.
+        # discarding the members. The stored `descriptor` rather than one
+        # re-derived from `scored_candidates.xyz`: it is the same fingerprint
+        # `pool_by_n` groups by, and re-deriving it here would be a second
+        # implementation of the criterion for the two to disagree over.
         basin_groups = dedupe_groups([c["energy_eV"] for _, _, _, c in tagged],
-                                     DEDUPE_TOL_EV)
+                                     [c["descriptor"] for _, _, _, c in tagged])
         deduped = [tagged[g[0]] for g in basin_groups]
         weights = boltzmann_weights([c["energy_eV"] for _, _, _, c in deduped],
                                     deduped[0][1]["temperature_K"])

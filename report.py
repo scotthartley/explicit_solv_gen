@@ -29,6 +29,7 @@ import json
 import time
 from datetime import datetime
 from importlib import metadata
+from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -115,35 +116,142 @@ def banner(text):
     return f"{_RULE}\n {text}\n{_RULE}"
 
 
-# Two optimised energies this close are one minimum. The criterion lives here,
-# beside the Boltzmann weighting and for the same reason: `ensemble` dedupes
-# the candidates of one run with it, and `pool_by_n` dedupes the pooled
-# candidates of every seed at one n with it, and the two must be the same test
-# by construction rather than by comment.
-DEDUPE_TOL_EV = 1e-3
+# Two optimised candidates are one minimum when their energies are this close
+# *and* their contact descriptors are (`GEOM_TOL_A` below). The criterion
+# lives here, beside the Boltzmann weighting and for the same reason:
+# `ensemble` dedupes the candidates of one run with it, `pool_by_n` dedupes
+# the pooled candidates of every seed at one n with it, and `dft_export`
+# re-pools them again -- the three must be the same test by construction
+# rather than by comment, and `pool_by_n` is handed summaries rather than a
+# `Scoring` to read a setting off.
+#
+# 5 meV, up from the 1 meV this was through 0.10.0, because geometry is the
+# real test now and energy is the cheap guard beside it. At 1 meV the energy
+# axis was saturated: pooling 76 candidates from one n = 2 sweep spans 284 meV
+# with a *median nearest-neighbour gap of 1.08 meV*, so a 1 meV window was
+# deciding almost nothing. Measured on that pool, pairs the descriptor calls
+# identical (within `GEOM_TOL_A`) differ in energy by up to 2.07 meV -- above
+# the old window, which was therefore splitting them -- and 5 meV covers that
+# with margin while staying an order of magnitude under the ~29 meV of the
+# nearest pairs the descriptor cannot separate but energy can. Widening this
+# is what fixes the false splits; the geometry veto fixes the false merges.
+DEDUPE_TOL_EV = 5e-3
+
+# Two contact descriptors this close, in Angstrom, are one basin. Picked from
+# a gap in the data, not guessed: over all 2850 pairs of that same n = 2 pool
+# the descriptor distances run 0.01-0.12 A for sixteen pairs and then stop
+# dead until 0.16 A, with the bulk of the distribution only starting at 0.19
+# -- a genuine within-basin cluster, an empty band, and then everything else.
+# 0.15 sits in the empty band. That the within-basin cluster is that tight is
+# also what says `Scoring.fmax = 0.002` is converged enough for the criterion
+# to be stable; at the 0.05 it used to be, it would not be.
+GEOM_TOL_A = 0.15
+
+# Above this many solvent molecules the brute-force assignment search in
+# `descriptors_match` stops being free (8! = 40320 comparisons of small
+# arrays). Real n stays well under it -- `monolayer_capacity` is what says how
+# far a first shell goes -- and there is no scipy in `environment.yml` to
+# reach for a Hungarian solver, so this raises rather than silently degrading.
+MAX_DESCRIPTOR_MOLECULES = 8
 
 
-def dedupe_groups(energies_eV, tol_eV=DEDUPE_TOL_EV):
+def _descriptor_arrays(descriptor):
+    return (np.asarray(descriptor["contacts"], dtype=float),
+            np.asarray(descriptor["solvent_gaps"], dtype=float))
+
+
+def _descriptor_pair(a, b):
+    """The two candidates' arrays plus the assignment-invariant deviation.
+
+    `solvent_gaps` is already sorted, hence invariant under relabelling the
+    solvent molecules, so it takes no part in the permutation search and its
+    deviation is a floor on the distance rather than something to minimise.
+    """
+    ca, ga = _descriptor_arrays(a)
+    cb, gb = _descriptor_arrays(b)
+    if ca.shape != cb.shape or ga.shape != gb.shape:
+        raise ValueError(
+            f"descriptors have different shapes ({ca.shape}, {ga.shape}) vs "
+            f"({cb.shape}, {gb.shape}); they describe different systems and "
+            "cannot be compared. Candidates are only ever grouped within one "
+            "n of one sweep, so this means two runs' candidates were mixed.")
+    if ca.shape[0] > MAX_DESCRIPTOR_MOLECULES:
+        raise ValueError(
+            f"{ca.shape[0]} solvent molecules exceeds "
+            f"MAX_DESCRIPTOR_MOLECULES = {MAX_DESCRIPTOR_MOLECULES}; the "
+            "assignment search in `descriptors_match` is brute force and "
+            "there is no scipy in this environment to replace it with.")
+    floor = float(np.abs(ga - gb).max()) if ga.size else 0.0
+    return ca, cb, floor
+
+
+def descriptors_match(a, b, tol_A=GEOM_TOL_A):
+    """Are these two contact descriptors the same basin, within `tol_A`?
+
+    `descriptor_distance` with an early exit, which is the form the greedy
+    dedupe below wants: it only ever asks whether a candidate belongs in a
+    group, never how far away it is.
+    """
+    ca, cb, floor = _descriptor_pair(a, b)
+    if floor > tol_A:
+        return False
+    if ca.shape[0] == 0:
+        return True
+    return any(np.abs(ca[list(p)] - cb).max() <= tol_A
+               for p in permutations(range(ca.shape[0])))
+
+
+def descriptor_distance(a, b):
+    """How far apart two contact descriptors are, in Angstrom.
+
+    The max per-feature deviation, minimised over assignments of one
+    structure's solvent molecules to the other's -- a permutation search in
+    *descriptor* space rather than in Cartesian space, which is what makes it
+    a basin criterion rather than an RMSD. A naive coordinate RMSD would be
+    worse than the energy test it replaces: solvent molecules occupy a fixed
+    block layout but are chemically interchangeable, so two structures
+    identical up to swapping solvent 1 and 2 would score far apart and split,
+    where the energy test fused them correctly.
+
+    Brute force over `n_mol!` assignments. Not on the dedupe's hot path --
+    that is `descriptors_match` -- but the number a calibration wants.
+    """
+    ca, cb, floor = _descriptor_pair(a, b)
+    if ca.shape[0] == 0:
+        return floor
+    return max(floor, min(float(np.abs(ca[list(p)] - cb).max())
+                          for p in permutations(range(ca.shape[0]))))
+
+
+def dedupe_groups(energies_eV, descriptors=None, tol_eV=DEDUPE_TOL_EV,
+                  geom_tol_A=GEOM_TOL_A):
     """Partition indices into distinct minima, lowest first within and across.
 
     Each inner list is one basin's member indices, representative (its own
     lowest-energy member) first; the groups themselves are ordered by that
     representative's energy ascending. Walking the indices in ascending
     energy order, an index joins the first existing group whose
-    representative is within `tol_eV`, else starts a new group -- exactly the
-    rule `dedupe_energies` used to decide keep-or-drop, just with the merged
-    members kept rather than thrown away.
+    representative it matches, else starts a new group. That contract is
+    load-bearing well beyond this function -- `keep[0]` being the pooled
+    minimum, `basins[0]`, `best.xyz` selection and `write_best_geometries` all
+    rest on it.
 
-    Energy-based rather than RMSD-based: it cannot tell two genuinely
-    different structures apart when they happen to be isoenergetic, which for
-    ranking purposes costs nothing, and it needs nothing but the numbers
-    already in `scored.json` -- no geometries, no ASE, no calculator.
+    Two candidates match when their energies are within `tol_eV` **and** their
+    contact descriptors within `geom_tol_A`. Geometry is the real test and
+    energy the cheap guard beside it: a guard against the descriptor's own
+    lossiness, and the pre-sort that keeps this greedy pass deterministic.
+    `descriptors` is aligned with `energies_eV`; omitting it falls back to the
+    energy-only test this used to be, which is what the screening pass in
+    `docking.py` wants when it has no descriptors to hand.
     """
     order = sorted(range(len(energies_eV)), key=lambda i: energies_eV[i])
     groups = []
     for i in order:
         for group in groups:
-            if abs(energies_eV[i] - energies_eV[group[0]]) <= tol_eV:
+            if abs(energies_eV[i] - energies_eV[group[0]]) <= tol_eV and (
+                    descriptors is None
+                    or descriptors_match(descriptors[i], descriptors[group[0]],
+                                         geom_tol_A)):
                 group.append(i)
                 break
         else:
@@ -151,14 +259,33 @@ def dedupe_groups(energies_eV, tol_eV=DEDUPE_TOL_EV):
     return groups
 
 
-def dedupe_energies(energies_eV, tol_eV=DEDUPE_TOL_EV):
+def dedupe_energies(energies_eV, descriptors=None, tol_eV=DEDUPE_TOL_EV,
+                    geom_tol_A=GEOM_TOL_A):
     """Indices of the distinct minima, lowest first.
 
     A thin wrapper over `dedupe_groups` that keeps only the representatives --
     for the many callers that only ever wanted keep-or-drop and never needed
     which candidates a representative absorbed.
     """
-    return [group[0] for group in dedupe_groups(energies_eV, tol_eV)]
+    return [group[0] for group in
+            dedupe_groups(energies_eV, descriptors, tol_eV, geom_tol_A)]
+
+
+def same_basin(energy_a, descriptor_a, energy_b, descriptor_b,
+               tol_eV=DEDUPE_TOL_EV, geom_tol_A=GEOM_TOL_A):
+    """The dedupe criterion, for two named candidates rather than a list.
+
+    `found_by`, the `best` marker in the per-packing table and docking's
+    per-parent table all ask "is this the same minimum as that one?" without
+    partitioning anything, and all three used to answer it with an inline
+    `abs(dE) <= tol` that bypassed `dedupe_groups` entirely -- so a criterion
+    change moved the pooling and left them behind, silently disagreeing with
+    it. Four loose values rather than two candidate objects, because the
+    callers hold `scored.json` dicts in one place and `ensemble.Candidate`
+    dataclasses in another.
+    """
+    return (abs(energy_a - energy_b) <= tol_eV
+            and descriptors_match(descriptor_a, descriptor_b, geom_tol_A))
 
 
 def basin_visits(summary, member_frames):
@@ -731,8 +858,12 @@ def pool_by_n(summaries):
     the basin) separate "many genuine revisits" from "one long loiter" with
     the same frame count; `n_seeds` is the same denominator `found_by` uses,
     so `n_seeds_hit` / `n_seeds` prints like `found by`. `contacts_split` flags
-    when the 1 meV dedupe provably fused distinct minima -- its members
-    disagree on `n_contacts`, which cannot happen for one real basin. `None`
+    when the dedupe provably fused distinct minima -- its members disagree on
+    `n_contacts`, which cannot happen for one real basin. It is kept now that
+    the criterion is geometric because it is a check *on* that criterion: it
+    was the standing evidence that the energy-only test was fusing minima (58
+    flagged basins in one n = 3/4 production sweep), so it going quiet is what
+    says the descriptor is carrying the coordinate energy was missing. `None`
     throughout the occupancy fields for a docked chain, the same as
     `n_frames_pooled` above.
 
@@ -764,7 +895,8 @@ def pool_by_n(summaries):
         group = sorted(group, key=_row_order)
         tagged = [(s, idx, c) for s in group
                   for idx, c in enumerate(s["candidates"])]
-        basin_groups = dedupe_groups([c["energy_eV"] for _, _, c in tagged])
+        basin_groups = dedupe_groups([c["energy_eV"] for _, _, c in tagged],
+                                     [c["descriptor"] for _, _, c in tagged])
         keep = [tagged[g[0]] for g in basin_groups]
         interactions = [c["interaction_eV"] for _, _, c in keep]
         absolutes = [c["energy_eV"] for _, _, c in keep]
@@ -772,9 +904,13 @@ def pool_by_n(summaries):
         temperature = group[0]["temperature_K"]
         pack_mode = group[0]["pack_mode"]
         # A seed "found" the pooled minimum when its own best candidate is the
-        # same minimum by the same test used everywhere else.
-        seed_minima = [min(c["interaction_eV"] for c in s["candidates"])
-                       for s in group]
+        # same minimum by the same test used everywhere else -- energy *and*
+        # geometry, via `same_basin`, rather than the inline energy comparison
+        # this was until 0.11.0, which quietly stopped agreeing with the
+        # pooling above it the moment the criterion gained a second axis.
+        seed_best = [min(s["candidates"], key=lambda c: c["interaction_eV"])
+                     for s in group]
+        seed_minima = [c["interaction_eV"] for c in seed_best]
         walls = [f for s in group if (f := _wall_fraction(s)) is not None]
         # `basin_groups` sorts ascending, so `keep[0]` is not just *a*
         # minimum -- it is the pooled minimum, and therefore its own
@@ -827,13 +963,15 @@ def pool_by_n(summaries):
                 "n_seeds": len(group),
                 "weight": float(weight),
                 "n_contacts": rep_c["n_contacts"],
-                # The 1 meV dedupe cannot tell two isoenergetic but distinct
-                # minima apart; members disagreeing on n_contacts is direct
-                # evidence it just fused two of them into one basin.
+                # Members disagreeing on n_contacts is direct evidence the
+                # dedupe just fused two distinct minima into one basin -- the
+                # failure the energy-only criterion had wholesale, and the
+                # check that says whether the geometric one still has it.
                 "contacts_split": len({c["n_contacts"]
                                        for _, _, c in members}) > 1,
             })
 
+        s_best, _idx_best, c_best = keep[0]
         # What corroborates the reported minimum, and out of how many tries.
         # For a sweep those are independent packings agreeing on it. A
         # docking row is one constructed chain instead, so the analogue is
@@ -844,12 +982,19 @@ def pool_by_n(summaries):
         if pack_mode == "dock":
             found_by = sum(s["found_by"] for s in group)
             n_searches = sum(s["n_refined"] for s in group)
+            found_by_seeds = None
         else:
-            found_by = sum(1 for m in seed_minima
-                           if abs(m - e_min) <= DEDUPE_TOL_EV)
+            # The seeds themselves, not just how many: `format_seed_detail`
+            # marks the same packings with `*`, and its caption promises the
+            # two agree. Recomputing the test there instead is how they came
+            # to disagree.
+            found_by_seeds = [
+                s["seed"] for s, c in zip(group, seed_best)
+                if same_basin(c["energy_eV"], c["descriptor"],
+                              c_best["energy_eV"], c_best["descriptor"])]
+            found_by = len(found_by_seeds)
             n_searches = len(group)
 
-        s_best, _idx_best, c_best = keep[0]
         # The pooled `frame_share` maximum -- ties broken by how many seeds
         # hit it, then by energy -- on the same footing `best` gives the
         # minimum. `None` for a docked chain: `basins` carries no occupancy
@@ -875,6 +1020,7 @@ def pool_by_n(summaries):
             # argument in `boltzmann_weights`.
             "e_cluster_ens_eV": ensemble_energy(absolutes, temperature),
             "found_by": found_by,
+            "found_by_seeds": found_by_seeds,
             "seed_minima_kcal": [m * EV_TO_KCAL for m in seed_minima],
             # Over the *distinct minima* -- a property of how many kinds of
             # basin the search turned up, not of how the trajectory's time
@@ -1041,18 +1187,18 @@ def format_seed_detail(summaries, pooled):
     quantity now, and a per-packing one would be pairing independent searches
     by index.
     """
-    tol_kcal = DEDUPE_TOL_EV * EV_TO_KCAL
-    best_by_n = {p["n_solvent"]: p["e_int_min_kcal"] for p in pooled}
+    # The packings `pool_by_n` counted in `found_by`, taken from it rather
+    # than recomputed here: the criterion is two-axis now, and a second
+    # implementation of it beside the first is how the two would drift.
+    found = {(p["n_solvent"], seed) for p in pooled
+             for seed in (p["found_by_seeds"] or ())}
     header = (f"{'n':>3} {'seed':>4} {'best':>4} {'E_int(min)':>12} "
               f"{'uniq':>5} {'contacts':>9} {'dissolved':>10} {'wall':>6}")
     lines = ["Per-packing detail", "------------------", header,
              "-" * len(header)]
     for s in sorted(summaries, key=_row_order):
         frac = _wall_fraction(s)
-        e_min = best_by_n.get(s["n_solvent"])
-        star = ("*" if e_min is not None
-                and abs(s["min_interaction_kcal"] - e_min) <= tol_kcal
-                else "")
+        star = "*" if (s["n_solvent"], s["seed"]) in found else ""
         lines.append(
             f"{s['n_solvent']:>3} "
             f"{s['seed']:>4} "
@@ -1068,9 +1214,10 @@ def format_seed_detail(summaries, pooled):
         "the lowest of this\n  E_int(min) column, not the mean of it. uniq = "
         "its own count of distinct\n  minima; contacts / dissolved are "
         "frame-weighted over its own scored frames.\n  'best' marks a packing "
-        f"within {1000 * DEDUPE_TOL_EV:.0f} meV of the pooled minimum at its "
-        "n -- the\n  same test 'found by' counts, so the number of '*' at "
-        "an n equals its 'found by'\n  numerator.")
+        "whose own best candidate *is* the pooled minimum at its\n  n -- "
+        f"within {1000 * DEDUPE_TOL_EV:.0f} meV and {GEOM_TOL_A:.2f} A of "
+        "contact descriptor, the same test\n  'found by' counts, so the "
+        "number of '*' at an n equals its 'found by'\n  numerator.")
     return "\n".join(lines)
 
 
@@ -1095,10 +1242,12 @@ def format_basin_occupancy(params, summaries, pooled, top_n=_OCCUPANCY_TOP_N):
     (`candidate_index`, guaranteed equal by `ensemble.assemble`). `+` marks
     the pooled minimum's row (`basins[0]` by construction -- see
     `pool_by_n`), `*` the modal row (`pooled[n]["modal"]`), and `!` a basin
-    whose members disagree on `n_contacts` -- direct evidence the 1 meV
-    dedupe fused two distinct minima into one count (README's "Reading
-    report.txt" caveat 2, now flagged per basin instead of only mentioned in
-    general).
+    whose members disagree on `n_contacts` -- direct evidence the dedupe fused
+    two distinct minima into one count. Under the energy-only criterion that
+    was routine (58 flagged basins in one n = 3/4 production sweep, which is
+    what motivated the geometric one); under the current criterion it should
+    be rare, and a run where it is not says the descriptor is missing a
+    coordinate. README's "Reading report.txt" caveat 2 has the rest.
 
     A table of frame counts invites being read as a Boltzmann population and
     is not one; the caveats that go with it are in the README, under Reading
@@ -1170,8 +1319,8 @@ def format_basin_occupancy(params, summaries, pooled, top_n=_OCCUPANCY_TOP_N):
     lines.append(f"scored frame spacing: {spacing_str}")
     if n_collisions:
         lines.append(
-            f"basins flagged '!' (members disagree on n_contacts -- the 1 "
-            f"meV dedupe fused\ndistinct minima): {n_collisions}")
+            "basins flagged '!' (members disagree on n_contacts -- the dedupe "
+            f"fused\ndistinct minima): {n_collisions}")
 
     lines.append(
         "\n  How many of the scored frames quenched into each basin, pooled "
@@ -1316,8 +1465,9 @@ def format_search_convergence(params, pooled):
 
     lines.append(
         "\n  'found by' = how many of that n's packings reached the pooled "
-        f"minimum, by the\n  same {1000 * DEDUPE_TOL_EV:.0f} meV criterion "
-        "that dedupes candidates within a run. Their\n  agreement is the "
+        f"minimum, by the\n  same {1000 * DEDUPE_TOL_EV:.0f} meV + "
+        f"{GEOM_TOL_A:.2f} A criterion that dedupes candidates within a\n  "
+        "run. Their agreement is the "
         "evidence, not their scatter: 'spread' is the full range of\n  the "
         "per-packing minima, printed to be seen rather than used as an error "
         f"bar.\n  Widest here: {worst:.2f} kcal/mol -- a difference you go on "

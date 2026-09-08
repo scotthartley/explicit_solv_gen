@@ -60,6 +60,7 @@ from ensemble import (
     CONTACT_GAP_A,
     Candidate,
     Scoring,
+    contact_descriptor,
     reference_energies,
     relax,
     solvent_molecule_gaps,
@@ -68,11 +69,13 @@ from ensemble import (
 from report import (
     DEDUPE_TOL_EV,
     EV_TO_KCAL,
+    GEOM_TOL_A,
     VERSION,
     dedupe_energies,
     format_report,
     library_versions,
     pool_by_n,
+    same_basin,
     timestamp,
     write_best_geometries,
 )
@@ -118,14 +121,22 @@ class Docking:
     # at most ten refinements -- and capped `dft_export`'s window at ten
     # candidates per n whatever the window said.
     n_refine: int = 10
-    # Two screened energies this close are one basin for the purpose of
-    # choosing what to refine. Deliberately looser than `report.DEDUPE_TOL_EV`
-    # (1 meV): at `screen_fmax = 0.05` two placements in the same basin can
-    # still differ by up to ~0.6 kcal/mol, so this errs toward refining a
-    # duplicate rather than dropping a basin. ~0.1 kcal/mol. The screened
-    # energies never reach a `scored.json`, so neither does this criterion;
-    # the refined candidates are deduped at the 1 meV one like everything else.
-    screen_dedupe_tol_eV: float = 4e-3
+    # Two screened placements this close in energy *and* in contact
+    # descriptor are one basin for the purpose of choosing what to refine.
+    # Both are deliberately looser than the scorer's `report.DEDUPE_TOL_EV` /
+    # `report.GEOM_TOL_A`, because a screened geometry is relaxed only to
+    # `screen_fmax`: at 0.05 eV/A two placements in the same basin can still
+    # differ by up to ~0.6 kcal/mol in energy and by far more than the
+    # scorer's 0.15 A in geometry, so a criterion tuned for converged minima
+    # would shatter one screened basin into a dozen near-copies and spend
+    # every `n_refine` slot on them -- the exact starvation 0.9.0's per-parent
+    # refinement budget exists to prevent. Both still sit comfortably inside
+    # that scatter, so the pass errs toward refining a duplicate rather than
+    # dropping a basin. The screened energies never reach a `scored.json`, so
+    # neither does this criterion; the refined candidates are deduped at the
+    # scorer's like everything else.
+    screen_dedupe_tol_eV: float = 1e-2
+    screen_geom_tol_A: float = 0.5
     # Loose first pass so paying for `n_placements` per parent is cheap;
     # DESIGN.md measures 1.3 s vs 4.5 s per candidate at 0.05 vs 0.002 on the
     # pyrazine + 2 chloroform system.
@@ -213,8 +224,10 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     Builds `len(parents) * docking.n_placements` random placements (see
     `place_one`), screens all of them at `docking.screen_fmax`, and refines
     up to `docking.n_refine` *per parent* at the scorer's tight criterion:
-    the parent's screened energies are deduped at
-    `docking.screen_dedupe_tol_eV` and the lowest representative of each
+    the parent's screened placements are deduped at
+    `docking.screen_dedupe_tol_eV` / `docking.screen_geom_tol_A` -- the same
+    two-axis basin test the scorer uses, at the looser tolerances a
+    loosely-relaxed geometry needs -- and the lowest representative of each
     screened basin is refined, best-first, so the refined set carries every
     distinct basin the screen found rather than the best basin several times
     over. Fewer than `n_refine` are refined when a parent's placements
@@ -263,12 +276,16 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     by_parent = {}
     for i, parent_index in enumerate(sources):
         by_parent.setdefault(parent_index, []).append(i)
+    aps = len(solvent_unit)
+    descriptors = [contact_descriptor(r.atoms, n_solute, aps) for r in screened]
     top = []
     for parent_index in sorted(by_parent):
         members = by_parent[parent_index]
         representatives = dedupe_energies(
             [screened[i].energy_eV for i in members],
-            docking.screen_dedupe_tol_eV)
+            [descriptors[i] for i in members],
+            tol_eV=docking.screen_dedupe_tol_eV,
+            geom_tol_A=docking.screen_geom_tol_A)
         top += [members[r] for r in representatives[:docking.n_refine]]
 
     refine_tasks = [(screened[i].atoms, calculator, solvation,
@@ -322,29 +339,38 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             wall_energy_eV=None,
             gnorm_Eh_bohr=result.gnorm_Eh_bohr,
             n_opt_steps=result.n_opt_steps,
+            descriptor=contact_descriptor(result.atoms, n_solute, aps),
             parent=parent_index,
             n_frames=None,
             frames=None,
         ))
 
-    keep_idx = dedupe_energies([c.energy_eV for c in candidates])
+    keep_idx = dedupe_energies([c.energy_eV for c in candidates],
+                               [c.descriptor for c in candidates])
     unique = [candidates[i] for i in keep_idx]
-    e_min = min(c.interaction_eV for c in unique)
+    best = candidates[keep_idx[0]]
 
     write(n_dir / "best.xyz", pairs[keep_idx[0]][0].atoms)
     write(n_dir / "scored_candidates.xyz", [pairs[i][0].atoms for i in keep_idx])
     write(n_dir / "ref_solute.xyz", ref_solute_atoms)
     write(n_dir / "ref_solvent.xyz", ref_solvent_atoms)
 
+    # `same_basin` rather than an inline energy comparison, so this table and
+    # `found_by` below ask the identical question `dedupe_energies` just
+    # asked above -- energy *and* contact descriptor.
+    def is_best(c):
+        return same_basin(c.energy_eV, c.descriptor,
+                          best.energy_eV, best.descriptor)
+
     per_parent = {}
     for c in candidates:
-        per_parent.setdefault(c.parent, []).append(c.interaction_eV)
+        per_parent.setdefault(c.parent, []).append(c)
     parent_detail = [
         {"parent": pi,
-         "n_placements": len(vals),
-         "e_int_min_kcal": min(vals) * EV_TO_KCAL,
-         "best": abs(min(vals) - e_min) <= DEDUPE_TOL_EV}
-        for pi, vals in sorted(per_parent.items())
+         "n_placements": len(cs),
+         "e_int_min_kcal": min(c.interaction_eV for c in cs) * EV_TO_KCAL,
+         "best": any(is_best(c) for c in cs)}
+        for pi, cs in sorted(per_parent.items())
     ]
 
     summary = summarise(
@@ -370,8 +396,7 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             # placements that landed on this n's minimum. Not independent
             # corroboration the way agreeing packings are -- see
             # `report.format_dock_parent_detail`.
-            "found_by": sum(1 for c in candidates
-                            if abs(c.interaction_eV - e_min) <= DEDUPE_TOL_EV),
+            "found_by": sum(1 for c in candidates if is_best(c)),
             "parent_detail": parent_detail,
         },
     )
@@ -451,7 +476,9 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
             scoring, n_tried, n_parents_used, n_solute, aps)
         all_n_min_kcal[n] = summary["min_interaction_kcal"]
 
-        keep_idx = dedupe_energies([r.energy_eV for r, _ in pairs])
+        keep_idx = dedupe_energies(
+            [r.energy_eV for r, _ in pairs],
+            [contact_descriptor(r.atoms, n_solute, aps) for r, _ in pairs])
         parents = [pairs[i][0].atoms for i in keep_idx[:docking.n_parents]]
 
         if n in n_values:
@@ -493,6 +520,12 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
         "solvent_path": str(solvent_path),
         "n_values": list(n_values),
         "monolayer_capacity": capacity,
+        # The basin criterion the refined candidates were deduped by, recorded
+        # for the same reason `n_sweep.sweep_params` records it: it moves
+        # `pool` and `found by` without moving `E_int(min)`. The screening
+        # pass's looser pair is already here, from `asdict(docking)`.
+        "dedupe_tol_eV": DEDUPE_TOL_EV,
+        "geom_tol_A": GEOM_TOL_A,
         # Every n walked internally, not just the requested rows -- what lets
         # dE_int be computed for a requested n even when n - 1 was not itself
         # requested.
