@@ -449,13 +449,17 @@ microsolvation*: past roughly a third of a monolayer no single minimum
 dominates and solvent–solvent cohesion takes over, which is the MD sweep's
 regime instead. `run_docking` warns past that fraction, the same convention
 the `cover` column uses. Every placement is screened at a loose `fmax` and
-only the best are refined at the scorer's tight one: up to `--refine` (default
-10) **per parent**, one per distinct screened basin, so the refined set — and
-with it the next `n`'s parents and what `dft_export` has to choose from —
-carries every basin the screen found rather than the best one several times
-over. See `DESIGN.md`'s `docking.py` section for the full measurements (staged
-screen-then-refine cost, the placement-count confidence argument, per-parent
-detail).
+only some are refined at the scorer's tight one: one per distinct screened
+basin, **per parent**, and *which* ones is an energy window rather than a
+rank — every basin within `--refine-window` (default 3.0 kcal/mol) of that
+parent's own screened minimum, capped at `--refine`. It has to be a window,
+because a geometry relaxed only to the loose `fmax` carries an energy that
+does not predict where it refines to: on one acetone grid run the best basin
+was the 247th of 410 by screened energy, so the flat top-10 this used to take
+missed it, and neither a bigger cap nor a tighter screen finds it. See
+`DESIGN.md`'s `docking.py` section for the full measurements (the
+screen-to-refine handoff, staged screen-then-refine cost, the placement-count
+confidence argument, per-parent detail).
 
 ## Packing: the seeds are independent draws
 

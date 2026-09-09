@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -479,6 +479,46 @@ def wall_warning(fraction, indent="  "):
         "** the Hamiltonian wants to disperse, and these energies are",
         "** contaminated by the confinement. Sample in gas phase, or accept",
         "** that there is no bound shell to find.",
+    ))
+
+
+def refine_cap_warning(summaries, indent="  "):
+    """Warning for parents whose `n_refine` cap bound, or None.
+
+    The cap exists to stop a runaway, not to choose anything: the selector is
+    `Docking.refine_window_kcal`. But once the cap bites it takes the lowest
+    *screened* representatives of the window, and the screened energy does
+    not predict the refined one -- that is the whole finding behind the
+    window (DESIGN.md's "The screen-to-refine handoff"). A capped run has
+    quietly reverted to the rank cut the window replaced, and nothing in its
+    refined candidates says so, which is why this reads `n_in_window` against
+    what was actually refined rather than inferring it from the output.
+    """
+    hits = [(s["n_solvent"], p["parent"], p["n_placements"], p["n_in_window"])
+            for s in sorted(summaries, key=_row_order)
+            for p in s["parent_detail"]
+            if p["n_in_window"] > p["n_placements"]]
+    if not hits:
+        return None
+    worst = max(h[3] - h[2] for h in hits)
+    where = ", ".join(f"n = {n} parent {pi} ({kept} of {total})"
+                      for n, pi, kept, total in hits[:4])
+    if len(hits) > 4:
+        where += f", and {len(hits) - 4} more"
+    return "\n".join(indent + line for line in (
+        f"** WARNING: the n_refine cap bound on {len(hits)} parent(s): "
+        f"{where}.",
+        "** Inside the window the cap keeps the lowest *screened* basins, and "
+        "screened",
+        "** energy does not predict where a basin refines to -- which is the "
+        "reason the",
+        f"** selector is a window and not a rank. Up to {worst} basin(s) per "
+        "parent went",
+        "** unrefined, so this run's minimum and its pool are both cuts of "
+        "what the",
+        "** search actually found. Raise --refine (or narrow --refine-window) "
+        "and re-run",
+        "** before trusting the pool, especially for a dft_export.",
     ))
 
 
@@ -1672,28 +1712,39 @@ def format_parent_detail(summaries):
     sweep has no analogue of -- it reads `parent_detail`, which only
     `docking._assemble_dock_n` writes.
     """
-    header = (f"{'n':>3} {'parent':>6} {'best':>4} {'placements':>10} "
-             f"{'E_int(min)':>12}")
+    header = (f"{'n':>3} {'parent':>6} {'best':>4} {'refined':>8} "
+             f"{'window':>7} {'E_int(min)':>12}")
     lines = ["Per-parent detail", "-----------------", header,
              "-" * len(header)]
     for p in sorted(summaries, key=_row_order):
         for parent in p["parent_detail"]:
             star = "*" if parent["best"] else ""
+            # A capped parent gets a marker on the number itself, so the row
+            # says which one the warning below is about.
+            capped = "!" if parent["n_in_window"] > parent["n_placements"] else ""
             lines.append(
                 f"{p['n_solvent']:>3} "
                 f"{parent['parent']:>6} "
                 f"{star:>4} "
-                f"{parent['n_placements']:>10} "
+                f"{parent['n_placements']:>8} "
+                f"{str(parent['n_in_window']) + capped:>7} "
                 f"{parent['e_int_min_kcal']:>12.2f}")
     lines.append(
         "\n  One row per parent used to grow to that n: its own best "
-        "E_int(min) among its\n  own random placements. 'best' marks the "
-        "parent whose descendant became the n's\n  reported minimum -- the "
-        "greedy chain made visible, and the reason docking\n  carries more "
-        "than one parent forward. Unlike the sweep's 'found by', several\n  "
-        "parents landing near one minimum is not independent corroboration: "
-        "every\n  parent explores the same shell region with independent "
-        "random poses, not a\n  differently-arranged packing.")
+        "E_int(min) among its\n  own placements. 'best' marks the parent "
+        "whose descendant became the n's\n  reported minimum -- the greedy "
+        "chain made visible, and the reason docking\n  carries more than one "
+        "parent forward. 'window' is how many distinct screened\n  basins "
+        "fell within --refine-window of that parent's screened minimum and "
+        "'refined'\n  how many were then optimised tightly; they differ, "
+        "marked '!', only when the\n  --refine cap bound, which is a rank cut "
+        "and is warned about below. Unlike the\n  sweep's 'found by', several "
+        "parents landing near one minimum is not independent\n  "
+        "corroboration: every parent explores the same shell region, not a\n  "
+        "differently-arranged packing.")
+    warning = refine_cap_warning(summaries)
+    if warning:
+        lines += ["", warning]
     return "\n".join(lines)
 
 

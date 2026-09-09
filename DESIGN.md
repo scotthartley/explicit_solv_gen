@@ -978,6 +978,131 @@ numbers above are one system, and moving a default wants more than that.
 `n_placements` is ignored in grid mode, so the params block's `place_mode` is
 what says which number was live.
 
+### The screen-to-refine handoff: a window, not a rank
+
+The staged screen was validated on its *minimum* (above), and separately on
+the *diversity* of what it refines (0.9.0's per-parent dedupe). What neither
+check asked is whether the screened **ranking** picks the right basins to
+refine at all, and under a systematic scan it does not. 0.12.0 already saw
+the symptom and mis-diagnosed it, advising "raise `--refine` before a
+`dft_export` from a grid run": raising it does not help, because the problem
+is not how many are refined but that they are chosen by an energy carrying no
+information about where they refine to.
+
+**The diagnostic.** Acetone, n = 1, grid mode, default shells, one parent,
+refining *every* screened basin representative instead of the top ten. 2798
+poses collapse into 410 screened basins; the best refined basin is the
+**247th** of them by screened energy, 1.50 kcal/mol above the screened
+minimum, at `E_int(min) = -4.608` against top-10's -4.541. This is the
+question the plan posed as "outside top-k, or merged into a neighbour's
+group?" and the answer is the first: the basin *is* a representative, it is
+simply never reached by a rank cut. Raising the cap does not rescue it --
+top-30 and top-50 still return -4.54, and the curve only reaches -4.599 by
+top-100.
+
+**Tightening the screen does not rescue it either, and costs more.** The
+obvious alternative was to make the screened energy a better predictor by
+relaxing further before ranking. Measured on the same 2798 poses:
+
+| `screen_fmax` | screen | refine-all | basins | best `E_int` | winner's rank | top-10 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.05 (default) | 8.2 s | 21.3 s | 410 | -4.608 | 247 of 410 | -4.541 |
+| 0.02 | 30.0 s | 16.7 s | 323 | -4.635 | 283 of 323 | -4.611 |
+| 0.01 | 69.4 s | 11.6 s | 230 | -4.625 | 155 of 230 | -4.611 |
+
+A tighter screen does lift what top-10 finds (-4.541 to -4.611) and does
+fuse near-duplicate basins (410 to 230), but the winner still sits 60-88% of
+the way down the ranking at every tightness, so a rank cut keeps missing it.
+And it is the wrong pass to spend on: screening every pose costs 3.7x and
+8.5x more, while refining the survivors gets *cheaper* (they start closer to
+a minimum), for a net 29.5 -> 46.7 -> 81.0 s. Refining every basin off the
+**loose** screen is both the cheapest column here and the only one that
+reaches the minimum. `screen_fmax` stays at 0.05.
+
+**So the cut is an energy window and `n_refine` is only its cost cap.** Every
+screened basin within `Docking.refine_window_kcal` of *that parent's own*
+screened minimum is refined, best-first, up to `n_refine` -- per parent, for
+the same reason the dedupe is per parent, so a lineage that screened a little
+higher than another still gets its own basins refined. 3.0 kcal/mol is
+`dft_export`'s window and about 5 kT, and it covers the measured winner at
+every screen tightness above (+1.50, +1.82, +1.17); at `fmax = 0.05` a
+screened energy is worth so little that the window's real job is only to drop
+what is plainly unbound.
+
+Note what this does *not* change: for a fixed parent, the refined set is now
+a strict superset of what the old top-10 refined -- the window admits a
+prefix of the same energy-ordered representatives and the cap sits well above
+10 -- so `E_int(min)` at that n can only fall or stay. A chain number that
+moves the wrong way is the greedy chain reacting to a different (better)
+parent, the documented `n_parents` caveat, and not the window losing a basin.
+Pyrazine, grid mode, one parent, n = 1 2 3, is exactly that case -- and the
+same table settles the cap:
+
+| solvent | policy | n = 1 | n = 2 | n = 3 | pool | wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| acetone | top-10 (old) | -4.541 | **-10.250** | -15.123 | 8 / 10 / 10 | 76.1 s |
+| acetone | window 3.0, cap 100 | -4.599 | -9.812 | -14.912 | 70 / 82 / 80 | 112.9 s |
+| acetone | window 3.0, cap 400 | **-4.608** | -10.020 | **-15.678** | 218 / 312 / 324 | 237.6 s |
+| chloroform | top-10 (old) | -6.667 | -13.022 | -18.208 | 1 / 3 / 8 | 203.0 s |
+| chloroform | window 3.0, cap 100 | -6.667 | -13.022 | -18.370 | 7 / 63 / 69 | 184.9 s |
+| chloroform | window 3.0, cap 400 | -6.667 | **-13.028** | **-18.384** | 7 / 151 / 233 | 550.9 s |
+
+At the default cap the change is lower at n = 1 and n = 3 in acetone (0.55
+kcal/mol at n = 3) and at n = 2 and n = 3 in chloroform, for 2.7-3.1x the
+wall-clock. Acetone's n = 2 goes the other way, and that is the greedy chain,
+not the window: the better n = 1 basin is a dead end one step on, which one
+parent cannot recover from and `n_parents = 3` exists to damp. The `pool`
+column is the other half of the result and the one `dft_export` cares about
+-- 8 distinct minima against 218 at n = 1 -- from a search that had already
+found them and was throwing them away.
+
+**`n_refine = 400` rather than 100, measured.** At one fixed parent the two
+are indistinguishable (n = 1 acetone: -4.599 against -4.608, a 0.009 kcal/mol
+gap under the 5 meV dedupe tolerance) and 100 is less than half the
+wall-clock, which is what made it the tempting default. Over a chain it is
+not: cap 100 lands acetone at n = 3 on **-14.912, worse than the old top-10's
+-15.123**, because a cap small enough to bind is still a rank cut in
+disguise, re-running the same lottery one level up and handing a worse parent
+forward. Cap 400 is at or below the old policy at every n in both solvents.
+100 remains the knob (`--refine 100`) for a deliberately cheaper grid run,
+with that caveat attached.
+
+**And a binding cap is reported, not left to be inferred.** The failure above
+is invisible from the refined output alone -- a run that refined its cap's
+worth of basins looks exactly like one that refined every basin it had -- so
+`dock_at_n` records how many basins each parent's window admitted
+(`n_in_window` in `parent_detail`) beside how many were actually refined. The
+Per-parent detail table shows both, marks the row `!` when they differ, and
+`report.refine_cap_warning` names the capped parents and says what it costs.
+The point is not the cap itself but what a capped run silently becomes: a
+rank cut on the screened energy, which is the thing this whole section
+measures as not working.
+
+**This is not a grid-only change.** It is easy to assume 64 random
+placements collapse into a handful of basins, and they do not: measured per
+parent over acetone and chloroform at n = 1, 2 and 3, a random parent yields
+**40-63** distinct screened basins, so the old flat top-10 was discarding
+about four fifths of them in the default mode too. The cap never binds there
+-- a random parent's entire screened spread is 1.5-3.2 kcal/mol, so the
+window admits nearly all of them (the two cases where it bit at all were 40
+basins to 37 and 62 to 56, both dropping only basins the old top-10 had
+never reached). At the real defaults -- `place_mode="random"`,
+`n_parents = 3` -- the change is worth *more* here than under the scan it was
+diagnosed on:
+
+| solvent | policy | n = 1 | n = 2 | n = 3 | pool | wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| chloroform | top-10 (old) | -6.651 | -12.997 | -18.167 | 3 / 25 / 26 | 46.0 s |
+| chloroform | window 3.0 | -6.651 | **-13.000** | **-18.328** | 17 / 59 / 78 | 107.7 s |
+| acetone | top-10 (old) | -4.563 | -9.366 | -14.764 | 8 / 28 / 29 | 50.5 s |
+| acetone | window 3.0 | **-4.585** | **-9.643** | **-15.653** | 34 / 162 / 172 | 192.5 s |
+
+Lower or equal at every n in both solvents -- 0.16 and 0.89 kcal/mol at n = 3
+-- for 2.3x and 3.8x the wall-clock, with the pool up 3-6x. The old rows
+reproduce the random-mode numbers this file already carried (-6.6514 /
+-12.9971 / -18.1672), which is the check that the harness behind these tables
+is the same pipeline and not a re-implementation of it.
+
 ### Applicability: where this stops working
 
 The same ~N^2.5 GFN2 gradient cost that limits the MD sweep limits docking,

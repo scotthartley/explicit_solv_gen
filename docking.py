@@ -158,15 +158,51 @@ class Docking:
     # greedy -- the best structure at n need not descend from the best at
     # n - 1 -- and this is the mitigation.
     n_parents: int = 3
-    # Placements re-relaxed at the scorer's tight fmax, after screening --
-    # **per parent**, and chosen among that parent's *distinct* screened
-    # basins (see `screen_dedupe_tol_eV`) rather than by raw screened energy.
-    # It used to be a total over all parents, taken off the raw ranking: ten
-    # of 192 at n >= 2, which could be ten copies of one basin. That starved
-    # `n_parents` -- the next generation's parents were the deduped top-3 of
-    # at most ten refinements -- and capped `dft_export`'s window at ten
-    # candidates per n whatever the window said.
-    n_refine: int = 10
+    # Which of a parent's distinct screened basins (see
+    # `screen_dedupe_tol_eV`) are re-relaxed at the scorer's tight fmax:
+    # every one within `refine_window_kcal` of that parent's own screened
+    # minimum, best-first, up to `n_refine` of them. **Both are per parent**,
+    # so a parent whose placements all screened a little higher than
+    # another's still gets its own basins refined -- that is what keeps the
+    # chain's `n_parents` lineages alive into the next generation.
+    #
+    # The window is the selector and `n_refine` is a cost cap, which is the
+    # opposite of how this worked until 0.13.0: `n_refine` was a flat top-10
+    # off the screened ranking, and **the screened ranking does not predict
+    # the refined one**. Measured, acetone n = 1 grid mode, refining all 410
+    # screened basins instead of the top ten: the best refined basin is the
+    # 247th by screened energy, 1.50 kcal/mol above the screened minimum, and
+    # E_int(min) is -4.608 against top-10's -4.541. Raising the flat cap does
+    # not reach it either (top-30 and top-50 both stall at -4.54), and
+    # neither does a tighter screen -- at `screen_fmax` 0.02 and 0.01 the
+    # winner still sits at rank 283 of 323 and 155 of 230, for 3.7x and 8.5x
+    # the screening cost. Hence a window wide enough to cover that scatter
+    # rather than a rank cut. See DESIGN.md's "The screen-to-refine handoff".
+    #
+    # 3.0 kcal/mol is `dft_export`'s window and about 5 kT, and it covers the
+    # measured winner at every screen tightness tried (+1.50, +1.82, +1.17).
+    # It is deliberately generous: at `screen_fmax = 0.05` a screened
+    # geometry's energy is worth little, so this excludes only what is
+    # plainly unbound -- which is the whole of its job.
+    refine_window_kcal: float = 3.0
+    # The cap, raised from 10 with the window above, and only a cost guard:
+    # the window is what selects. **This moves the random path too**, which
+    # is worth stating because it is the default mode and because the
+    # opposite is easy to assume: 64 random placements do not collapse into
+    # a handful of basins but into 40-63 distinct ones per parent (measured,
+    # acetone and chloroform, n = 1 to 3), so the old flat top-10 was
+    # refining about a fifth of them there as well. The cap does not bind in
+    # random mode; the window does the work, and it is nearly all of them --
+    # a random parent's whole screened spread is 1.5-3.2 kcal/mol.
+    #
+    # Nothing the old cut refined is dropped, at either mode: the window
+    # admits a prefix of the same energy-ordered representatives and the cap
+    # is well above 10, so the refined set is a strict superset of the old
+    # one for a fixed parent, and `E_int(min)` at that n can only fall or
+    # stay. A chain number that moves the wrong way is the greedy chain
+    # reacting to a better parent -- the `n_parents` caveat -- not a lost
+    # basin.
+    n_refine: int = 400
     # Two screened placements this close in energy *and* in contact
     # descriptor are one basin for the purpose of choosing what to refine.
     # Both are deliberately looser than the scorer's `report.DEDUPE_TOL_EV` /
@@ -451,22 +487,34 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     Builds the placements -- `len(parents) * docking.n_placements` random
     ones (see `random_placements`), or, at `place_mode="grid"`, every surface
     position x orientation pose that clears the tolerance (see
-    `grid_placements`) -- screens all of them at `docking.screen_fmax`, and refines
-    up to `docking.n_refine` *per parent* at the scorer's tight criterion:
-    the parent's screened placements are deduped at
+    `grid_placements`) -- screens all of them at `docking.screen_fmax`, and
+    refines a selection *per parent* at the scorer's tight criterion: the
+    parent's screened placements are deduped at
     `docking.screen_dedupe_tol_eV` / `docking.screen_geom_tol_A` -- the same
     two-axis basin test the scorer uses, at the looser tolerances a
     loosely-relaxed geometry needs -- and the lowest representative of each
     screened basin is refined, best-first, so the refined set carries every
     distinct basin the screen found rather than the best basin several times
-    over. Fewer than `n_refine` are refined when a parent's placements
-    collapsed into fewer screened basins than that.
+    over.
 
-    Returns `(refined, sources, n_tried)`: `refined` is a list of
-    `ensemble.Relaxed` objects, `sources[i]` is the index into `parents` that
-    `refined[i]` descended from, and `n_tried` is the total number of
-    placements screened (not all of which were refined) -- the
-    denominator the docking report shows the search effort against.
+    **Which of those basins is an energy window, not a rank.** Every
+    representative within `docking.refine_window_kcal` of that parent's own
+    screened minimum is refined, capped at `docking.n_refine`, because a
+    geometry relaxed only to `screen_fmax` carries an energy that does not
+    predict where it refines to -- the measurement is in
+    `Docking.refine_window_kcal` and in DESIGN.md's "The screen-to-refine
+    handoff". Fewer than the cap are refined whenever a parent's placements
+    collapsed into fewer screened basins than that, which is the ordinary
+    case in random mode.
+
+    Returns `(refined, sources, n_tried, window_counts)`: `refined` is a list
+    of `ensemble.Relaxed` objects, `sources[i]` is the index into `parents`
+    that `refined[i]` descended from, `n_tried` is the total number of
+    placements screened (not all of which were refined) -- the denominator
+    the docking report shows the search effort against -- and
+    `window_counts[parent_index]` is how many screened basins that parent's
+    window admitted before `n_refine` capped it, which is what makes a
+    binding cap visible downstream.
     """
     # Both modes place into the parent's principal-axis frame: only the
     # solute block defines where the axes point (a docking parent is the
@@ -516,13 +564,25 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     # Per parent, so a parent whose placements all screened a little higher
     # than another's still gets its basins refined -- that is what keeps the
     # chain's `n_parents` lineages alive into the next generation. Within a
-    # parent, one representative per screened basin, lowest first.
+    # parent, one representative per screened basin, lowest first, and every
+    # one of them within `refine_window_kcal` of *that parent's* screened
+    # minimum: the screened ranking does not predict the refined one (see
+    # `Docking.refine_window_kcal`), so the cut has to be an energy window
+    # and not a rank. `n_refine` is only the cap behind it.
     by_parent = {}
     for i, parent_index in enumerate(sources):
         by_parent.setdefault(parent_index, []).append(i)
     aps = len(solvent_unit)
     descriptors = [contact_descriptor(r.atoms, n_solute, aps) for r in screened]
+    window_eV = docking.refine_window_kcal / EV_TO_KCAL
     top = []
+    # How many basins the window admitted, per parent, *before* `n_refine`
+    # clipped it. Recorded rather than discarded because it is the only way
+    # to see the cap bind: once it does, the selection is a rank cut on the
+    # screened energy again -- the exact failure the window replaced -- and
+    # nothing in the refined output says so. `report.refine_cap_warning`
+    # compares it against what was actually refined.
+    window_counts = {}
     for parent_index in sorted(by_parent):
         members = by_parent[parent_index]
         representatives = dedupe_energies(
@@ -530,18 +590,25 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
             [descriptors[i] for i in members],
             tol_eV=docking.screen_dedupe_tol_eV,
             geom_tol_A=docking.screen_geom_tol_A)
-        top += [members[r] for r in representatives[:docking.n_refine]]
+        # `dedupe_energies` returns representatives lowest-energy first, so
+        # the window is a prefix and the cap a slice of it.
+        floor_eV = screened[members[representatives[0]]].energy_eV
+        inside = [r for r in representatives
+                  if screened[members[r]].energy_eV - floor_eV <= window_eV]
+        window_counts[parent_index] = len(inside)
+        top += [members[r] for r in inside[:docking.n_refine]]
 
     refine_tasks = [(screened[i].atoms, calculator, solvation,
                      calculator_kwargs, scoring.fmax, scoring.opt_steps, 0)
                     for i in top]
     refined = pool_map(relax, refine_tasks, n_workers)
     refined_sources = [sources[i] for i in top]
-    return refined, refined_sources, len(placements)
+    return refined, refined_sources, len(placements), window_counts
 
 
 def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
-                     docking, scoring, n_tried, n_parents_used, n_solute, aps):
+                     docking, scoring, n_tried, n_parents_used, n_solute, aps,
+                     window_counts):
     """Turn one n's refined placements into `scored.json` and its files.
 
     `pairs` is `[(Relaxed, parent_index), ...]`, already sorted lowest energy
@@ -609,9 +676,15 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
     per_parent = {}
     for c in candidates:
         per_parent.setdefault(c.parent, []).append(c)
+    # `n_placements` is how many of this parent's basins were refined;
+    # `n_in_window` is how many its window admitted. They differ exactly when
+    # `n_refine` capped the selection, which `report.refine_cap_warning`
+    # surfaces -- a capped run is choosing by screened rank again, and the
+    # refined candidates alone cannot show it.
     parent_detail = [
         {"parent": pi,
          "n_placements": len(cs),
+         "n_in_window": window_counts[pi],
          "e_int_min_kcal": min(c.interaction_eV for c in cs) * EV_TO_KCAL,
          "best": any(is_best(c) for c in cs)}
         for pi, cs in sorted(per_parent.items())
@@ -708,7 +781,7 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
 
     for n in range(1, max_n + 1):
         n_parents_used = len(parents)
-        refined, sources, n_tried = dock_at_n(
+        refined, sources, n_tried, window_counts = dock_at_n(
             parents, n_solute, solvent_unit, n, docking, scoring, solvation,
             docking.calculator, docking.calculator_kwargs, seed=n,
             n_workers=n_workers)
@@ -717,7 +790,7 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
         pairs = sorted(zip(refined, sources), key=lambda pair: pair[0].energy_eV)
         summary = _assemble_dock_n(
             out_root, label, n, pairs, references, solvation, docking,
-            scoring, n_tried, n_parents_used, n_solute, aps)
+            scoring, n_tried, n_parents_used, n_solute, aps, window_counts)
         all_n_min_kcal[n] = summary["min_interaction_kcal"]
 
         keep_idx = dedupe_energies(
@@ -833,9 +906,16 @@ def main(argv=None):
                         help="deduped minima carried forward as the next n's "
                              "parents (default: %(default)s)")
     parser.add_argument("--refine", type=int, default=Docking.n_refine,
-                        help="screened placements re-relaxed at the scorer's "
-                             "tight fmax, per parent: one per distinct "
-                             "screened basin, best-first, up to this many "
+                        help="cap on screened basins re-relaxed at the "
+                             "scorer's tight fmax, per parent; the selector "
+                             "is --refine-window, and this only bounds its "
+                             "cost (default: %(default)s)")
+    parser.add_argument("--refine-window", type=float,
+                        default=Docking.refine_window_kcal,
+                        help="screened basins this far above a parent's own "
+                             "screened minimum are refined, kcal/mol; the "
+                             "screened ranking does not predict the refined "
+                             "one, so this is a window and not a rank cut "
                              "(default: %(default)s)")
     parser.add_argument("--screen-fmax", type=float,
                         default=Docking.screen_fmax,
@@ -877,6 +957,7 @@ def main(argv=None):
         grid_probe_fracs=tuple(args.grid_probe_fracs),
         n_parents=args.parents,
         n_refine=args.refine,
+        refine_window_kcal=args.refine_window,
         screen_fmax=args.screen_fmax,
         freeze_solute=args.freeze_solute,
         solvent=args.solvent,

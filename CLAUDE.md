@@ -24,6 +24,11 @@ what was tried and removed. Read the named section before you touch:
 - docking's `n_refine` / `n_placements` -- "`docking.py` -- a second
   generator, beside the MD sweep" (`1 - 0.93^K` sets the default; `n_refine`
   is per parent and per distinct screened basin since 0.9.0)
+- docking's `refine_window_kcal`, `n_refine` as a cap, or `screen_fmax` --
+  "The screen-to-refine handoff: a window, not a rank" (the screened ranking
+  does not predict the refined one, so the cut is an energy window and
+  `n_refine` only caps its cost; tightening `screen_fmax` was measured and
+  rejected, and 0.12.0's advice to raise `--refine` instead does not work)
 - `report.DEDUPE_TOL_EV`, `report.GEOM_TOL_A`, the contact descriptor, or
   `Docking.screen_*_tol` -- "Geometric basin dedupe: what the energy-only
   criterion was doing" (both tolerances are picked from measured gaps in a
@@ -124,7 +129,11 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 (Anything scored before `n_opt_steps`, the mandatory wall fields or the
 mandatory per-candidate `descriptor` (0.11.0) no longer re-renders, since the
 readers no longer default a missing field. Rescore it rather than
-re-reporting it. The same applies to a `sweep.json` params block without
+re-reporting it. The same applies to a `dock.json` whose `parent_detail`
+entries predate `n_in_window` (0.13.0): it raises rather than rendering a
+per-parent table that silently omits the `window` column and with it the
+warning that says the `n_refine` cap bound. Re-run the docking -- there is no
+rescore path for a docked run. The same applies to a `sweep.json` params block without
 `monolayer_capacity`: it raises rather than rendering a report that silently
 omits the `cover` column.)
 
