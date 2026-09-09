@@ -1103,6 +1103,203 @@ reproduce the random-mode numbers this file already carried (-6.6514 /
 -12.9971 / -18.1672), which is the check that the harness behind these tables
 is the same pipeline and not a re-implementation of it.
 
+### How deep the cap cut -- and why that is not a safety grade
+
+0.13.0's cap warning says *that* the cap bound and never *where*, which
+leaves it with exactly one discharge: re-run at a larger cap. That is the
+wrong shape for a diagnostic on a run that costs hours, and the information
+was already in hand at selection time and being thrown away -- `dock_at_n`
+knows, for every basin it refines, its position in that parent's screened
+ordering and its screened offset above that parent's screened floor.
+
+So 0.14.0 keeps that provenance. `dock_at_n` returns one `ScreenOrigin` per
+refined candidate instead of a bare parent index (`parent`, `rank`,
+`offset_kcal`, plus the parent-wide `n_in_window` and `cut_kcal`), which also
+removes the parallel `window_counts` dict that had to stay in lockstep with
+it. `parent_detail` gains three fields off that record -- `screen_cut_kcal`,
+`best_screen_rank`, `best_screen_offset_kcal` -- and the Per-parent detail
+table gains a `cut`, `rank` and `offset` column.
+
+**The grading statistic has to be the offset, not the rank.** "The winner came
+from rank 12 of 400" would license "the cap was harmless" only given a
+screened-rank-to-refined-energy correlation, and the whole of this section is
+the measurement that there isn't one. The offset is the quantity that
+transfers between runs, and `cut_kcal` against `refine_window_kcal` says how
+much of the window a binding cap left unexplored.
+
+**What that offset does *not* support is a safe/unsafe grade.** The intended
+design was three-way: a cap that only ever cut above ~2.0 kcal/mol had
+truncated a region no refined winner had been seen in (the three observations
+above: +1.50, +1.82, +1.17) and would emit a NOTE rather than a WARNING.
+Stated in advance so it could be refuted, and it was. Twenty-eight parent
+rows -- pyrazine in chloroform and acetone, random mode, n = 1-3, 32 and 64
+placements, the cap never binding so every in-window basin was refined --
+put the refined winner's own screened offset at **+0.00 to +2.98 of a 3.0
+kcal/mol window**, quartiles 0.55 / 1.12 / 1.64:
+
+| winner's offset | of 28 parents | of the 13 lineages that produced their n's minimum |
+| --- | --- | --- |
+| above half the window (+1.50) | 11 | 7 |
+| above 0.6 (+1.80) | 6 | 4 |
+| above 0.7 (+2.10) | 4 | 2 |
+| above 0.8 (+2.40) | 3 | 2 |
+| above 0.9 (+2.70) | 1 | 1 |
+
+A cut at +2.0 would have been graded "safe" and lost the winner in 5 of the
+28. It is the same finding as the section's, one level up: at
+`screen_fmax = 0.05` a screened energy says so little about where a basin
+refines to that its rank is uninformative and its *offset* is barely better --
+a weak concentration toward the floor, with a tail running to the window edge.
+
+Directly, on pyrazine + chloroform, random mode, one parent, 16 placements,
+varying only `--refine`:
+
+| `--refine` | n = 1 cut / winner offset | `E_int(1)` | n = 2 cut | `E_int(2)` |
+| --- | --- | --- | --- | --- |
+| 3 | +1.72 / +2.44 | -6.64 | +0.10 | **-11.34** |
+| 12 | +2.53 / +2.44 | **-6.65** | +0.72 | **-13.01** |
+| 400 (uncapped) | +2.82 / +2.44 | **-6.65** | +0.97 | **-13.01** |
+
+The n = 2 row is what a shallow cut costs -- 1.67 kcal/mol, the both-nitrogens
+basin -- and the n = 1 column is the counter-example to the 2.0 threshold: the
+winner sits at +2.44 and only a cut above that keeps it.
+
+So the warning stays unconditional on the cap binding, and what the
+measurement bought is a warning that quantifies rather than one that grades:
+it names each capped parent with its cut, says what fraction of the window
+that left unexplored, and quotes the measured winner spread instead of
+implying a safe depth. `report.SCREEN_WINNER_OFFSET_KCAL` carries the range.
+One caveat it does not cover: all 28 rows are random mode, where a parent
+holds 21-61 in-window representatives. A grid parent holds hundreds to
+thousands in the same window, and whether the offsets distribute the same way
+there is untested -- the three grid observations that exist all sit under
++1.9.
+
+**And the screening partition itself can now be re-examined offline.** The
+screened energies and descriptors were computed and discarded, so every
+question about whether the partition is over-splitting -- is 883 screened
+basins at n = 3 a real count, or the loose tolerances shattering one basin
+into near-copies? -- needed another full screen to ask. `--dump-screen`
+writes `screen.json` into every n's run directory: per parent, every screened
+energy and contact descriptor, plus the representative / window / cap decision
+taken off them. Off by default, read by nothing in the pipeline, and
+deliberately *not* a `Docking` field -- it changes nothing about the run, so
+it has no business in the params block that says what the run was. Re-running
+`report.dedupe_energies` over a dump reproduces that parent's `n_in_window`
+and its refined set exactly, which is the check that the dump describes the
+run rather than a re-derivation of it.
+
+### "Distinct minima" is a resolution, not a count -- and there is no truth to check it against
+
+The screening tolerances (`Docking.screen_dedupe_tol_eV` 10 meV,
+`screen_geom_tol_A` 0.5 A) never got the histogram calibration the scorer's
+pair got, and the suspicion they invite is specific: if they shatter one
+screened basin into near-copies, then the 883 and 1667 in-window "basins" at
+n = 3 and n = 4 are an artifact, `n_refine` is truncating duplicates rather
+than candidates, and the fix belongs in the dedupe rather than in `--refine`.
+
+Measured on one grid run with `--dump-screen` (pyrazine + chloroform, one
+parent, n = 1-4, 22,906 poses, 977 s), which reproduces this file's existing
+grid numbers exactly -- `E_int(min)` -6.667 / -13.028 / -18.384, `pool`
+7 / 151 / 233 -- so the harness is the pipeline, not a re-implementation.
+
+**First, the methodological trap, because it is easy to fall into and this
+file did.** There is no independent source of truth here. The screened basin
+count and the refined `pool` are *the same function*, `dedupe_groups`,
+differing only in tolerance -- 10 meV / 0.5 A against 5 meV / 0.15 A. Dividing
+one by the other and calling the stricter one ground truth measures nothing
+except the tolerance gap. Done that way the "over-count" reads 6.1 / 1.9 / 1.7
+/ 1.2 : 1 and looks like it vanishes with n. Re-cut the *same* refined pool at
+the *same* tolerance the screen used, and it does not:
+
+| n | refined | distinct at the screen's own 10 meV / 0.5 A | over-count |
+| --- | --- | --- | --- |
+| 1 | 43 | 4 | **10.8 : 1** |
+| 2 | 287 | 48 | **6.0 : 1** |
+| 3 | 400 | 75 | **5.3 : 1** |
+| 4 | 400 | 164 | **2.4 : 1** |
+
+So the screen really does over-count, by 5-6x in the middle of the range. The
+suspicion was right in direction.
+
+**But the tolerances are not the lever -- convergence is.** The table above
+holds the tolerance fixed and varies only how far the geometry was relaxed:
+400 screened basins at `screen_fmax = 0.05` are 75 basins once the same
+structures reach `Scoring.fmax = 0.002`, judged identically. Two poses heading
+for one minimum are still more than 0.5 A apart in contact space at the loose
+screen, and no threshold recovers that -- widening it merges genuinely
+different basins just as fast. This is the same effect "The screen-to-refine
+handoff" already measured from the other side (screening at 0.01 instead of
+0.05 fuses 410 basins to 230) and rejected on cost: 8.5x the screening pass
+for a net 29.5 -> 81.0 s. The over-count is real, its cause is known, and the
+cure is already priced and declined.
+
+**And the proposed loosening is contraindicated on its own terms.**
+Re-partitioning at each candidate tolerance, asking whether the pose that
+actually refined into that n's reported minimum survives as a representative:
+
+| tolerance | n = 1 | n = 2 | n = 3 | n = 4 |
+| --- | --- | --- | --- | --- |
+| 10 meV / 0.5 A (current) | survives | survives | survives | survives |
+| 20 meV / 0.5 A | survives | survives | survives | survives |
+| **30 meV / 0.5 A** | **absorbed** | **absorbed** | survives | survives |
+| 10 meV / 0.7 A | -- | -- | **absorbed** | **absorbed** |
+
+30 meV -- the value the ~26 meV of within-basin scatter at `screen_fmax = 0.05`
+argues for -- absorbs the winning pose at n = 1 and n = 2; 0.7 A absorbs it at
+n = 3 and n = 4. Both directions fail, in complementary halves of the range.
+Absorption is not proof the minimum would be lost (the absorbing
+representative may relax to the same place, which only a re-run settles), but
+there is no version of this that is free. **`screen_dedupe_tol_eV` stays at 10
+meV and `screen_geom_tol_A` at 0.5 A.**
+
+**Second, and larger: the refined `pool` is a resolution too.** Calibrating it
+the way 0.11.0 calibrated `GEOM_TOL_A` -- all pairs of the deduped, fully
+converged candidates -- the docked pools have no empty band at n = 3 or n = 4,
+where the n = 2 sweep pool that set 0.15 A had a clean one (cluster at
+0.01-0.12, gap, bulk from 0.19). And the count slides with the knob:
+
+| n | pool span | median NN energy gap | @0.15 A | @0.20 | @0.30 | @0.50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 2.82 kcal/mol | 2.34 meV | 7 | 5 | 4 | 4 |
+| 2 | 2.83 | 0.18 meV | 151 | 126 | 93 | 63 |
+| 3 | 1.90 | 0.21 meV | 233 | 183 | 134 | 95 |
+| 4 | 1.48 | 0.11 meV | 320 | 289 | 239 | 184 |
+
+Two things to read off it. The count is **saturated on the tight side** --
+0.05 A gives the identical 233 and 320, because essentially no pair is closer
+than 0.15 (30 of 27,028 at n = 3) -- so the pool is not being shattered by a
+threshold that is too tight; every member really is that far from every other.
+But it is **not stable on the loose side**, and there is no band to put a
+threshold in, so 233-vs-134 is a choice rather than a measurement.
+
+The energy column is the blunter point. At n >= 2 the energy axis does
+nothing: **100% of nearest-neighbour gaps fall inside the 5 meV window**, so
+the whole partition is geometric, and the entire n = 3 pool spans 82 meV --
+**3.2 kT at 298 K**, and well inside GFN2's own error bar. These are 233
+optimiser endpoints on a flat, glassy surface, not 233 chemically
+distinguishable species. n = 1 is the one honest case: 7 minima over 2.82
+kcal/mol with a 2.34 meV median gap.
+
+**They are, however, genuinely different placements rather than jitter.** The
+obvious worry with a chain that fixes a parent and varies one molecule is that
+the inherited molecules relax slightly differently under each placement and
+manufacture spurious minima. Decomposing each near-threshold pair's distance
+per molecule under the winning assignment says otherwise: at n = 2 and n = 3,
+**100%** of the pairs in 0.15-0.30 A differ in exactly one molecule (median
+largest deviation 0.22-0.24 A, median second largest 0.015-0.030 A). Only at
+n = 4 does jitter appear at all, and it is still a minority (82% one molecule,
+18% two or more, median second largest 0.076 A).
+
+So the count is not a criterion artifact -- but "distinct minimum" here means
+"optimiser endpoint at least 0.15 A away in contact space", never "separated
+by a barrier", which nothing in this pipeline checks. **Read `pool` as a
+diversity measure at a stated resolution, not as a count of species**, and
+compare it only between runs that share both tolerances -- which is what
+recording `dedupe_tol_eV` / `geom_tol_A` in every summary is for. The number
+that survives all of this untouched is `E_int(min)`: it is a set minimum
+however the set is partitioned.
+
 ### Applicability: where this stops working
 
 The same ~N^2.5 GFN2 gradient cost that limits the MD sweep limits docking,
@@ -1229,6 +1426,25 @@ Known limitations:
   advice: on a 3 ps smoke sweep at the new defaults, 2 of the 5 packings at
   n = 2 reached the both-N basin (-13.01 kcal/mol, `found by` 2/5) that 3
   packings had missed, which is what 0.83^k = 0.39 rather than 0.57 buys.
+- **A `pool` is a resolution-relative diversity measure, not a count of
+  species, and nothing here checks for a barrier.** See "'Distinct minima' is
+  a resolution, not a count": at n >= 2 the whole partition is geometric (100%
+  of nearest-neighbour energy gaps sit inside the 5 meV window), a docked n = 3
+  pool spans 3.2 kT, and its size slides from 233 to 95 as `geom_tol_A` goes
+  0.15 -> 0.5 with no empty band to anchor a choice. It is saturated on the
+  tight side and the members really are distinct placements rather than
+  jitter, so it is not an artifact -- but `E_int(min)` is the number that is
+  invariant to all of it, and two `pool`s are comparable only at identical
+  tolerances.
+- **The screening tolerances rest on a weaker argument than the scorer's.**
+  The screen over-counts 5-6x at n = 2-3 at matched resolution, but the cause
+  is `screen_fmax = 0.05`, not the thresholds, and tightening it was already
+  measured and rejected on cost. Both proposed loosenings absorb the winning
+  pose. So 10 meV / 0.5 A stay on a *negative* result, which is enough not to
+  move them and not enough to call them optimal -- one system, one solvent,
+  grid mode, one parent. `--dump-screen` plus `--screen-dedupe-tol` /
+  `--screen-geom-tol` make re-opening it on another system post-processing
+  rather than compute.
 - MACE-OFF23 as a generator is **untested** here. It needs a model download,
   and it cannot share a process with tblite (see the file boundary above).
 - GFN2 likely **over-binds** the C-H...N contact -- 1.91 A is short against a

@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -48,6 +48,29 @@ KB_EV_PER_K = 8.617333262e-5   # Boltzmann constant, == ase.units.kB
 # load-bearing rather than a safety net. Measured regimes: 4-5% for gas-phase
 # sampling (shell self-bound), 50-60% for ALPB(water) (shell dissociating).
 WALL_WARN_FRACTION = 0.20
+
+# How far above its parent's own screened floor a *refined winner* has
+# actually been observed, in kcal/mol, and over how many parents. This is the
+# distribution `refine_cap_warning` grades a binding `n_refine` cap against,
+# and it is a measurement rather than a guess: 28 parent rows over pyrazine in
+# chloroform and acetone, random mode, n = 1-3 at 32 and 64 placements, plus
+# the three grid-mode observations in DESIGN.md's "The screen-to-refine
+# handoff" (+1.50, +1.82, +1.17).
+#
+# **The point of the number is that there is no safe cut depth.** The
+# intuition it was meant to support -- "the cap only truncated above where any
+# winner has been seen, so this run is fine" -- is false: the winner's offset
+# runs from +0.00 to +2.98 of a 3.0 kcal/mol window, quartiles 0.55 / 1.12 /
+# 1.64, with 11 of 28 parents above half the window and one in its top 5%.
+# That is the same finding the window itself rests on, one level up: a
+# screened energy relaxed only to `screen_fmax` carries so little information
+# about where a basin refines to that its *rank* is uninformative and its
+# *offset* is barely better. So a binding cap is always a WARNING; what the
+# measurement buys is a warning that says how much of the window went
+# unexplored and how often that has cost the winner, instead of one that can
+# only be discharged by re-running.
+SCREEN_WINNER_OFFSET_KCAL = (0.0, 2.98)
+SCREEN_WINNER_OFFSET_PARENTS = 28
 
 _RULE = "=" * 78
 
@@ -482,8 +505,8 @@ def wall_warning(fraction, indent="  "):
     ))
 
 
-def refine_cap_warning(summaries, indent="  "):
-    """Warning for parents whose `n_refine` cap bound, or None.
+def refine_cap_warning(params, summaries, indent="  "):
+    """Warning for the parents whose `n_refine` cap bound, or None.
 
     The cap exists to stop a runaway, not to choose anything: the selector is
     `Docking.refine_window_kcal`. But once the cap bites it takes the lowest
@@ -493,32 +516,67 @@ def refine_cap_warning(summaries, indent="  "):
     quietly reverted to the rank cut the window replaced, and nothing in its
     refined candidates says so, which is why this reads `n_in_window` against
     what was actually refined rather than inferring it from the output.
+
+    **It says how deep the cap cut, not merely that it did.** A warning that
+    only reports "the cap bound" can be discharged in exactly one way, by
+    re-running at a larger cap; `screen_cut_kcal` -- the screened offset of
+    the last representative the cap admitted -- says instead how much of the
+    window went unexplored, which is the quantity a reader can weigh.
+
+    What it deliberately does **not** do is grade that depth as safe.
+    `SCREEN_WINNER_OFFSET_KCAL` is the measurement that settles it: over 28
+    parents the refined winner's own screened offset ran the full width of the
+    window, so there is no depth above which truncating is known to be
+    harmless and every binding cap stays a WARNING. The offset is still the
+    number to read rather than the rank, for the same reason the selector is a
+    window -- a rank means nothing at all here.
     """
-    hits = [(s["n_solvent"], p["parent"], p["n_placements"], p["n_in_window"])
+    hits = [(s["n_solvent"], p["parent"], p["n_placements"], p["n_in_window"],
+             p["screen_cut_kcal"])
             for s in sorted(summaries, key=_row_order)
             for p in s["parent_detail"]
             if p["n_in_window"] > p["n_placements"]]
     if not hits:
         return None
-    worst = max(h[3] - h[2] for h in hits)
-    where = ", ".join(f"n = {n} parent {pi} ({kept} of {total})"
-                      for n, pi, kept, total in hits[:4])
+    window = params["refine_window_kcal"]
+    worst = max(total - kept for _, _, kept, total, _ in hits)
+    shallowest = min(cut for *_, cut in hits)
+    unexplored = 100 * (1.0 - shallowest / window) if window else 0.0
+    # One line per capped parent rather than a run-on list: with a cut depth
+    # beside each count the inline form ran past 130 columns.
+    where = [f"**   n = {n} parent {pi}: refined {kept} of {total} in window, "
+             f"cut at +{cut:.2f}"
+             for n, pi, kept, total, cut in hits[:4]]
     if len(hits) > 4:
-        where += f", and {len(hits) - 4} more"
+        where.append(f"**   ... and {len(hits) - 4} more")
+    low, high = SCREEN_WINNER_OFFSET_KCAL
     return "\n".join(indent + line for line in (
-        f"** WARNING: the n_refine cap bound on {len(hits)} parent(s): "
-        f"{where}.",
+        f"** WARNING: the n_refine cap bound on {len(hits)} parent(s):",
+        *where,
         "** Inside the window the cap keeps the lowest *screened* basins, and "
         "screened",
         "** energy does not predict where a basin refines to -- which is the "
         "reason the",
         f"** selector is a window and not a rank. Up to {worst} basin(s) per "
         "parent went",
-        "** unrefined, so this run's minimum and its pool are both cuts of "
-        "what the",
-        "** search actually found. Raise --refine (or narrow --refine-window) "
-        "and re-run",
-        "** before trusting the pool, especially for a dft_export.",
+        f"** unrefined; the shallowest cut was +{shallowest:.2f} kcal/mol of "
+        f"a {window:.2f} window, leaving",
+        f"** its top {unexplored:.0f}% unexplored. Over "
+        f"{SCREEN_WINNER_OFFSET_PARENTS} measured parents a refined winner's "
+        "own offset ran",
+        f"** +{low:.2f} to +{high:.2f} -- the whole width of the window -- so "
+        "no cut depth is known to",
+        "** be safe, and this run's minimum and its pool are both cuts of "
+        "what the search",
+        "** found. Raise --refine and re-run before trusting the pool, "
+        "especially for a",
+        "** dft_export. Narrowing --refine-window does *not* help while the "
+        "cap binds: the",
+        "** window admits a prefix of the same energy-ordered "
+        "representatives, so the refined",
+        "** set is unchanged until the window drops below the cap -- at which "
+        "point it has",
+        "** become a smaller cap, i.e. the rank cut again.",
     ))
 
 
@@ -1570,7 +1628,7 @@ def format_report(params, summaries):
     if docked:
         # One run per n, so there are no per-packing rows to show; what a
         # docking chain has instead is per-parent rows.
-        parts.append(format_parent_detail(summaries))
+        parts.append(format_parent_detail(params, summaries))
         return "\n\n".join(parts) + "\n"
 
     parts.append(format_modal_geometry(pooled))
@@ -1705,15 +1763,42 @@ def write_best_geometries(out_dir, pooled, prefix):
     return written
 
 
-def format_parent_detail(summaries):
+def format_lineage_agreement(summaries, indent="  "):
+    """The n values at which every lineage reached the same minimum, or None.
+
+    Free from `parent_detail`'s own `best` markers, and worth saying out loud
+    because a full column of stars invites exactly the reading the table's key
+    warns against. The caveat travels in the same sentence as the observation
+    rather than several lines above it, since the two are only ever read
+    together.
+    """
+    agreed = [s["n_solvent"] for s in sorted(summaries, key=_row_order)
+              if len(s["parent_detail"]) > 1
+              and all(p["best"] for p in s["parent_detail"])]
+    if not agreed:
+        return None
+    where = ", ".join(f"n = {n}" for n in agreed)
+    return "\n".join(indent + line for line in (
+        f"Every lineage reached the same minimum at {where} -- which is not",
+        "independent corroboration, since they all explore the same shell "
+        "region:",
+        "read it as that basin being easy to reach, not as a second search",
+        "confirming it.",
+    ))
+
+
+def format_parent_detail(params, summaries):
     """Per parent, under the main table: the greedy chain made visible.
 
     Docking's counterpart to `format_seed_detail`, and the one section a
     sweep has no analogue of -- it reads `parent_detail`, which only
-    `docking._assemble_dock_n` writes.
+    `docking._assemble_dock_n` writes. `params` is here for one number, the
+    `refine_window_kcal` a `cut` is a fraction of: the cut alone says where
+    the cap stopped and only the window says how much that left behind.
     """
     header = (f"{'n':>3} {'parent':>6} {'best':>4} {'refined':>8} "
-             f"{'window':>7} {'E_int(min)':>12}")
+              f"{'window':>7} {'cut':>7} {'rank':>5} {'offset':>7} "
+              f"{'E_int(min)':>12}")
     lines = ["Per-parent detail", "-----------------", header,
              "-" * len(header)]
     for p in sorted(summaries, key=_row_order):
@@ -1728,6 +1813,9 @@ def format_parent_detail(summaries):
                 f"{star:>4} "
                 f"{parent['n_placements']:>8} "
                 f"{str(parent['n_in_window']) + capped:>7} "
+                f"{'+%.2f' % parent['screen_cut_kcal']:>7} "
+                f"{parent['best_screen_rank']:>5} "
+                f"{'+%.2f' % parent['best_screen_offset_kcal']:>7} "
                 f"{parent['e_int_min_kcal']:>12.2f}")
     lines.append(
         "\n  One row per parent used to grow to that n: its own best "
@@ -1738,13 +1826,22 @@ def format_parent_detail(summaries):
         "fell within --refine-window of that parent's screened minimum and "
         "'refined'\n  how many were then optimised tightly; they differ, "
         "marked '!', only when the\n  --refine cap bound, which is a rank cut "
-        "and is warned about below. Unlike the\n  sweep's 'found by', several "
-        "parents landing near one minimum is not independent\n  "
-        "corroboration: every parent explores the same shell region, not a\n  "
+        "and is warned about below. 'cut' is how\n  far above that parent's "
+        "screened minimum the last refined basin sat, kcal/mol:\n  against "
+        "--refine-window it says how much of the window a binding cap left\n  "
+        "unexplored, which is what the cap costs. 'rank' and 'offset' are "
+        "where that\n  parent's own winner sat in the same screened ordering. "
+        "Read the offset, not the\n  rank -- the screened ranking does not "
+        "predict the refined one, which is why the\n  selector is a window -- "
+        "and read it as a spread rather than a bound: measured\n  winners run "
+        "the full width of the window. Unlike the sweep's 'found by',\n  "
+        "several parents landing near one minimum is not independent "
+        "corroboration:\n  every parent explores the same shell region, not a "
         "differently-arranged packing.")
-    warning = refine_cap_warning(summaries)
-    if warning:
-        lines += ["", warning]
+    for section in (format_lineage_agreement(summaries),
+                    refine_cap_warning(params, summaries)):
+        if section:
+            lines += ["", section]
     return "\n".join(lines)
 
 

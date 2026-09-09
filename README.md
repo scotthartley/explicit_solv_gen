@@ -410,6 +410,18 @@ minimum is *not* independent corroboration: every parent explores the same
 shell region with independent random poses, not a differently-arranged
 packing.
 
+`window` is how many distinct screened basins fell within `--refine-window` of
+that parent's own screened minimum, `refined` how many were then optimised
+tightly. They differ — marked `!` — only when the `--refine` cap bound, which
+is a rank cut on an energy that does not predict where a basin refines to.
+`cut` says how far above that parent's screened minimum the last refined basin
+sat, so `cut` against `--refine-window` is how much of the window a binding cap
+left unexplored; `rank` and `offset` are where that parent's own winner sat in
+the same screened ordering. Read the offset, not the rank — and read it as a
+spread rather than a bound. Over 28 measured parents a winner's offset ran the
+full width of the window (+0.00 to +2.98 of 3.0), so there is no cut depth
+that is known to be safe, and a binding cap is always warned about.
+
 ## Docking: a constructive alternative
 
 `n_sweep.py` explores by thermal sampling and quenches whatever basin the
@@ -456,10 +468,21 @@ parent's own screened minimum, capped at `--refine`. It has to be a window,
 because a geometry relaxed only to the loose `fmax` carries an energy that
 does not predict where it refines to: on one acetone grid run the best basin
 was the 247th of 410 by screened energy, so the flat top-10 this used to take
-missed it, and neither a bigger cap nor a tighter screen finds it. See
-`DESIGN.md`'s `docking.py` section for the full measurements (the
-screen-to-refine handoff, staged screen-then-refine cost, the placement-count
-confidence argument, per-parent detail).
+missed it, and neither a bigger cap nor a tighter screen finds it.
+
+When `--refine` *does* bind, the report says how deep it cut and warns — every
+time, because there is no depth that is known to be safe: a refined winner's
+own screened offset has been measured across the whole width of the window.
+Narrowing `--refine-window` does not relieve a binding cap, because the window
+admits a prefix of the same energy-ordered basins; raise `--refine` instead.
+`--dump-screen` writes the whole screening partition to `screen.json` per `n`
+— every screened energy and descriptor, plus the window/cap decision — so it
+can be re-examined without paying for another screen, and
+`--screen-dedupe-tol` / `--screen-geom-tol` are the two tolerances that
+partition comes out of. See `DESIGN.md`'s `docking.py` section for the full
+measurements (the screen-to-refine handoff, how deep the cap cut, staged
+screen-then-refine cost, the placement-count confidence argument, per-parent
+detail).
 
 ## Packing: the seeds are independent draws
 

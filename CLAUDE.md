@@ -29,6 +29,23 @@ what was tried and removed. Read the named section before you touch:
   does not predict the refined one, so the cut is an energy window and
   `n_refine` only caps its cost; tightening `screen_fmax` was measured and
   rejected, and 0.12.0's advice to raise `--refine` instead does not work)
+- grading a binding `n_refine` cap as harmless, or reintroducing a "safe cut
+  depth" -- "How deep the cap cut -- and why that is not a safety grade" (a
+  refined winner's screened offset runs the *whole* width of the window, so
+  no depth is safe; a NOTE grade at ~2.0 kcal/mol was designed, measured over
+  28 parents and rejected). Narrowing `--refine-window` to relieve a binding
+  cap is inert, for the reason given there
+- `Docking.screen_dedupe_tol_eV` / `screen_geom_tol_A`, or reading `pool` as a
+  count of species -- "'Distinct minima' is a resolution, not a count". The
+  screen does over-count (10.8 / 6.0 / 5.3 / 2.4 : 1 at n = 1-4, measured at
+  *matched* tolerance -- comparing partitions at different tolerances is the
+  trap, and it reads 6.1 / 1.9 / 1.7 / 1.2 : 1 instead), but the cause is
+  `screen_fmax`, not the tolerances, and that trade was already priced and
+  declined. Both proposed loosenings -- 30 meV, or 0.7 A -- absorb the pose
+  that actually refined into the reported minimum. Also: at n >= 2 the pool's
+  energy axis does nothing (100% of nearest-neighbour gaps inside the 5 meV
+  window) and the whole n = 3 pool spans 3.2 kT, so a `pool` of 233 is a
+  diversity measure at a stated resolution, never 233 species
 - `report.DEDUPE_TOL_EV`, `report.GEOM_TOL_A`, the contact descriptor, or
   `Docking.screen_*_tol` -- "Geometric basin dedupe: what the energy-only
   criterion was doing" (both tolerances are picked from measured gaps in a
@@ -130,12 +147,13 @@ Regenerate any of these from the JSON already on disk, no MD and no calculator:
 mandatory per-candidate `descriptor` (0.11.0) no longer re-renders, since the
 readers no longer default a missing field. Rescore it rather than
 re-reporting it. The same applies to a `dock.json` whose `parent_detail`
-entries predate `n_in_window` (0.13.0): it raises rather than rendering a
-per-parent table that silently omits the `window` column and with it the
-warning that says the `n_refine` cap bound. Re-run the docking -- there is no
-rescore path for a docked run. The same applies to a `sweep.json` params block without
-`monolayer_capacity`: it raises rather than rendering a report that silently
-omits the `cover` column.)
+entries predate `n_in_window` (0.13.0) or `screen_cut_kcal` /
+`best_screen_rank` / `best_screen_offset_kcal` (0.14.0): it raises rather than
+rendering a per-parent table that silently omits the `window` / `cut` / `rank`
+/ `offset` columns and with them the warning that says how deep the `n_refine`
+cap cut. Re-run the docking -- there is no rescore path for a docked run. The
+same applies to a `sweep.json` params block without `monolayer_capacity`: it
+raises rather than rendering a report that silently omits the `cover` column.)
 
 `E_int(min)` is the reported number, because it alone is comparable across n,
 and at 0.8.0 it is the only energy any table prints. `E_int(ens)` and
@@ -243,6 +261,21 @@ to the identical criterion and stay comparable.
 `scored.json` for a docked run carries `pack_mode: "dock"` (an MD run's says
 `"md"`) and every candidate's `wall_energy_eV` is `null` -- a real absence,
 not a zero, and `report.py`'s formatters render it as `-`.
+
+**`--dump-screen` additionally writes `<label>_n<N>_dock/screen.json`, for
+every n the chain walks rather than only the requested ones**: per parent,
+every screened energy and contact descriptor plus the representative /
+window / cap decision taken off them. Off by default, read by nothing here,
+and deliberately *not* a `Docking` field -- it changes nothing about the run,
+so it stays out of the params block that says what the run was. It exists so
+the screening partition can be re-examined offline (re-running
+`report.dedupe_energies` over a dump reproduces that parent's `n_in_window`
+and its refined set exactly) without paying for another screen; a few MB of
+bare floats per n, written compactly rather than at `indent=2` like every
+other JSON here. `--screen-dedupe-tol` / `--screen-geom-tol` are the flags for
+moving the tolerances the partition comes out of -- and **moving either moves
+every screened basin count**, so read DESIGN.md's "The screen-to-refine
+handoff" before you do.
 
 `dft_export.py` exports deduped, near-minimum candidates from either
 generator, plus a manifest, for a downstream DFT single point or reopt:

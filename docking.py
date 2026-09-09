@@ -480,8 +480,58 @@ def random_placements(parent_atoms, solvent_unit, n_solute, n_total, docking,
             for _ in range(docking.n_placements)]
 
 
+@dataclass
+class ScreenOrigin:
+    """Where one refined candidate sat in its parent's screened ranking.
+
+    `dock_at_n` used to return a flat list of parent indices beside its
+    refined results, with everything else about the selection either discarded
+    or carried in a second structure (`window_counts`) that had to stay in
+    lockstep with the first. This is that provenance as one record per refined
+    candidate, so it survives `run_docking`'s `sorted(zip(refined, origins))`
+    by construction rather than by two parallel lists agreeing.
+
+    `rank` and `offset_kcal` describe the candidate: its position among its
+    parent's energy-ordered screened representatives (0 is that parent's
+    screened minimum) and how far above that minimum it screened.
+    `n_in_window` and `cut_kcal` describe the parent's whole selection and are
+    identical across its candidates -- how many representatives
+    `refine_window_kcal` admitted, and the offset of the last one `n_refine`
+    actually let through.
+
+    **`offset_kcal` is the statistic to read, not `rank`.** "The winner came
+    from rank 12 of 400" does not license "the cap was harmless": that
+    inference needs exactly the screened-rank-to-refined-energy correlation
+    DESIGN.md's "The screen-to-refine handoff" measures as absent. What does
+    transfer between runs is the offset, so `report.refine_cap_warning` says
+    where in energy a binding cap cut and how much of the window that left
+    behind. It stops short of grading that depth *safe*, and deliberately: a
+    refined winner's own offset has been measured across the whole width of
+    the window (`report.SCREEN_WINNER_OFFSET_KCAL`), so there is no depth
+    above which truncating is known to cost nothing.
+    """
+
+    parent: int
+    rank: int
+    offset_kcal: float
+    n_in_window: int
+    cut_kcal: float
+
+
+def dock_run_dir(out_root, label, n):
+    """The run directory for one n of a chain.
+
+    Named in one place because two callers need it before it exists:
+    `_assemble_dock_n` creates it to write `scored.json` into, and
+    `run_docking` points `dock_at_n`'s optional screen dump at it several
+    minutes earlier.
+    """
+    return Path(out_root) / f"{label}_n{n}_dock"
+
+
 def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
-              solvation, calculator, calculator_kwargs, seed, n_workers=None):
+              solvation, calculator, calculator_kwargs, seed, n_workers=None,
+              screen_dump=None):
     """Grow every parent by one solvent molecule, screen, and refine.
 
     Builds the placements -- `len(parents) * docking.n_placements` random
@@ -507,14 +557,23 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     collapsed into fewer screened basins than that, which is the ordinary
     case in random mode.
 
-    Returns `(refined, sources, n_tried, window_counts)`: `refined` is a list
-    of `ensemble.Relaxed` objects, `sources[i]` is the index into `parents`
-    that `refined[i]` descended from, `n_tried` is the total number of
-    placements screened (not all of which were refined) -- the denominator
-    the docking report shows the search effort against -- and
-    `window_counts[parent_index]` is how many screened basins that parent's
-    window admitted before `n_refine` capped it, which is what makes a
-    binding cap visible downstream.
+    Returns `(refined, origins, n_tried)`: `refined` is a list of
+    `ensemble.Relaxed` objects, `origins[i]` is the `ScreenOrigin` of
+    `refined[i]` -- which parent it grew from and where in that parent's
+    screened ranking it was picked, which is what makes a binding cap visible
+    downstream -- and `n_tried` is the total number of placements screened
+    (not all of which were refined), the denominator the docking report shows
+    the search effort against.
+
+    `screen_dump`, when given a path, additionally writes the whole screening
+    partition there: per parent, every screened energy and contact descriptor
+    plus the representative / window / cap decision taken off them. Off by
+    default and read by nothing in this pipeline -- it exists so the partition
+    can be re-examined offline (is 883 screened basins at n = 3 a real count,
+    or the tolerances over-splitting?) without paying for another GFN2
+    gradient. Written compactly rather than at `indent=2` like every other
+    JSON here: it is a few MB of bare floats per n, and nobody reads it by
+    eye.
     """
     # Both modes place into the parent's principal-axis frame: only the
     # solute block defines where the axes point (a docking parent is the
@@ -546,10 +605,10 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
             f"unknown place_mode {docking.place_mode!r}; expected "
             '"random" or "grid"')
 
-    placements, sources = [], []
+    placements, parent_of = [], []
     for parent_index, poses in enumerate(per_parent):
         placements += poses
-        sources += [parent_index] * len(poses)
+        parent_of += [parent_index] * len(poses)
 
     # The same optimiser as the refinement below and as the scorer, at a
     # looser `fmax` and optionally with the solute held fixed. Nothing it
@@ -570,19 +629,19 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     # `Docking.refine_window_kcal`), so the cut has to be an energy window
     # and not a rank. `n_refine` is only the cap behind it.
     by_parent = {}
-    for i, parent_index in enumerate(sources):
+    for i, parent_index in enumerate(parent_of):
         by_parent.setdefault(parent_index, []).append(i)
     aps = len(solvent_unit)
     descriptors = [contact_descriptor(r.atoms, n_solute, aps) for r in screened]
     window_eV = docking.refine_window_kcal / EV_TO_KCAL
-    top = []
-    # How many basins the window admitted, per parent, *before* `n_refine`
-    # clipped it. Recorded rather than discarded because it is the only way
-    # to see the cap bind: once it does, the selection is a rank cut on the
+    # `top` indexes `screened`; `origins[j]` is the provenance of `top[j]`, so
+    # the two stay aligned through `pool_map` (which preserves input order)
+    # and through `run_docking`'s energy sort. What that provenance is for is
+    # seeing the cap bind: once it does, the selection is a rank cut on the
     # screened energy again -- the exact failure the window replaced -- and
-    # nothing in the refined output says so. `report.refine_cap_warning`
-    # compares it against what was actually refined.
-    window_counts = {}
+    # nothing in the refined output says so.
+    top, origins = [], []
+    dump_parents = [] if screen_dump is not None else None
     for parent_index in sorted(by_parent):
         members = by_parent[parent_index]
         representatives = dedupe_energies(
@@ -595,23 +654,60 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
         floor_eV = screened[members[representatives[0]]].energy_eV
         inside = [r for r in representatives
                   if screened[members[r]].energy_eV - floor_eV <= window_eV]
-        window_counts[parent_index] = len(inside)
-        top += [members[r] for r in inside[:docking.n_refine]]
+        admitted = inside[:docking.n_refine]
+        # In kcal/mol, and only for the record: the selection above stays in
+        # eV so that adding this provenance moves no refined set.
+        offsets = [(screened[members[r]].energy_eV - floor_eV) * EV_TO_KCAL
+                   for r in admitted]
+        top += [members[r] for r in admitted]
+        origins += [ScreenOrigin(parent=parent_index, rank=rank,
+                                 offset_kcal=offset, n_in_window=len(inside),
+                                 cut_kcal=offsets[-1])
+                    for rank, offset in enumerate(offsets)]
+        if dump_parents is not None:
+            # Indices are into this parent's own `members`, so each entry is
+            # self-contained: `energies_eV[k]` and `descriptors[k]` are one
+            # screened placement, and the three index lists select from them.
+            dump_parents.append({
+                "parent": parent_index,
+                "energies_eV": [screened[i].energy_eV for i in members],
+                "descriptors": [descriptors[i] for i in members],
+                "representatives": representatives,
+                "in_window": inside,
+                "refined": admitted,
+                "floor_eV": floor_eV,
+                "cut_kcal": offsets[-1],
+            })
+
+    if dump_parents is not None:
+        screen_dump = Path(screen_dump)
+        screen_dump.parent.mkdir(parents=True, exist_ok=True)
+        screen_dump.write_text(json.dumps({
+            "n_solvent": n_total,
+            "place_mode": docking.place_mode,
+            "screen_fmax": docking.screen_fmax,
+            "screen_dedupe_tol_eV": docking.screen_dedupe_tol_eV,
+            "screen_geom_tol_A": docking.screen_geom_tol_A,
+            "refine_window_kcal": docking.refine_window_kcal,
+            "n_refine": docking.n_refine,
+            "n_solute": n_solute,
+            "atoms_per_solvent": aps,
+            "version": VERSION,
+            "parents": dump_parents,
+        }))
 
     refine_tasks = [(screened[i].atoms, calculator, solvation,
                      calculator_kwargs, scoring.fmax, scoring.opt_steps, 0)
                     for i in top]
     refined = pool_map(relax, refine_tasks, n_workers)
-    refined_sources = [sources[i] for i in top]
-    return refined, refined_sources, len(placements), window_counts
+    return refined, origins, len(placements)
 
 
 def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
-                     docking, scoring, n_tried, n_parents_used, n_solute, aps,
-                     window_counts):
+                     docking, scoring, n_tried, n_parents_used, n_solute, aps):
     """Turn one n's refined placements into `scored.json` and its files.
 
-    `pairs` is `[(Relaxed, parent_index), ...]`, already sorted lowest energy
+    `pairs` is `[(Relaxed, ScreenOrigin), ...]`, already sorted lowest energy
     first, for every refined placement at this n (not yet deduped). The
     summary itself is built by `ensemble.summarise`, the same function
     `ensemble.assemble` calls, so a docking run and a sweep run cannot drift
@@ -627,11 +723,11 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
     `summarise` report no occupancy at all rather than a plausible number.
     """
     e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = references
-    n_dir = out_root / f"{label}_n{n}_dock"
+    n_dir = dock_run_dir(out_root, label, n)
     n_dir.mkdir(parents=True, exist_ok=True)
 
     candidates = []
-    for i, (result, parent_index) in enumerate(pairs):
+    for i, (result, origin) in enumerate(pairs):
         gaps = solvent_molecule_gaps(result.atoms, n_solute, aps)
         candidates.append(Candidate(
             # No trajectory to index into: this is which refined placement
@@ -651,7 +747,7 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             gnorm_Eh_bohr=result.gnorm_Eh_bohr,
             n_opt_steps=result.n_opt_steps,
             descriptor=contact_descriptor(result.atoms, n_solute, aps),
-            parent=parent_index,
+            parent=origin.parent,
             n_frames=None,
             frames=None,
         ))
@@ -673,22 +769,38 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
         return same_basin(c.energy_eV, c.descriptor,
                           best.energy_eV, best.descriptor)
 
+    # Grouped off the `ScreenOrigin`s rather than off `Candidate.parent`, so
+    # the screening provenance is available here without every candidate in
+    # `scored.json` having to carry a pair of fields an MD candidate could
+    # only write as null.
     per_parent = {}
-    for c in candidates:
-        per_parent.setdefault(c.parent, []).append(c)
+    for candidate, (_, origin) in zip(candidates, pairs):
+        per_parent.setdefault(origin.parent, []).append((candidate, origin))
     # `n_placements` is how many of this parent's basins were refined;
     # `n_in_window` is how many its window admitted. They differ exactly when
     # `n_refine` capped the selection, which `report.refine_cap_warning`
     # surfaces -- a capped run is choosing by screened rank again, and the
-    # refined candidates alone cannot show it.
-    parent_detail = [
-        {"parent": pi,
-         "n_placements": len(cs),
-         "n_in_window": window_counts[pi],
-         "e_int_min_kcal": min(c.interaction_eV for c in cs) * EV_TO_KCAL,
-         "best": any(is_best(c) for c in cs)}
-        for pi, cs in sorted(per_parent.items())
-    ]
+    # refined candidates alone cannot show it. `screen_cut_kcal` is how far up
+    # the cap reached before it did, and the two `best_screen_*` fields are
+    # where this parent's own winner sat: together they are what discharges a
+    # cap warning instead of merely repeating it. See `ScreenOrigin` for why
+    # the offset and not the rank is the number to grade on.
+    parent_detail = []
+    for pi, items in sorted(per_parent.items()):
+        # `pairs` is energy-sorted, so `items[0]` is this parent's own best
+        # refined candidate; `min` says it rather than relying on that.
+        best_candidate, best_origin = min(
+            items, key=lambda item: item[0].interaction_eV)
+        parent_detail.append({
+            "parent": pi,
+            "n_placements": len(items),
+            "n_in_window": best_origin.n_in_window,
+            "screen_cut_kcal": best_origin.cut_kcal,
+            "best_screen_rank": best_origin.rank,
+            "best_screen_offset_kcal": best_origin.offset_kcal,
+            "e_int_min_kcal": best_candidate.interaction_eV * EV_TO_KCAL,
+            "best": any(is_best(c) for c, _ in items),
+        })
 
     summary = summarise(
         run_dir=n_dir,
@@ -722,7 +834,8 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
 
 
 def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
-                docking=None, scoring=None, n_workers=None, label=None):
+                docking=None, scoring=None, n_workers=None, label=None,
+                dump_screen=False):
     """Dock one solute in one solvent, chained upward over n.
 
     n = 1's parent is the bare relaxed solute (the same reference
@@ -738,6 +851,13 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
     matching `sweep.json`'s shape -- and `<out_root>/dock_report.txt`, plus
     one `best_n<N>.xyz` per requested n. Returns the list of summaries, one
     per requested n.
+
+    `dump_screen` additionally writes `screen.json` into every n's run
+    directory -- **every** n the chain walks, not only the requested ones,
+    since the partition at a skipped n is exactly as interesting and the
+    screening for it was paid for anyway. It is not a `Docking` field on
+    purpose: it changes nothing about the run, so it has no business in the
+    params block that says what the run was. See `dock_at_n`.
     """
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -781,16 +901,18 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
 
     for n in range(1, max_n + 1):
         n_parents_used = len(parents)
-        refined, sources, n_tried, window_counts = dock_at_n(
+        refined, origins, n_tried = dock_at_n(
             parents, n_solute, solvent_unit, n, docking, scoring, solvation,
             docking.calculator, docking.calculator_kwargs, seed=n,
-            n_workers=n_workers)
+            n_workers=n_workers,
+            screen_dump=(dock_run_dir(out_root, label, n) / "screen.json"
+                         if dump_screen else None))
         n_tried_total += n_tried
 
-        pairs = sorted(zip(refined, sources), key=lambda pair: pair[0].energy_eV)
+        pairs = sorted(zip(refined, origins), key=lambda pair: pair[0].energy_eV)
         summary = _assemble_dock_n(
             out_root, label, n, pairs, references, solvation, docking,
-            scoring, n_tried, n_parents_used, n_solute, aps, window_counts)
+            scoring, n_tried, n_parents_used, n_solute, aps)
         all_n_min_kcal[n] = summary["min_interaction_kcal"]
 
         keep_idx = dedupe_energies(
@@ -921,6 +1043,23 @@ def main(argv=None):
                         default=Docking.screen_fmax,
                         help="loose optimiser convergence for the screening "
                              "pass, eV/A (default: %(default)s)")
+    parser.add_argument("--screen-dedupe-tol", type=float,
+                        default=Docking.screen_dedupe_tol_eV,
+                        help="energy half of the screening basin criterion, "
+                             "eV; deliberately looser than the scorer's "
+                             "because a screened geometry is only relaxed to "
+                             "--screen-fmax (default: %(default)s)")
+    parser.add_argument("--screen-geom-tol", type=float,
+                        default=Docking.screen_geom_tol_A,
+                        help="contact-descriptor half of the screening basin "
+                             "criterion, A; splitting one basin here spends "
+                             "--refine slots on near-copies of it "
+                             "(default: %(default)s)")
+    parser.add_argument("--dump-screen", action="store_true",
+                        help="also write <run>/screen.json per n: every "
+                             "screened energy and descriptor plus the "
+                             "window/cap decision, so the screening partition "
+                             "can be re-examined without re-running the screen")
     parser.add_argument("--freeze-solute", action="store_true",
                         help="FixAtoms the solute during screening only "
                              "(approximation; refinement is always "
@@ -958,6 +1097,8 @@ def main(argv=None):
         n_parents=args.parents,
         n_refine=args.refine,
         refine_window_kcal=args.refine_window,
+        screen_dedupe_tol_eV=args.screen_dedupe_tol,
+        screen_geom_tol_A=args.screen_geom_tol,
         screen_fmax=args.screen_fmax,
         freeze_solute=args.freeze_solute,
         solvent=args.solvent,
@@ -969,7 +1110,7 @@ def main(argv=None):
     run_docking(
         args.solute, args.solvent_geometry, args.solvent, args.n_values,
         args.out, docking=docking, scoring=scoring, n_workers=args.workers,
-        label=args.label,
+        label=args.label, dump_screen=args.dump_screen,
     )
     print(Path(args.out) / "dock_report.txt")
 
