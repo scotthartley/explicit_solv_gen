@@ -790,7 +790,7 @@ deterministic, at the cost of occasionally keeping two points closer than the
 spacing across a cell boundary, which for a placement grid is harmless
 redundancy.
 
-**What each shell costs, and an open question about the outer one.** Equal
+**What each shell costs, and what the outer one is worth.** Equal
 150-pose samples off the relaxed n = 1 parent, screened through the same pool:
 
 | shell | poses kept | mean BFGS steps | throughput |
@@ -806,15 +806,124 @@ contact and BFGS does real work on it. The refinement half does not scale at
 all: `n_refine` is 10 per parent whatever the mode, so a run does 30 tight
 relaxations either way.
 
-That table also puts the outer shell in question. It is 54% of the poses and
+That table also put the outer shell in question. It is 54% of the poses and
 converges in a **median of one BFGS step** -- those placements never relax
 into contact at all, they are accepted by the loose screen sitting exactly
 where they were put, which is consistent with the zero both-N hits and the
-2 kcal/mol higher screened minimum above. It is kept on the argument that a
+2 kcal/mol higher screened minimum above. It was kept on the argument that a
 bulky orientation may clear `tolerance` only further out, on a solute the
-inner shells reject outright -- but that argument is *not* measured, and on
-this system the shell is measurably buying nothing for ~30% of the run time.
-Dropping to `(0.4, 0.7)` is the obvious test and has not been run.
+inner shells reject outright -- an argument that was not measured. It has now
+been measured, in two solvents.
+
+**The shell question, closed.** Pyrazine, `--n 1 2 3`, grid mode, everything
+else at defaults. `E_int(min)` in kcal/mol, then found-by, then `pool`. At one
+parent and `--refine 10`, the conditions of the comparison table below:
+
+| solvent | shells | poses | time | n = 1 | n = 2 | n = 3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| CHCl3 | (0.4, 0.7, 1.0) | 15,542 | 148 s | -6.667 10/10 1 | -13.002 6/10 5 | -18.350 1/10 9 |
+| CHCl3 | (0.4, 0.7) | 7,382 | 128 s | identical | identical | identical |
+| CHCl3 | (0.5, 0.7) | 8,796 | 157 s | -6.664 10/10 1 | -13.023 9/10 2 | -18.378 2/10 5 |
+| acetone | random, 64 | 192 | 13 s | -4.563 1/10 8 | -9.366 1/10 10 | -14.582 1/10 10 |
+| acetone | 0.4 alone | 177 | 14 s | -4.566 1/10 9 | -10.101 1/10 10 | -14.743 1/10 8 |
+| acetone | 0.7 alone | 3,400 | 44 s | -4.541 1/10 9 | -9.612 1/10 8 | -14.637 1/10 10 |
+| acetone | 1.0 alone | 8,448 | 37 s | -4.343 1/10 7 | -9.093 1/10 9 | -14.628 1/10 10 |
+| acetone | (0.4, 0.7, 1.0) | 11,673 | 75 s | -4.541 | -9.612 | -14.637 |
+| acetone | (0.4, 0.7) | 3,609 | 51 s | identical to default | | |
+| acetone | (0.5, 0.7) | 4,104 | 60 s | identical to default | | |
+
+At three parents and `--refine 30` -- `n_parents` is the real default, and 30
+is what the comparison below already advises before a `dft_export`:
+
+| solvent | shells | poses | time | n = 1 | n = 2 | n = 3 |
+| --- | --- | --- | --- | --- | --- | --- |
+| CHCl3 | (0.4, 0.7, 1.0) | 37,385 | 403 s | -6.667 27/30 4 | -13.043 10/90 36 | -18.355 2/90 46 |
+| CHCl3 | (0.5, 0.7) | 20,931 | 424 s | -6.665 28/30 3 | -13.037 15/90 31 | -18.360 2/90 45 |
+| acetone | (0.4, 0.7, 1.0) | 28,407 | 215 s | -4.541 1/30 26 | -10.129 2/90 82 | -15.462 1/90 85 |
+| acetone | (0.4, 0.7) | 8,518 | 150 s | -4.546 4/30 26 | -10.039 1/90 80 | -15.363 1/90 82 |
+| acetone | (0.5, 0.7) | 9,925 | 171 s | -4.541 1/30 28 | -10.146 1/90 73 | -15.048 1/90 69 |
+
+Both tables predate the principal-axis alignment described further down, which
+slightly changes which poses a grid run generates: the first row re-measured
+after it gives -6.6667 / -13.0222 / -18.2082 on 15,148 poses. The n = 3 shift
+is the greedy chain following a *lower* n = 2, not a worse search, and it is
+the same size as the chain's own scatter below. Shell-against-shell
+comparisons hold at that resolution; an absolute number worth quoting should
+be re-measured.
+
+**The outer shell is inert.** Remove it and chloroform at one parent is
+identical at every n, `pool` and found-by included; at three parents the
+default and (0.5, 0.7) differ by at most 0.006 kcal/mol. Run *alone* it is the
+worst shell for acetone at every n despite having the most poses. The
+structural reason is the median-one-step column above: its poses do not relax
+into contact at `screen_fmax`, so they rank below every contact pose and are
+refined only when a parent turned up fewer contact basins than `n_refine`.
+Dropping it saves 45-70% of the poses and almost none of the wall-clock -- an
+inner pose costs ~4x an outer one, so chloroform's 52% pose saving was 14% of
+the run.
+
+**0.4 against 0.5 is a wash.** Chloroform at one parent prefers 0.5 (both-N
+9/10 against 6/10, and lower at n = 2 and n = 3); at three parents the two are
+equal. Acetone is mixed at the 0.1-0.4 kcal/mol level, which is inside the
+selection noise below.
+
+**Acetone's spread is selection noise, and the noise is the finding.** Every
+acetone run has found-by 1 of N and a `pool` near the cap: many shallow,
+near-degenerate basins. The 0.4 r shell alone -- 177 poses -- found -4.566 at
+n = 1, lower than any run with 8,000 to 28,000 poses and 30 refinements.
+Checked with `same_basin`: that basin *is* in the default grid's pose list
+(same parent, same shell), and appears in none of the default run's refined
+candidates at `--refine` 10 or 30, while the 64-pose random run and the
+(0.4, 0.7) run both reach it. So the refine selection -- a fixed top-k off a
+ranking relaxed only to 0.05 eV/A, with screened basins merged at 10 meV /
+0.5 A -- loses basins once the screened pool is 50x larger than k, and raising
+k alone does not cure it. That is grid mode's first-order weakness and a
+bigger effect than any shell set: the screen-to-refine handoff, not the radial
+grid, is where the next measurement goes. The greedy chain shows in the same
+tables -- chloroform n = 3 is -18.355 at three parents / refine 30 against
+-18.404 at three parents / refine 10, because refine 30 found a lower n = 2
+(-13.043) whose descendants are not the best n = 3. That is the known
+`n_parents` caveat, not something grid mode introduced.
+
+**So `grid_probe_fracs` stays `(0.4, 0.7, 1.0)`.** Nothing measured is better,
+and the rule here is not to move a default without a measurement that says to.
+What changes is why the outer shell is there: not the unmeasured bulky-orientation
+argument, but that it is nearly free, and that the case which would justify it
+-- a concave solute whose pockets the inner shells reject outright -- is
+exactly the case neither chloroform nor acetone on pyrazine tested.
+
+**A new solvent wants a per-shell survival count first.** The fractions scale
+with the solvent's bulk-density sphere radius; the contact distance they are
+meant to bracket -- centroid to nearest heavy atom -- does not scale with it.
+The 1.0 r shell sits 3.5 A from a pyrazine N for water, which is nearly an
+H-bond, 4.4-4.9 A for chloroform and ~5 A for toluene, which is empty space.
+The cheap check is the pose count itself -- how many poses clear `tolerance`
+per shell, seconds of numpy and no calculator. For water, chloroform, acetone,
+methanol, acetonitrile and benzene, against bare pyrazine and against a
+grooved pyrazine + 2 CHCl3 parent, the 0.7 r shell never had a position where
+all 12 orientations clashed, so the "the outer shell rescues positions the
+inner shells reject" case did not fire anywhere; 0.4 r keeps 6-20% of its
+poses on the flatter solvents (acetone: 47 of 792) and 1.0 r keeps 100%
+everywhere. Run that count on a new solvent before trusting these fractions.
+
+**Grid mode is not frame-independent, so the parent is aligned first.** It was
+commented in `dock_at_n` as though it were -- "the placement region *is* the
+parent's surface" -- and it is not: `_voxel_downsample` rounds against a
+lattice anchored at the lab origin, and the `n_orientations` rotations are
+lab-frame. Measured on bare pyrazine, six rigid motions of the input gave
+3251-3564 poses against the file frame's 3355, a 6.2% spread, at different
+places. Not a correctness bug -- every pose still clears `tolerance`, screened
+by the same test -- but a reproducibility caveat for the one mode whose
+selling point is coverage. `dock_at_n` now calls
+`align_to_principal_axes(parent, n_solute)` before *both* placement modes, as
+the random one always did for its axis-aligned ellipsoid; that puts the two
+modes' poses in one frame and makes the pose set bit-identical across rigid
+motions. What survives is `_principal_frame`'s eigenvector-sign ambiguity:
+`eigh` fixes each axis only up to sign, a perturbation as small as a pure
+translation can flip one, and the flipped runs give 3348-3363 poses (0.4%)
+across the same six motions. Deliberately not fixed -- `_principal_frame` also
+sets the frame `pack_solvent` packs into, so pinning the sign convention would
+move the starting geometry of every MD sweep to buy 0.4% of the grid.
 
 **The parent is the new solute, literally.** At n = k the surface is computed
 on the whole relaxed n = k - 1 complex, with no solute/solvent distinction
@@ -851,7 +960,9 @@ fixed 10 per parent taken off the lowest *screened* representatives, so
 against 5236 screened poses instead of 64 those ten all land in the best few
 basins. That is the right trade for minimum-finding and the wrong one for
 `dft_export`, which wants diversity inside its 3 kcal/mol window; raise
-`--refine` when exporting from a grid run.
+`--refine` when exporting from a grid run. The grid column here predates the
+principal-axis alignment, like the shell tables above and with the same
+caveat; the random column is unaffected, since that path always aligned.
 
 **`n_parents` still earns its keep under a systematic scan**, which was the
 open question -- with random placement a bad parent choice compounds with

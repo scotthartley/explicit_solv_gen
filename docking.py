@@ -135,11 +135,20 @@ class Docking:
     # centroid 3.17 A from the nearest pyrazine atom where that shell puts it
     # at 4.4-4.9 A, and a scan of that shell alone found the both-nitrogens
     # basin in 0 of 2664 poses against 13-27 of a few hundred at 0.4-0.6.
-    # The outer shell is kept on the argument that a bulky orientation may
-    # clear `tolerance` only further out -- an argument that is not measured,
-    # and on pyrazine that shell is 54% of the poses at a median of one BFGS
-    # step, i.e. buying nothing for ~30% of the run. See DESIGN.md's
-    # "Systematic placement" for the scan and for that open question.
+    # The outer shell is no longer argued for but measured, in two solvents,
+    # and it is **inert**: dropping it leaves chloroform identical at every n
+    # (E_int(min), found-by and pool alike) at one parent and within 0.006
+    # kcal/mol at three, and moves acetone only inside its own selection
+    # noise. Its poses do not relax into contact at the loose screen, so they
+    # rank below every contact pose and are refined only when a parent has
+    # fewer contact basins than `n_refine`. It stays because it is nearly
+    # free -- it is 45-70% of the poses, but an outer pose costs ~4x less
+    # than an inner one, so dropping it saved 14% of the wall-clock -- and
+    # because the one case that would justify it, a concave solute whose
+    # pockets the inner shells reject outright, is exactly what neither
+    # solvent tested. See DESIGN.md's "Systematic placement" for both tables,
+    # and for why a new solvent wants a per-shell survival count before these
+    # fractions are trusted.
     grid_probe_fracs: tuple = (0.4, 0.7, 1.0)
     # Grid mode only. Quasi-uniform rotations per position, from a
     # super-Fibonacci spiral over SO(3). No symmetry detection and no
@@ -269,6 +278,31 @@ def _quaternion_to_matrix(q):
     ])
 
 
+def _pose_if_clear(parent_atoms, parent_positions, solvent_unit, centered,
+                   rotation, point, tolerance):
+    """`solvent_unit` rotated and centred on `point`, appended to the parent.
+
+    `None` if any interatomic distance to the parent would fall below
+    `tolerance` -- the placement test, in packmol's sense and packmol's
+    units, and the one place it lives: `place_one` redraws when this returns
+    `None` and `grid_placements` skips the pose, so "the identical test" is
+    structural rather than two copies that happen to agree. It is also the
+    inner-exclusion test, since a point inside the parent fails it too.
+
+    `parent_positions` and `centered` -- the solvent unit's coordinates about
+    its own centroid -- are passed in already computed because both callers
+    loop over one fixed parent and one fixed solvent molecule.
+    """
+    coords = centered @ rotation.T + point
+    d = np.linalg.norm(
+        coords[:, None, :] - parent_positions[None, :, :], axis=2)
+    if d.min() < tolerance:
+        return None
+    placed = solvent_unit.copy()
+    placed.set_positions(coords)
+    return parent_atoms + placed
+
+
 def grid_placements(parent_atoms, solvent_unit, docking):
     """Every position x orientation pose of `solvent_unit` around the parent.
 
@@ -285,11 +319,16 @@ def grid_placements(parent_atoms, solvent_unit, docking):
     `docking.grid_probe_fracs`, because no single one is right: the outermost
     is the solvent-centre surface, which is the contact distance for a sphere
     and about 1.5 A too far out for a directional H-bond. Orientations come
-    from `_orientation_quaternions`. Poses whose closest
-    interatomic approach to the parent is under `docking.tolerance` are
-    dropped -- the identical test `place_one` redraws on -- so the returned
-    count is already post-rejection, which is what `n_placements_tried`
-    reports.
+    from `_orientation_quaternions`. Poses whose closest interatomic approach
+    to the parent is under `docking.tolerance` are dropped -- literally
+    `_pose_if_clear`, the test `place_one` redraws on -- so the returned count
+    is already post-rejection, which is what `n_placements_tried` reports.
+
+    Callers pass an already principal-axis-aligned parent, exactly as
+    `place_one`'s do: the grid is *not* frame-independent, because
+    `_voxel_downsample` rounds against a lattice anchored at the lab origin
+    and the orientations are lab-frame, so a rigidly moved input would
+    otherwise give a slightly different pose set. See `dock_at_n`.
 
     **The parent is the whole complex**, with no solute/solvent distinction
     anywhere here: at n = k the surface is computed on the relaxed n = k - 1
@@ -327,15 +366,12 @@ def grid_placements(parent_atoms, solvent_unit, docking):
 
     placements = []
     for q in quaternions:
-        rotated = centered @ _quaternion_to_matrix(q).T
+        rotation = _quaternion_to_matrix(q)
         for point in positions:
-            coords = rotated + point
-            d = np.linalg.norm(
-                coords[:, None, :] - parent_positions[None, :, :], axis=2)
-            if d.min() >= docking.tolerance:
-                placed = solvent_unit.copy()
-                placed.set_positions(coords)
-                placements.append(parent_atoms + placed)
+            pose = _pose_if_clear(parent_atoms, parent_positions, solvent_unit,
+                                  centered, rotation, point, docking.tolerance)
+            if pose is not None:
+                placements.append(pose)
     return placements
 
 
@@ -345,11 +381,10 @@ def place_one(parent_atoms, solvent_unit, region, tolerance, rng, max_tries=2000
     A random point inside the ellipsoidal shell `region` (semi-axes, centred
     at the origin -- callers pass an already solute-centred `parent_atoms`),
     a random orientation from `solvate_md._random_rotation`, redrawn whenever
-    any interatomic distance to an existing atom would fall below
-    `tolerance`. There is no separate inner-exclusion test: a point too close
-    to the solute simply fails the same distance check, exactly as
-    `pack_solvent` relies on packmol's own `tolerance` to keep solvent off
-    the fixed solute rather than carving out a second region for it.
+    `_pose_if_clear` rejects the pair. That one test also keeps solvent off
+    the solute -- a point too close simply fails it -- exactly as
+    `pack_solvent` relies on packmol's own `tolerance` rather than carving
+    out a second region for the purpose.
 
     Pure numpy, no packmol and no subprocess -- what makes it cheap enough to
     try dozens of poses per parent. Returns the combined `Atoms`.
@@ -359,15 +394,14 @@ def place_one(parent_atoms, solvent_unit, region, tolerance, rng, max_tries=2000
     centered = unit_positions - unit_positions.mean(axis=0)
 
     for _ in range(max_tries):
+        # Point first, then rotation: the stream is shared across parents and
+        # across n, so swapping the two draws reshuffles every random run.
         point = _random_point_in_ellipsoid(region, rng)
         rotation = _random_rotation(rng)
-        positions = centered @ rotation.T + point
-        d = np.linalg.norm(
-            positions[:, None, :] - parent_positions[None, :, :], axis=2)
-        if d.min() >= tolerance:
-            placed = solvent_unit.copy()
-            placed.set_positions(positions)
-            return parent_atoms + placed
+        pose = _pose_if_clear(parent_atoms, parent_positions, solvent_unit,
+                              centered, rotation, point, tolerance)
+        if pose is not None:
+            return pose
 
     raise RuntimeError(
         f"place_one: no placement clearing tolerance={tolerance} A in "
@@ -376,12 +410,46 @@ def place_one(parent_atoms, solvent_unit, region, tolerance, rng, max_tries=2000
     )
 
 
+def random_placements(parent_atoms, solvent_unit, n_solute, n_total, docking,
+                      rng):
+    """`docking.n_placements` independent draws around the parent.
+
+    The historical counterpart of `grid_placements`, and the same shape of
+    thing: everything one mode needs to turn one parent into a list of poses,
+    so `dock_at_n` dispatches to one call per mode rather than carrying one
+    mode's sizing arithmetic inline. What it buys is *confidence* rather than
+    coverage -- see `Docking.place_mode`.
+
+    The region is the ellipsoidal shell `place_one` draws in, sized by
+    `shell_padding` around the **solute block alone** (`n_solute` leading
+    atoms of an already principal-axis-aligned parent) but holding the whole
+    complex, at the `n_total` the shell is eventually meant to hold rather
+    than at the parent's own count -- so the region a molecule is drawn into
+    does not shrink as the chain grows.
+
+    `rng` is passed in, not seeded here: one stream runs across every parent
+    and every n of a run, which is what makes a given `seed` reproduce a run
+    pose for pose.
+    """
+    solute_only = parent_atoms[:n_solute]
+    semi_axes = solute_semi_axes(solute_only)
+    padding = shell_padding(
+        semi_axes, _vdw_volume(solute_only), n_total,
+        bulk_molecular_volume(docking.solvent, solvent_unit),
+        docking.shell_fill,
+        min_padding=solvent_radius(docking.solvent, solvent_unit))
+    region = semi_axes + padding
+    return [place_one(parent_atoms, solvent_unit, region, docking.tolerance,
+                      rng)
+            for _ in range(docking.n_placements)]
+
+
 def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
               solvation, calculator, calculator_kwargs, seed, n_workers=None):
     """Grow every parent by one solvent molecule, screen, and refine.
 
     Builds the placements -- `len(parents) * docking.n_placements` random
-    ones (see `place_one`), or, at `place_mode="grid"`, every surface
+    ones (see `random_placements`), or, at `place_mode="grid"`, every surface
     position x orientation pose that clears the tolerance (see
     `grid_placements`) -- screens all of them at `docking.screen_fmax`, and refines
     up to `docking.n_refine` *per parent* at the scorer's tight criterion:
@@ -400,39 +468,40 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
     placements screened (not all of which were refined) -- the
     denominator the docking report shows the search effort against.
     """
-    placements, sources = [], []
+    # Both modes place into the parent's principal-axis frame: only the
+    # solute block defines where the axes point (a docking parent is the
+    # whole complex, and has been through BFGS with nothing constraining its
+    # centre of mass), but the whole complex moves with it. The random path
+    # needs this, since its ellipsoidal region is axis-aligned. Grid mode
+    # does not need it to be *correct* -- its region is the parent's own
+    # surface -- but it is not frame-independent either, and used to be
+    # commented here as though it were: `_voxel_downsample` rounds against a
+    # lattice anchored at the lab origin and the orientations are lab-frame,
+    # so six rigid motions of bare pyrazine gave 3251-3564 poses (6.2% spread)
+    # against the file frame's 3355, at different places. Aligning first cuts
+    # that to 3348-3363, and to *bit-identical* pose sets whenever the two
+    # frames agree in sign -- what is left is `_principal_frame`'s
+    # eigenvector-sign ambiguity, which flips on a pure translation and is
+    # deliberately not fixed (it would move packmol's starting frame, and so
+    # every sweep). See DESIGN.md's "Systematic placement".
+    aligned = [align_to_principal_axes(parent, n_solute) for parent in parents]
     if docking.place_mode == "grid":
-        # No principal-axis alignment and no ellipsoid: the surface points
-        # are computed in the parent's own frame, and the placement region
-        # *is* the parent's surface, so nothing here depends on the
-        # orientation of the input or on `n_total`.
-        for parent_index, parent in enumerate(parents):
-            poses = grid_placements(parent, solvent_unit, docking)
-            placements += poses
-            sources += [parent_index] * len(poses)
+        per_parent = [grid_placements(parent, solvent_unit, docking)
+                      for parent in aligned]
     elif docking.place_mode == "random":
-        v_solvent = bulk_molecular_volume(docking.solvent, solvent_unit)
-        r_solvent = solvent_radius(docking.solvent, solvent_unit)
         rng = np.random.default_rng(seed)
-
-        for parent_index, parent in enumerate(parents):
-            # Only the solute block defines the frame the shell region is
-            # measured in, but the whole complex moves with it.
-            aligned = align_to_principal_axes(parent, n_solute)
-            solute_only = aligned[:n_solute]
-            semi_axes = solute_semi_axes(solute_only)
-            v_solute = _vdw_volume(solute_only)
-            padding = shell_padding(semi_axes, v_solute, n_total, v_solvent,
-                                    docking.shell_fill, min_padding=r_solvent)
-            region = semi_axes + padding
-            for _ in range(docking.n_placements):
-                placements.append(place_one(aligned, solvent_unit, region,
-                                            docking.tolerance, rng))
-                sources.append(parent_index)
+        per_parent = [random_placements(parent, solvent_unit, n_solute,
+                                        n_total, docking, rng)
+                      for parent in aligned]
     else:
         raise ValueError(
             f"unknown place_mode {docking.place_mode!r}; expected "
             '"random" or "grid"')
+
+    placements, sources = [], []
+    for parent_index, poses in enumerate(per_parent):
+        placements += poses
+        sources += [parent_index] * len(poses)
 
     # The same optimiser as the refinement below and as the scorer, at a
     # looser `fmax` and optionally with the solute held fixed. Nothing it
