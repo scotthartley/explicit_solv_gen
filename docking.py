@@ -120,8 +120,9 @@ class Docking:
     # than confidence: nothing in a random run's output distinguishes "this
     # basin does not exist" from "we did not draw it", and a missing basin is
     # the one thing downstream DFT cannot repair. `n_placements` is ignored
-    # in grid mode, so the params block's `place_mode` is what says which of
-    # the two numbers was live.
+    # in grid mode; a rendered report omits it there rather than asserting a
+    # setting that did nothing (`report.inert_params`), though `dock.json`'s
+    # own `asdict` still carries it, live or not.
     place_mode: str = "random"
     # Grid mode only. Surface points are voxel-downsampled to roughly this
     # separation, so each position stands for ~`grid_spacing_A**2` of
@@ -959,10 +960,12 @@ def dock_params(docking, scoring, n_values, label, capacity, solute_path,
     # the source, so a report and its re-render stay byte-identical.
     params["grid_probe_fracs"] = list(docking.grid_probe_fracs)
     # `max_frames` describes how a trajectory is subsampled, and docking has
-    # no trajectory: `summarise` already writes it as `None` per run, and the
-    # params block should not advertise a setting that did nothing either.
-    params.update({k: v for k, v in asdict(scoring).items()
-                   if k != "max_frames"})
+    # no trajectory: `summarise` already writes it as `None` per run. It stays
+    # in this block regardless -- the JSON records the complete `asdict` of
+    # every dataclass so nothing can be added without appearing here;
+    # `report.inert_params` is what crops it (and `place_mode`'s other inert
+    # fields) at render time.
+    params.update(asdict(scoring))
     params.update({
         "solute_label": label,
         "solute_path": str(solute_path),

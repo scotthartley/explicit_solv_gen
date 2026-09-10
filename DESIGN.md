@@ -47,6 +47,44 @@ two sweeps most needed distinguishing -- and it failed silently, since
 `git`'s stderr was discarded and `None` rendered as `-`. `version` is the
 pin now, which is why the bump rule in `CLAUDE.md` is not optional.
 
+### Cropping a *rendered* block is not cropping the record
+
+Being the whole `asdict` is the right rule for what gets **recorded** -- no
+`Condition` / `Scoring` / `Docking` field can be added without landing in the
+params block, so nothing that shapes a run goes unrecorded by omission. It is
+the wrong rule for what gets **printed**, because a field can be live in the
+dataclass and provably inert in a given run: grid-mode docking never reads
+`n_placements`, random mode never reads `grid_spacing_A`, and no docking run
+has a trajectory for `max_frames` to subsample. Before 0.16.0 a rendered
+report asserted all three anyway -- a grid-mode `dock_report.txt` printed
+`n_placements  64` and `shell_fill  0.5` beside `place_mode  grid`, and a
+reader had to know `docking.py`'s dispatch to discount them.
+
+0.16.0's `report.inert_params` answers this at render time only:
+`format_report` omits a row when another value already recorded in the same
+block says it did nothing, and appends a one-line footnote naming what it
+dropped and why. `sweep.json` / `dock.json` are untouched -- `dock_params`
+stopped special-casing `max_frames` out of the JSON for exactly this reason,
+so the record stays the complete `asdict` and two runs' params blocks stay
+diffable key-for-key regardless of what either run's report chose to show.
+
+**The rule is inert *given another recorded value*, never "left at its
+default."** Cropping a field merely because it sits at its default was
+considered and rejected outright: it is the same mistake that made
+`wall_slack`'s silent meaning-change at `c429f8a` dangerous in the first
+place. A params block that hides values equal to their default cannot show a
+reader that two runs disagree about what a default field *means* -- only
+that both happen to hold the same number -- and that is precisely the case
+that needs the field visible, not hidden. So a report keeps every field that
+is merely at a default and crops only a field another recorded value has
+made structurally impossible to have acted.
+
+The same reasoning applies to `run.log`'s header at n = 0: `pack_solvent`
+short-circuits before packmol runs, so the whole Packing block and the wall
+row of Sampling Hamiltonian describe machinery that did not execute, not
+settings that merely took their default value. They are dropped, with a
+one-line replacement saying why, on the identical basis.
+
 ## `E_int(n)` is what makes "how much explicit solvent?" a measurement
 
     E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)

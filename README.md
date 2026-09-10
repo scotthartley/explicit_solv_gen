@@ -365,6 +365,20 @@ distinct-minima `mean_contacts` / `dissolved_fraction` are there too; they
 describe the search, which `pool` already reports, and the table shows the
 frame-weighted pair instead.
 
+**What is in the Parameters block, but only in the JSON.** A docking report's
+Parameters block can omit a row the params JSON still carries — `n_placements`
+under `place_mode = grid`, `grid_spacing_A` under `place_mode = random`,
+`n_parents` when the chain requested runs no further than `n = 1`, and
+`max_frames` always, since docking has no trajectory to subsample. Each
+omission is because another value printed in the same block already says the
+row did nothing, never because the row sits at its default — a field merely
+at its default is always shown. A one-line footnote under the block names
+what it dropped and why, e.g. `Omitted as inert: n_placements, shell_fill
+(place_mode = grid enumerates the surface; it draws no random poses).`
+`dock.json` itself is untouched: it is the complete `asdict` of `Docking` /
+`Scoring` regardless of what a given run's report chose to print, so two
+runs' params blocks stay diffable key-for-key.
+
 **Basin spectrum** is the ladder those two columns are read off: every
 distinct minimum at that `n`, lowest first, in kT above that `n`'s own minimum,
 up to `--ladder` rungs (default 16; `pool` says how many there are in total).

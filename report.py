@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.15.1"
+VERSION = "0.16.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -137,6 +137,65 @@ def kv_block(title, mapping, indent="  "):
 
 def banner(text):
     return f"{_RULE}\n {text}\n{_RULE}"
+
+
+def inert_params(params):
+    """Params another recorded param renders inert -> why they are omitted.
+
+    Pure function of `params`, so a live render and a `python -m report`
+    re-render agree. Both `sweep.json` and `dock.json` params blocks are
+    `asdict` of the live dataclasses (`n_sweep.sweep_params`,
+    `docking.dock_params`) -- the right rule for the *record*, since it means
+    no field can be added to `Condition` / `Scoring` / `Docking` without
+    appearing there, but it means a naive render asserts settings that
+    provably did nothing given another value already in the same block. This
+    crops those rows at render time only; the JSON keeps every one of them.
+
+    **"Inert" here means inert *given another recorded value*, never "left at
+    its default"** -- cropping defaults would hide exactly the kind of silent
+    meaning-change `wall_slack` underwent at `c429f8a`, which is why a report
+    still prints every field at its default.
+
+    Keyed off `"place_mode" in params` to tell a dock from a sweep, matching
+    how `format_report` already distinguishes them by
+    `summaries[0]["pack_mode"]`. A sweep has no analogous case -- no
+    `Condition` or `Scoring` field is made inert by another.
+    """
+    if "place_mode" not in params:
+        return {}
+    inert = {}
+    if params["place_mode"] == "grid":
+        for key in ("n_placements", "shell_fill"):
+            inert[key] = ("place_mode = grid enumerates the surface; it "
+                          "draws no random poses")
+    elif params["place_mode"] == "random":
+        for key in ("grid_spacing_A", "grid_probe_fracs", "n_orientations"):
+            inert[key] = "place_mode = random draws no grid"
+    if max(params["n_values"]) == 1:
+        inert["n_parents"] = ("the chain ends at n = 1, so no second "
+                              "generation is seeded")
+    inert["max_frames"] = "docking has no trajectory to subsample"
+    return inert
+
+
+def format_inert_footnote(inert, indent="  "):
+    """Say what `inert_params` cropped and why, grouped by reason.
+
+    One line pair per distinct reason rather than one per key, so the grid
+    case -- two keys, one cause -- reads as one sentence instead of two
+    identical ones. `""` when nothing was cropped, so a caller can append it
+    unconditionally.
+    """
+    if not inert:
+        return ""
+    by_reason = {}
+    for key, reason in inert.items():
+        by_reason.setdefault(reason, []).append(key)
+    lines = []
+    for reason, keys in by_reason.items():
+        lines.append(f"{indent}Omitted as inert: {', '.join(keys)}")
+        lines.append(f"{indent}({reason}).")
+    return "\n".join(lines)
 
 
 # Two optimised candidates are one minimum when their energies are this close
@@ -502,16 +561,16 @@ _MD_COLUMNS = (
 )
 
 
-def format_run_header(meta, extra=None):
+def format_run_header(meta):
     """Header for one MD run, built from a `metadata.json`-shaped mapping.
 
     Taking the metadata dict rather than the `Condition` and `Packing` objects
     keeps the live log and the post-hoc regeneration on one code path, and
     guarantees the log cannot describe a run differently from the JSON beside
-    it. `extra` carries the few `Condition` fields metadata.json does not
-    record (`shell_fill`, `wall_slack`), and is omitted when regenerating.
+    it. `shell_fill` / `wall_slack` are read as mandatory subscripts, the same
+    rule as everything else here: a `metadata.json` that predates them is a
+    broken run to re-render, not an old one to default around.
     """
-    extra = dict(extra or {})
     n_solvent = meta["n_solvent"]
     aps = meta["atoms_per_solvent"]
     axes = meta["shell_semi_axes"]
@@ -523,33 +582,42 @@ def format_run_header(meta, extra=None):
     parts = [banner(f"Explicit-solvent MD: {meta['label']} "
                     f"(seed {meta['seed']})")]
 
+    solvent_row = (f"{meta['solvent_path']}  ({aps} atoms x {n_solvent})"
+                   if n_solvent
+                   else "not packed -- n = 0 is the solute reference")
     parts.append(kv_block("System", {
         "solute": f"{meta['solute_path']}  ({meta['n_solute']} atoms)",
-        "solvent": f"{meta['solvent_path']}  ({aps} atoms x {n_solvent})",
+        "solvent": solvent_row,
         "solvent name": meta["solvent"],
         "total atoms": meta["n_atoms"],
     }))
 
-    packing = {
-        "solute semi-axes/A": "  ".join(f"{a:.3f}" for a in axes),
-        "shell padding/A": f"{padding:.3f}",
-        "region semi-axes/A": "  ".join(f"{a + padding:.3f}" for a in axes),
-        "packmol tolerance/A": f"{meta['tolerance']:.2f}",
-    }
-    if "shell_fill" in extra:
-        packing["shell fill"] = f"{extra['shell_fill']:.2f}"
-    packing["wall distance/A"] = f"{meta['wall_distance']:.3f}"
-    if "wall_slack" in extra:
-        packing["wall slack"] = f"{extra['wall_slack']:.2f} solvent diameters"
-    packing["wall k/eV A^-2"] = f"{meta['wall_k']:.3f}"
-    parts.append(kv_block("Packing", packing))
+    # At n = 0, `solvate_md.pack_solvent` short-circuits before packmol runs
+    # and `SolventShellWall` has no solvent atoms to act on -- everything a
+    # Packing block would print here was computed and discarded.
+    if n_solvent:
+        parts.append(kv_block("Packing", {
+            "solute semi-axes/A": "  ".join(f"{a:.3f}" for a in axes),
+            "shell padding/A": f"{padding:.3f}",
+            "region semi-axes/A": "  ".join(f"{a + padding:.3f}" for a in axes),
+            "packmol tolerance/A": f"{meta['tolerance']:.2f}",
+            "shell fill": f"{meta['shell_fill']:.2f}",
+            "wall distance/A": f"{meta['wall_distance']:.3f}",
+            "wall slack": f"{meta['wall_slack']:.2f} solvent diameters",
+            "wall k/eV A^-2": f"{meta['wall_k']:.3f}",
+        }))
+    else:
+        parts.append("Packing: none -- n = 0 is the solute reference; "
+                     "packmol and the wall are not used.")
 
-    parts.append(kv_block("Sampling Hamiltonian", {
+    sampling_hamiltonian = {
         "calculator": meta["calculator"],
         # None is a real value here -- gas-phase sampling -- not a missing one.
         "continuum": _solvation_str(meta["solvation"]),
-        "wall": "SolventShellWall on solvent atoms only",
-    }))
+    }
+    if n_solvent:
+        sampling_hamiltonian["wall"] = "SolventShellWall on solvent atoms only"
+    parts.append(kv_block("Sampling Hamiltonian", sampling_hamiltonian))
 
     parts.append(kv_block("Pre-MD relaxation (clash relief, fmax 0.5)", {
         "converged": "yes" if meta["relax_converged"] else "no",
@@ -764,11 +832,11 @@ class RunLogger:
         self._fh.write(text + "\n")
         self._fh.flush()
 
-    def header(self, meta, extra=None):
+    def header(self, meta):
         self._target_K = meta["temperature_K"]
         if not self._live:
             self._write(f"[regenerated from JSON on {timestamp()}]\n")
-        self._write(format_run_header(meta, extra))
+        self._write(format_run_header(meta))
 
     def md_row(self, record):
         """Log one trajectory dump. Takes the same dict `energies.json` gets."""
@@ -1812,9 +1880,12 @@ def format_report(params, summaries, ladder_n=LADDER_N):
 
     # `all_n_min_kcal` is the docking chain's full internal walk, which
     # `_increments` reads and nobody needs to see spelt out in a params block.
+    inert = inert_params(params)
     shown = {k: ("-" if v is None else v) for k, v in params.items()
-             if k != "all_n_min_kcal"}
-    parts.append(kv_block("Parameters", shown))
+             if k != "all_n_min_kcal" and k not in inert}
+    param_block = kv_block("Parameters", shown)
+    footnote = format_inert_footnote(inert)
+    parts.append(param_block + ("\n\n" + footnote if footnote else ""))
 
     pooled = pool_by_n(summaries, ladder_n)
 

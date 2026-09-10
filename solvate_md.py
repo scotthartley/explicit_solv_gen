@@ -621,13 +621,12 @@ def run_one_job(condition, seed, out_dir):
         "shell_padding": packing.padding,
         "wall_distance": packing.wall_distance,
         "wall_k": condition.wall_k,
+        "shell_fill": condition.shell_fill,
+        "wall_slack": condition.wall_slack,
         "relax_converged": relax_converged,
         "relax_final_fmax": relax_fmax,
     }
-    # shell_fill and wall_slack shape the packing but are not in metadata.json,
-    # so hand them to the header separately rather than widening that file.
-    logger.header(metadata, extra={"shell_fill": condition.shell_fill,
-                                   "wall_slack": condition.wall_slack})
+    logger.header(metadata)
 
     # Draw velocities reproducibly, then remove the net translation and
     # rotation the draw introduces. Langevin's fixcm handles the translation

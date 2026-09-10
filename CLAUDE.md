@@ -173,7 +173,22 @@ rendering a per-parent table that silently omits the `window` / `cut` / `rank`
 / `offset` columns and with them the warning that says how deep the `n_refine`
 cap cut. Re-run the docking -- there is no rescore path for a docked run. The
 same applies to a `sweep.json` params block without `monolayer_capacity`: it
-raises rather than rendering a report that silently omits the `cover` column.)
+raises rather than rendering a report that silently omits the `cover` column.
+And a `metadata.json` without `shell_fill` / `wall_slack` (0.16.0): `run.log`'s
+header reads both as mandatory subscripts for an n >= 1 run, so an older
+`metadata.json` raises rather than regenerating a header two rows short of the
+live one. n = 0 is unaffected -- that header never reads either field, since
+packmol and the wall are not used there.)
+
+**A rendered params block is not the same thing as a raised or omitted
+field.** Since 0.16.0, `report.inert_params` crops rows from a *displayed*
+Parameters block -- e.g. `n_placements` under `place_mode = "grid"`, or
+`max_frames` for any docking run -- when another recorded value already says
+the row did nothing, and appends a one-line footnote naming what it dropped
+and why. This is render-time only: `sweep.json` / `dock.json` keep the
+complete `asdict` regardless, so nothing above is affected by it and two
+runs' JSON stay diffable key-for-key even when their printed reports differ
+in which rows they show.
 
 **0.15.0's basin ladder is the exception to that list, deliberately.** The
 `sites` / `gap/kT` columns and the whole Basin spectrum section are derived
