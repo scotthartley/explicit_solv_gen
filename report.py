@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -1374,6 +1374,13 @@ def format_basin_spectrum(pooled):
     Both generators get it -- a docked chain's basins are the same object a
     sweep's are, and the spectrum says the same thing about either.
 
+    The footer says what rung 0 is, because it reads as information and is
+    not: it is the minimum every other rung is measured from, so it is 0.0 by
+    construction. A *later* 0.0 is the one that carries something -- a
+    distinct basin degenerate with the minimum to finer than the printed
+    resolution, which at n past saturation is the flat floor this section
+    exists to show. The two were read as the same thing once.
+
     Its own section rather than more columns because the per-n table is
     already nine columns wide; a ladder long enough to be useful cannot fit
     beside them. What each n's cliff *means* lives in README's "Reading
@@ -1391,13 +1398,18 @@ def format_basin_spectrum(pooled):
         f"that n's own\n  minimum -- the first {LADDER_N} of them, and `pool` "
         "above says how many there are\n  in total (--ladder changes how many "
         "rungs print and nothing else; sites and\n  gap/kT are read off the "
-        "whole spectrum). Rungs past "
-        f"{LADDER_CLAMP_KT:.0f} kT print as >10:\n  a basin that far up is "
-        "thermally irrelevant and only its position still\n  matters. A cliff "
-        "of a few kT after the first few rungs means those basins are\n  a "
-        "defined interaction and the rest of the pool is not; no cliff means "
-        "the\n  choice among near-degenerate shells is arbitrary. See README: "
-        "Reading\n  report.txt.")
+        "whole spectrum). The first rung is that minimum\n  itself, so it is "
+        "always 0.0 and says nothing; a later 0.0 is a *different*\n  basin, "
+        "nearer than the 0.05 kT this rounding resolves -- distinct in "
+        "contact\n  geometry rather than in energy, since two candidates "
+        "share a basin only by\n  matching within both tolerances "
+        f"({DEDUPE_TOL_EV * 1e3:.0f} meV and {GEOM_TOL_A:.2f} A). Rungs "
+        f"past {LADDER_CLAMP_KT:.0f} kT print\n  as >10: a basin that far up "
+        "is thermally irrelevant and only its position\n  still matters. A "
+        "cliff of a few kT after the first few rungs means those\n  basins "
+        "are a defined interaction and the rest of the pool is not; no cliff"
+        "\n  means the choice among near-degenerate shells is arbitrary. See "
+        "README:\n  Reading report.txt.")
     return "\n".join(lines)
 
 

@@ -175,6 +175,20 @@ candidates -- gives `sites` 1 at n = 1 (gap 4.4) and 1 at n = 2 (gap 2.7), and
 no cliff at n = 3. Two searches that share no geometry agree on where the
 specificity stops.
 
+**What the first rung is, said in the report.** A ladder reading
+`0.0 0.0 0.1 ...` was misread on first contact by someone who had not written
+it, in both available directions: the leading `0.0` looks like a measured
+result rather than the zero the row is defined against, and a repeated `0.0`
+looks like the minimum listed twice rather than a second basin. Neither
+reading is recoverable from the numbers alone, so `format_basin_spectrum`'s
+footer now states both -- rung 0 *is* that n's minimum, and a later `0.0` is a
+distinct basin closer than the 0.05 kT one printed decimal resolves. The
+second point is the load-bearing one: 0.05 kT is ~1.3 meV against
+`DEDUPE_TOL_EV`'s 5 meV window, so two basins that print alike cannot have
+been separated by energy at all -- they are distinct because
+`contact_descriptor` says so, which is exactly the flat floor the section
+exists to show and the reason the count is not a count of species.
+
 **Why not simply the gap to the second basin.** For a solute with several
 inequivalent sites of similar affinity, two distinguishable binding sites give
 two near-degenerate basins, so the naive gap is ~0 and reports "bulk-like" for

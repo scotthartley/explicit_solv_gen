@@ -111,6 +111,17 @@ over the same four rows run −6.67, −6.36, −5.36, −5.11, a smooth decay w
 feature at `n = 2 → 3` at all. The MD sweep, a different generator drawing
 independently, reads the same: a cliff at `n = 1` and `n = 2`, none at `n = 3`.
 
+**What a rung is.** Every rung is one distinct basin, and the leading `0.0` is
+that `n`'s own minimum — the structure in `best_n<N>.xyz`, the zero the rest of
+the row is measured from, carrying no information itself. A *repeated* `0.0`,
+as at `n = 3` and `n = 4` above, is therefore a **different** basin lying
+nearer the minimum than the 0.05 kT the printed decimal resolves, not the
+minimum listed twice: it is distinct in contact geometry rather than in
+energy, since two candidates are merged into one basin only by agreeing within
+*both* tolerances, 5 meV **and** 0.15 Å (caveat 2 under
+[Basin occupancy](#basin-occupancy)). A row of repeated zeros is the flat floor
+this section exists to show.
+
 **How to read it.** A cliff of a few kT after the first few rungs means those
 basins are a defined interaction and the rest of the pool is not: the geometry
 matters, and it is worth exporting for DFT. No cliff means the choice among
@@ -357,7 +368,10 @@ frame-weighted pair instead.
 **Basin spectrum** is the ladder those two columns are read off: every
 distinct minimum at that `n`, lowest first, in kT above that `n`'s own minimum,
 up to `--ladder` rungs (default 16; `pool` says how many there are in total).
-Rungs past 9.9 kT print as `9.9+` — a basin that far up is thermally
+The first rung is that minimum itself and is always `0.0`; a later `0.0` is a
+distinct basin degenerate with it to finer than the printed decimal, not the
+minimum repeated — see [What a rung is](#basin-spectrum) above.
+Rungs past 10 kT print as `>10` — a basin that far up is thermally
 irrelevant and only its position in the ladder still matters. `--ladder` is
 display only: it changes how many rungs print and nothing else, it is not a
 `Condition` / `Scoring` / `Docking` field, and it deliberately does not reach
