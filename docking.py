@@ -10,8 +10,9 @@ cannot invent one.
 
 This module finds basins by constructing instead: place a solvent molecule at
 a position and orientation around the (already relaxed) parent cluster --
-drawn at random, or, at `place_mode="grid"`, scanned systematically over the
-parent's solvent-accessible surface -- and optimise. BFGS only descends, so it cannot climb out of the well
+scanned systematically over the parent's solvent-accessible surface by
+default (`place_mode="grid"`), or, at `place_mode="random"`, drawn at random
+-- and optimise. BFGS only descends, so it cannot climb out of the well
 it lands in -- which is exactly why it works where a *seeded* MD run would
 not: `run_one_job` discards 5 ps of equilibration before recording the first
 frame, so a seeded arrangement would already be gone by the time anything was
@@ -35,9 +36,9 @@ minimum stay comparable.
 Run one from the command line:
 
     python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
-      --solvent chcl3 --n 1 2 3 --out pyrazine_dock/ --placements 64
+      --solvent chcl3 --n 1 2 3 --out pyrazine_grid/
     python docking.py examples/pyrazine.xyz examples/chloroform.xyz \
-      --solvent chcl3 --n 1 2 3 --out pyrazine_grid/ --place-mode grid
+      --solvent chcl3 --n 1 2 3 --out pyrazine_dock/ --place-mode random
 
 `dock_at_n` fans placements out through `solvate_md.pool_map`, which uses
 spawn, so a script calling `run_docking` itself MUST guard the call:
@@ -108,22 +109,25 @@ class Docking:
     that makes trying dozens of them affordable.
     """
 
-    # Random placements per parent per n. 1 - 0.93^K gives 90% confidence of
-    # hitting a basin found in 7% of random poses (the measured both-N rate
-    # on pyrazine/chloroform) at K = 32 and 99% at K = 64.
+    # Random placements per parent per n, read only under `place_mode =
+    # "random"`. 1 - 0.93^K gives 90% confidence of hitting a basin found in
+    # 7% of random poses (the measured both-N rate on pyrazine/chloroform) at
+    # K = 32 and 99% at K = 64.
     n_placements: int = 64
-    # How the poses are generated. "random" is the historical behaviour and
-    # still the default: `n_placements` independent draws per parent, sized
-    # by the `1 - 0.93^K` argument above. "grid" enumerates instead --
+    # How the poses are generated. "grid" is the default since 0.17.0:
     # positions from the parent's solvent-accessible surface, crossed with
     # `n_orientations` quasi-uniform rotations -- which buys coverage rather
     # than confidence: nothing in a random run's output distinguishes "this
     # basin does not exist" from "we did not draw it", and a missing basin is
-    # the one thing downstream DFT cannot repair. `n_placements` is ignored
-    # in grid mode; a rendered report omits it there rather than asserting a
-    # setting that did nothing (`report.inert_params`), though `dock.json`'s
-    # own `asdict` still carries it, live or not.
-    place_mode: str = "random"
+    # the one thing downstream DFT cannot repair. DESIGN.md's "Systematic
+    # placement" measured grid lower at every n and 3x more likely to hit the
+    # both-nitrogens basin, at ~11x the wall-clock of `"random"` -- still
+    # reachable at `--place-mode random` for a cheap first look or a rerun of
+    # an older sweep's conditions. `n_placements` is ignored in grid mode; a
+    # rendered report omits it there rather than asserting a setting that did
+    # nothing (`report.inert_params`), though `dock.json`'s own `asdict`
+    # still carries it, live or not.
+    place_mode: str = "grid"
     # Grid mode only. Surface points are voxel-downsampled to roughly this
     # separation, so each position stands for ~`grid_spacing_A**2` of
     # surface; 2.0 A puts ~220 positions on the outermost shell of pyrazine.
@@ -188,9 +192,10 @@ class Docking:
     # plainly unbound -- which is the whole of its job.
     refine_window_kcal: float = 3.0
     # The cap, raised from 10 with the window above, and only a cost guard:
-    # the window is what selects. **This moves the random path too**, which
-    # is worth stating because it is the default mode and because the
-    # opposite is easy to assume: 64 random placements do not collapse into
+    # the window is what selects. **This moves the random path too**, worth
+    # stating (random was the default when this was measured, and stays
+    # reachable at `--place-mode random`) because the opposite is easy to
+    # assume: 64 random placements do not collapse into
     # a handful of basins but into 40-63 distinct ones per parent (measured,
     # acetone and chloroform, n = 1 to 3), so the old flat top-10 was
     # refining about a fifth of them there as well. The cap does not bind in

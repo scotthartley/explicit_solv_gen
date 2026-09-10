@@ -1169,11 +1169,30 @@ n = 2 (the grid's n = 1 pool is a single basin, so there is only one parent to
 carry), and -18.4039 against -18.3497 at n = 3, for 320 s against 144 s. It
 buys 0.054 kcal/mol, so `n_parents` stays at 3.
 
-**Both defaults deliberately unchanged.** `place_mode` stays `"random"` and
-`n_parents` stays 3; grid mode is reachable at `--place-mode grid`. The
-numbers above are one system, and moving a default wants more than that.
-`n_placements` is ignored in grid mode, so the params block's `place_mode` is
-what says which number was live.
+**`n_parents` stays unchanged at 3** -- it buys 0.054 kcal/mol under a
+systematic scan for 320 s against 144 s, the same margin it bought under
+random placement.
+
+**`place_mode` default flipped to `"grid"` at 0.17.0, without a new
+measurement.** The numbers above were already the measurement: grid is lower
+at every n on the one system tested, reaches the both-nitrogens basin from
+three times as many refined placements, and costs ~11x the wall-clock --
+still under three minutes at one parent. What changed is not the evidence but
+the judgment call sitting on top of it: a missing basin is the failure mode
+this whole module exists to avoid, and 11x on a search that already runs in
+seconds to minutes is cheap insurance against it, cheaper than it looked
+before `n_refine`'s window-based cap (0.13.0, default 400) closed grid mode's
+own weak point -- a fixed top-k losing the winning basin to a screened
+ranking that does not predict it. That fix was already the live default
+before this one, so grid mode no longer trades a narrower pool for its lower
+minimum. Random placement stays reachable at `--place-mode random`, for a
+cheap first look or to reproduce an older sweep's exact conditions -- older
+`dock.json` params blocks recorded `place_mode` explicitly, so nothing
+becomes ambiguous retroactively. "Moving a default wants more than one
+system's numbers" was the standing bar and is not overridden here; this is a
+recorded exception, made on request, and a second solvent's numbers before
+trusting `grid_probe_fracs` (above) still applies with the same force now
+that grid is the default most runs will actually take.
 
 ### The screen-to-refine handoff: a window, not a rank
 
