@@ -84,6 +84,64 @@ still in `sweep.json`, are convergence indicators for the *search* rather
 than the *sampling*: they say how many kinds of basin were found, not how
 much of the trajectory sat in one, which `pool` already reports.
 
+### Basin spectrum
+
+The section above says the increment cannot switch off when the specific sites
+fill. That leaves the question the whole exercise is for — *which* solvent
+molecules make a defined interaction, and which are merely present — with no
+column that answers it. `E_int(min)` and `dE_int` cannot, for the reason just
+given; `pool` cannot either, and misleads in the opposite direction, since a
+big number reads as a rich landscape when it may be a flat floor finely
+subdivided.
+
+The spectrum of distinct minima answers it directly. Sort each `n`'s pooled
+basins by energy, express them in kT above that `n`'s own minimum, and look for
+a gap. Measured on pyrazine + chloroform, where the answer is known — two
+nitrogens, one C–H···N contact each:
+
+```
+  n = 1  0.0 4.4 4.4 4.6 4.7 4.7 4.8              one basin, then a 4.4 kT cliff
+  n = 2  0.0 2.6 2.6 2.7 2.7 2.9 2.9 ...          one basin, then a 2.6 kT cliff
+  n = 3  0.0 0.0 0.1 0.2 0.2 0.2 0.2 0.3 ...      no cliff anywhere
+  n = 4  0.0 0.0 0.0 0.1 0.1 0.2 0.2 0.2 ...      no cliff anywhere
+```
+
+The transition sits exactly where the nitrogens saturate — and the increments
+over the same four rows run −6.67, −6.36, −5.36, −5.11, a smooth decay with no
+feature at `n = 2 → 3` at all. The MD sweep, a different generator drawing
+independently, reads the same: a cliff at `n = 1` and `n = 2`, none at `n = 3`.
+
+**How to read it.** A cliff of a few kT after the first few rungs means those
+basins are a defined interaction and the rest of the pool is not: the geometry
+matters, and it is worth exporting for DFT. No cliff means the choice among
+near-degenerate shells is arbitrary — only the *count* of molecules matters at
+that `n`, not which arrangement the search happened to pick, and a "best"
+geometry there is one draw from a crowd. The report prints the numbers and
+stops; it draws no conclusion of its own, and neither `sites` nor `gap/kT` is a
+verdict.
+
+**Bound is not the same as specific.** Pyrazine + acetone binds — −3.5
+kcal/mol for one molecule in ALPB(acetone), in the table below — and has **no
+cliff at any `n`**: 34 distinct basins inside 0.7 kT at `n = 1`, and only 2 of
+48 refinements reaching the reported minimum, against 37 of 43 for chloroform.
+Chloroform donates a C–H to the nitrogen lone pair; acetone is an acceptor
+like the nitrogen itself, so it binds without a directional anchor to pick out
+one geometry. Reading a flat ladder as "the solvent barely binds" is the
+mistake to avoid — the energy column already says how much it binds, and this
+one says whether any particular arrangement is the answer.
+
+Two guards keep the gap honest, both in `report.basin_ladder`. It is the
+*largest* gap in the spectrum rather than the gap to the second basin, because
+a solute with several inequivalent sites of similar affinity puts two
+near-degenerate basins at the bottom and a naive gap would call the most
+specific case bulk-like. And a gap counts only if it is wider than the spread
+of everything below it, because an MD pool reaches ~11 kT (it quenches
+half-dissolved frames) and its largest raw gap can sit a hundred basins up.
+`sites` is blank when the gap is under 1 kT: a manifold size is meaningless
+without a gap to bound it. See DESIGN.md's "Binding-site specificity" for the
+measurements, including that the ladder is unmoved when a tighter relaxation
+halves `pool`.
+
 ### Basin occupancy
 
 `n_sweep.py`'s candidates are quenched local minima, not a thermal ensemble —
@@ -200,7 +258,9 @@ Per run directory (`<label>_<solvent>_n<N>_seed<S>/`):
 | `best.xyz` | the lowest candidate |
 
 Per sweep: `sweep.json` and `report.txt` — the params block, the `E_int(n)`
-table, a Best geometry at each n section naming the file behind each row, a
+table, a Basin spectrum section (the basin ladder its `sites` / `gap/kT`
+columns are read off — see [Basin spectrum](#basin-spectrum) above), a Best
+geometry at each n section naming the file behind each row, a
 Modal geometry at each n section naming the file behind the basin the shell
 actually spent the most time in, a Basin occupancy section (how many scored
 frames quenched into each basin, frame-weighted and pooled across packings —
@@ -232,18 +292,30 @@ E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)
 leg: pyrazine/chcl3
 full first shell: ~13 solvent molecules
 
-  n  cover   E_int(min)     dE_int  found by   pool  contacts  dissolved   wall
--------------------------------------------------------------------------------
-  0     0%        -0.03          -       1/1      2      0.00       100%     0%
-  1     8%        -6.65      -6.63       3/3      5      0.90        10%     0%
-  2    15%       -13.01      -6.36       1/2     14      0.90        35%    25%
+  n  cover   E_int(min)     dE_int  found by   pool  contacts  dissolved   wall sites gap/kT
+--------------------------------------------------------------------------------------------
+  0     0%        -0.03          -       1/1      1      0.00       100%     0%     -      -
+  1     8%        -6.65      -6.63       5/5     41      0.65        35%    12%     1    4.4
+  2    15%       -13.03      -6.38       2/5    114      1.38        17%     8%     1    2.7
+  3    23%       -18.38      -5.35       1/5    137      2.19         6%    16%     -    0.3
+
+Basin spectrum (kT above each n's own minimum)
+----------------------------------------------
+  n = 0  0.0
+  n = 1  0.0 4.4 4.4 4.4 4.4 4.4 4.4 4.6 4.6 4.6 4.6 4.6 4.6 4.6 4.7 4.7
+  n = 2  0.0 2.7 2.7 2.7 2.7 2.7 2.8 2.8 2.9 2.9 3.0 3.0 3.0 3.0 3.0 3.0
+  n = 3  0.0 0.1 0.1 0.1 0.4 0.5 0.5 0.5 0.5 0.6 0.6 0.6 0.6 0.7 0.8 0.9
 ```
 
-(This particular sweep is a fast smoke test — 1 ps, 10 frames, two packings
-per `n` on average, all well under the current defaults — so its increments
-are dominated by sampling noise: they do not settle because the sampling
-never did. The 25% wall row is exactly the contamination the wall diagnostic
-exists to catch.)
+Three things to read off that. The increment has not settled by `n = 3`, and
+[it will not](#e_intn-does-not-plateau--read-the-increment) — read it against
+the leg you are comparing to, not against zero. The `1/5` at `n = 3` says the
+pooled minimum was reached by exactly one packing, so that row rests on a
+single draw of the arrangement lottery and the report warns about it. And the
+`sites` / `gap/kT` pair says the chemistry: one basin under a cliff at `n = 1`
+and `n = 2` — pyrazine's two nitrogens taking one C–H···N contact each — and
+no cliff at `n = 3`, where the third chloroform is bulk-like. Nothing in the
+energy columns shows that transition.
 
 ## Reading `report.txt`
 
@@ -264,6 +336,7 @@ same sections, minus the ones a constructed chain has no analogue of.
 | `pool` | distinct minima the pooled search turned up — the *search effort* behind the running minimum above it |
 | `contacts`, `dissolved` | solvent molecules in contact with the solute, and the fraction of frames with none, **frame-weighted** over the scored frames — see [Basin occupancy](#basin-occupancy) |
 | `wall` | the worst packing's fraction of sampling frames with a nonzero wall energy |
+| `sites`, `gap/kT` | the largest gap in the low-energy basin spectrum, and how many basins sit below it — see [Basin spectrum](#basin-spectrum) |
 
 `E_int` is in kcal/mol and absolute energies in eV (ASE's native unit); the
 mix is deliberate. A `1/2` in `found by` says the number rests on a single
@@ -280,6 +353,17 @@ solvent molecule — which is precisely what `E_int` exists to fix. The
 distinct-minima `mean_contacts` / `dissolved_fraction` are there too; they
 describe the search, which `pool` already reports, and the table shows the
 frame-weighted pair instead.
+
+**Basin spectrum** is the ladder those two columns are read off: every
+distinct minimum at that `n`, lowest first, in kT above that `n`'s own minimum,
+up to `--ladder` rungs (default 16; `pool` says how many there are in total).
+Rungs past 9.9 kT print as `9.9+` — a basin that far up is thermally
+irrelevant and only its position in the ladder still matters. `--ladder` is
+display only: it changes how many rungs print and nothing else, it is not a
+`Condition` / `Scoring` / `Docking` field, and it deliberately does not reach
+the params block, so two runs rendered at different `--ladder` remain
+comparable. What a cliff means is under [Basin spectrum](#basin-spectrum)
+above.
 
 **Best geometry at each n** names the file behind each row: `<run>/best.xyz`,
 which is also frame 0 of that run's `scored_candidates.xyz`, since the pooled
@@ -359,7 +443,12 @@ and none is decorative:
    structures a geometric criterion calls different. See DESIGN.md's
    "Geometric basin dedupe" for the measurements, and note that changing
    either tolerance moves every count in this section, and none of the
-   `E_int` values.
+   `E_int` values. The 0.15 Å is also **finer than the pipeline reproduces**:
+   at `Scoring.fmax = 0.002` a candidate re-relaxed to 2e-4 moves by a median
+   0.11–0.13 Å, and `pool` falls 20–45%, while `E_int(min)` moves by at most
+   0.014 kcal/mol. Read a basin count as a diversity measure at a stated
+   resolution, never a count of species — and compare counts only between
+   runs that share both tolerances *and* an `fmax`.
 3. **Frames are correlated.** Compare the reported scored-frame spacing
    against a decorrelation time measured on *your* system — 0.55 ps for
    pyrazine + 3 CHCl₃, which is a property of the system rather than of the
@@ -571,6 +660,14 @@ explicit molecule sits at the continuum boundary, and where the sweep above is
 the only honest way to pick `n`. Comparing two conformers, note that a compact
 and an extended geometry have different surface areas, so the same `n` is a
 different fraction of a monolayer for each.
+
+The report's [`sites` / `gap/kT` pair](#basin-spectrum) is the other half of
+that choice, and the half the energy curve cannot supply: the `n` at which the
+cliff disappears is the `n` at which the solvent stops making a defined
+interaction. On pyrazine + chloroform that is `n = 3`, and it is invisible in
+`dE_int`. Sweep past it to see where it goes — but expect the answer to be a
+property of the solute–solvent *pair*, not of either alone: acetone on the
+same solute has no cliff at any `n`.
 
 ## Performance
 

@@ -135,6 +135,144 @@ sat in a contact state. They are in the JSON and no longer in any table, since
 `pool` already reports the search; what the `contacts` / `dissolved` columns
 show is the frame-weighted `occupancy_*` pair below.
 
+### Binding-site specificity: the basin ladder answers what the increment cannot
+
+The section above proves the increment cannot switch off when the specific
+sites fill -- two roughly linear terms survive the cancellation -- and that is
+a problem, because "which solvent molecules make a defined interaction, and
+which are merely present" is the question `docking.py` exists for. Nothing in
+the output answered it: `E_int(min)`, `dE_int` and `pool` are what get
+reported, and none of the three can tell a defined contact from a bulk-like
+one.
+
+The **spectrum of distinct minima** can. Sort each n's pooled basins by
+energy and express them in kT above that n's own minimum. Measured on the
+0.14.0 grid run (pyrazine + chloroform, n = 1-4, `--dump-screen` harness of the
+sections below, `report.VERSION` 0.14.0 numbers reproduced exactly):
+
+| n | ladder (kT above that n's minimum) | `sites` | `gap/kT` | `dE_int` |
+| --- | --- | --- | --- | --- |
+| 1 | 0.0 **4.4** 4.4 4.6 4.7 4.7 4.8 | 1 | 4.4 | -6.67 |
+| 2 | 0.0 **2.6** 2.6 2.7 2.7 2.9 2.9 ... | 1 | 2.6 | -6.36 |
+| 3 | 0.0 0.0 0.1 0.2 0.2 0.2 0.2 0.3 ... | -- | 0.0 | -5.36 |
+| 4 | 0.0 0.0 0.0 0.1 0.1 0.2 0.2 0.2 ... | -- | 0.0 | -5.11 |
+
+Pyrazine has two nitrogens, each taking one C-H...N contact, and the
+transition sits exactly where they saturate: one basin and then a 4.4 kT cliff
+at n = 1, one basin and a 2.6 kT cliff at n = 2, and from n = 3 a flat floor
+with no cliff anywhere. The increment column beside it is a smooth decay with
+no feature at n = 2 -> 3 at all. **The energy curve structurally cannot see
+this transition and the spectrum reads it off directly.**
+
+`pool` cannot see it either, and misleads in the opposite direction: 233
+basins at n = 3 reads as a rich landscape demanding search, when it is a flat
+floor finely subdivided -- the whole n = 3 pool spans 3.2 kT, which is the
+point "'Distinct minima' is a resolution, not a count" makes at length.
+
+**The MD sweep agrees, independently.** Re-reporting the shipped 5-packing
+pyrazine/chloroform sweep -- a different generator, independent draws, its own
+candidates -- gives `sites` 1 at n = 1 (gap 4.4) and 1 at n = 2 (gap 2.7), and
+no cliff at n = 3. Two searches that share no geometry agree on where the
+specificity stops.
+
+**Why not simply the gap to the second basin.** For a solute with several
+inequivalent sites of similar affinity, two distinguishable binding sites give
+two near-degenerate basins, so the naive gap is ~0 and reports "bulk-like" for
+the case that is most specific of all. So `basin_ladder` looks for the
+**largest** gap in the low-energy spectrum and reports how many basins sit
+below it. Chemically *equivalent* sites need no handling: `contact_descriptor`
+folds same-element automorphisms, so pyrazine's two nitrogens are one basin by
+construction (see "Geometric basin dedupe").
+
+That was stated as a falsifiable prediction before it was run, and tested on
+**2-methylpyrazine + chloroform** (`examples/2-methylpyrazine.xyz`, added for
+it): one methyl makes the two nitrogens inequivalent but similar, which is
+precisely where the naive gap fails. Predicted: two low rungs 0.2-0.8 kT apart,
+then a cliff of several kT, giving `sites = 2`. Measured, n = 1-3, default
+random placement:
+
+| n | ladder | `sites` | `gap/kT` |
+| --- | --- | --- | --- |
+| 1 | 0.0 **0.5** 5.4 | **2** | 4.9 |
+| 2 | 0.0 0.1 0.1 0.2 **2.8** 2.8 2.9 3.1 ... | 4 | 2.6 |
+| 3 | 0.0 0.1 0.2 0.2 0.2 0.2 0.2 0.2 ... | -- | 0.1 |
+
+The two rungs under the cliff really are the two nitrogens, checked on the
+geometries rather than assumed: in `scored_candidates.xyz` the lowest basin
+puts the chloroform H 1.89 A from the nitrogen beside the methyl-bearing
+carbon, the second puts it 1.90 A from the far nitrogen, and the third -- the
+one above the 4.9 kT cliff -- has no nitrogen contact at all (nearest solute
+atom 5.27 A, a ring H). So the two inequivalent sites come out 0.5 kT apart
+under a 4.9 kT cliff, and a gap-to-the-second-basin metric would have read
+0.5 kT and called the most specific case in this file bulk-like. n = 2 finds
+four near-degenerate two-molecule arrangements under a 2.6 kT cliff, which is
+what one molecule per nitrogen plus a residual splitting looks like, and n = 3
+saturates exactly where pyrazine's does.
+
+**The cliff is a property of the solvent, not an artifact of chloroform --
+and "strongly bound" is not "specific".** Run in a second continuum,
+pyrazine + acetone at n = 1-3 has **no cliff at any n**: `sites` blank
+throughout, gaps 0.2 / 0.1 / 0.7 kT, with 34 distinct basins inside 0.7 kT at
+n = 1 alone. A cliff was expected there on the grounds that CLAUDE.md's
+binding table has pyrazine...acetone at -3.5 kcal/mol in ALPB(acetone), which
+is real binding. It is real binding without a defined site, and that is
+chemically the right answer rather than a miss: chloroform donates a C-H to
+pyrazine's nitrogen lone pair, while acetone is an acceptor like the nitrogen
+itself, so its interaction is dispersion-and-dipole and has no directional
+anchor to single out one geometry. `found by` says the same thing from the
+other side -- 37 of 43 refinements reach chloroform's n = 1 minimum, against 2
+of 48 for acetone. **The diagnostic separates binding strength from binding
+specificity, which is the distinction it exists to draw**, and the earlier
+finding that acetone's eventual n = 1 winner sat 247th by screened energy
+("The screen-to-refine handoff") is the same flatness seen through a different
+instrument. What is *not* established is that acetone has no specific site at
+all -- only that this search, which does find its reported minimum, finds no
+gap above it.
+
+**Why a gap has to be wider than the manifold below it.** The first version of
+this searched the largest gap among basins within `LADDER_WINDOW_KT = 10.0` of
+the minimum, and that is wrong on an MD pool. Docked pools span 1.9-2.8 kT
+entire, but the sweep quenches half-dissolved frames too and its n = 3 pool
+spans 11.5 kT -- so the largest in-window gap was 2.0 kT sitting at the *118th*
+basin, and the column read `sites = 118` for exactly the bulk-like case this
+diagnostic exists to call bulk-like. A gap therefore qualifies only if it
+exceeds the spread of everything beneath it, which is the content of "these k
+basins are one family and everything else is far away". The condition is
+trivially true at the first gap, so there is always an answer. The window
+survives as the outer of the two guards.
+
+**The knobs, and what each does.** `LADDER_MIN_GAP_KT = 1.0` gates only
+whether `sites` is *printed* -- never a verdict, and every cliff measured here
+is 2.6-4.9 kT against 0.0-0.7 kT where there is none, an order of magnitude
+either side of it, so its exact value is not load-bearing.
+`LADDER_WINDOW_KT` is an energy and not a rank: the first draft
+capped the search at the first 25 basins, which re-couples the diagnostic to a
+rank and breaks on a many-site solute. `LADDER_CLAMP_KT` equals the window on
+purpose: a rung printed as `>10` is one no gap could have been measured from.
+`LADDER_N = 16` is display only, and
+`sites` / `gap/kT` are read off the whole spectrum, so `--ladder` cannot move
+them. 16 rather than 6 because the default has to survive a many-site solute:
+six pyrazines is twelve nitrogens, so n = 1 shows twelve near-degenerate rungs
+before the cliff and a shorter ladder would show only the flat part -- the
+"bulk-like" misreading this exists to prevent.
+
+**It is robust to the dedupe's known over-splitting.** `Scoring.fmax = 0.002`
+inflates `pool` by 20-45% (see "'Distinct minima' is a resolution"), and the
+ladder does not care: recomputing it on the same structures relaxed to
+`fmax = 2e-4`, where the pools fall 7 / 151 / 231 / 320 -> 6 / 98 / 128 / 239,
+`sites` is identical at every n and `gap/kT` moves by at most 0.16 kT
+(4.43 -> 4.38, 2.55 -> 2.54, 0.05 -> 0.21, 0.04 -> 0.18). A count that halves
+while the conclusion does not move is the argument for reporting the spectrum
+rather than the count.
+
+**No numeric default moved for any of this, and nothing new is persisted.**
+Everything is derived from the `e_int_kcal` values every `scored.json` already
+carries, so `python -m report <dir>` regenerates the columns and the section
+for runs scored by any earlier version, with no rescoring -- unlike
+`descriptor` (0.11.0), `n_in_window` (0.13.0) or `screen_cut_kcal` (0.14.0).
+The report states the measurement and refuses to grade it: there is no verdict
+line and no "saturates at n = 2" claim anywhere in the output.
+
 ### Basin occupancy: what quenching throws away
 
 Reading `n_sweep.py`'s code settles a question its docs used to leave open:
@@ -343,15 +481,22 @@ regardless: the greedy dedupe compares each candidate against group
 2850 pairs of that n = 2 pool the descriptor distances run 0.01-0.12 A for
 sixteen pairs, then stop dead until 0.16 A, with the bulk of the
 distribution only starting at 0.19 -- a within-basin cluster, an empty band,
-and then everything else. `GEOM_TOL_A = 0.15` sits in the empty band. That
-the within-basin cluster is that tight is also the evidence that
-`Scoring.fmax = 0.002` is converged enough for the criterion to be stable; at
-the 0.05 `Scoring.fmax` used to be, it would not be. And pairs the
+and then everything else. `GEOM_TOL_A = 0.15` sits in the empty band. And pairs
+the
 descriptor calls identical differ in energy by up to **2.07 meV** -- above
 the old 1 meV window, which was therefore splitting them -- so
 `DEDUPE_TOL_EV` went 1 meV -> 5 meV, covering that with margin while staying
 an order of magnitude under the ~29 meV separating the nearest pairs the
 descriptor cannot resolve but energy can.
+
+**That the within-basin cluster is tight was also read here as evidence that
+`Scoring.fmax = 0.002` is converged enough for the criterion to be stable.
+That claim is withdrawn** -- it generalised one n = 2 sweep pool, and
+"'Distinct minima' is a resolution, not a count" below now refutes it on
+docked pools at n = 1-4: the median residual displacement on re-relaxing to
+2e-4 is 0.11-0.13 A, 73-89% of this tolerance. The band above is still where
+0.15 comes from and is still the best available anchor; what it does not
+license is the further claim about convergence.
 
 So the criterion is `|dE| <= DEDUPE_TOL_EV` **and** `descriptor distance <=
 GEOM_TOL_A`. Geometry is the real test; energy stays as a cheap guard against
@@ -1291,10 +1436,49 @@ largest deviation 0.22-0.24 A, median second largest 0.015-0.030 A). Only at
 n = 4 does jitter appear at all, and it is still a minority (82% one molecule,
 18% two or more, median second largest 0.076 A).
 
+**And the stated resolution is finer than the pipeline can deliver.** The
+per-molecule decomposition above cannot see this, because "one molecule
+differs by 0.22 A" is exactly what residual optimiser displacement on a soft
+mode looks like. Measured by re-relaxing all 711 of these candidates down a
+cumulative ladder of `fmax` rungs in their own scoring environment (the 2e-3
+control takes zero steps and is the identity map, so there is no harness noise
+floor to subtract):
+
+| n | median displacement at 5e-4 | p90 | >= 0.15 A | `pool` at 2e-4 |
+| --- | --- | --- | --- | --- |
+| 1 | 0.047 A | 0.377 | 29% | 7 -> 6 (-14%) |
+| 2 | 0.109 | 0.430 | 41% | 151 -> 98 (-35%) |
+| 3 | 0.133 | 0.597 | 56% | 233 -> 128 (-45%) |
+| 4 | 0.126 | 0.558 | 48% | 320 -> 239 (-25%) |
+
+The median residual displacement at n >= 2 is 73-89% of `GEOM_TOL_A`, about
+half of each pool moves further than the tolerance meant to separate distinct
+minima, and 71 of 711 candidates were not near a minimum at all -- they fell
+into a *different* basin, the deepest dropping 108 meV. The collapse is a
+lower bound, since these candidates were already deduped at 0.15 A and so
+start mutually that far apart. It is not a greedy-ordering artifact either:
+re-deduping the original geometries with energies jittered by the observed
+spread gives 147.9 +/- 1.5 / 228.4 +/- 1.9 / 317.7 +/- 1.3 basins at
+n = 2/3/4, tens of standard deviations from the observed 98 / 128 / 239.
+Curvature corroborates the scale without being able to predict it
+per-structure: the softest mode the Hessian can resolve above its own ~4.4e-3
+eV/A^2 numerical floor permits 0.21-0.29 A of displacement at `fmax = 0.002`,
+and every unresolved mode is softer.
+
+Two remedies were priced. Tightening `Scoring.fmax` to 5e-4 costs 1.5-2.7x on
+the scoring optimisation and still does not reach a stable partition (n = 3
+slides 134 -> 128 -> 117 across three tight rungs); widening `GEOM_TOL_A` to
+cover p90 displacement (~0.5 A) would take n = 3 from 233 basins to ~50 and
+destroy the diversity measure it is supposed to report. **Neither default
+moved**, and `E_int(min)` never rose under any of it -- it falls by at most
+0.014 kcal/mol, monotonically, at every n and every rung.
+
 So the count is not a criterion artifact -- but "distinct minimum" here means
 "optimiser endpoint at least 0.15 A away in contact space", never "separated
-by a barrier", which nothing in this pipeline checks. **Read `pool` as a
-diversity measure at a stated resolution, not as a count of species**, and
+by a barrier", which nothing in this pipeline checks, and the endpoint itself
+is only reproducible to ~0.11-0.13 A (median) or ~0.5 A (p90). **Read `pool`
+as a diversity measure at a stated resolution, not as a count of species**,
+and
 compare it only between runs that share both tolerances -- which is what
 recording `dedupe_tol_eV` / `geom_tol_A` in every summary is for. The number
 that survives all of this untouched is `E_int(min)`: it is a set minimum

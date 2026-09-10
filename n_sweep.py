@@ -70,8 +70,8 @@ from pathlib import Path
 from ase.io import read
 
 from ensemble import Scoring, score_run_grid
-from report import (DEDUPE_TOL_EV, GEOM_TOL_A, VERSION, format_report,
-                    library_versions, pool_by_n, timestamp,
+from report import (DEDUPE_TOL_EV, GEOM_TOL_A, LADDER_N, VERSION,
+                    format_report, library_versions, pool_by_n, timestamp,
                     write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
@@ -95,7 +95,7 @@ DEFAULT_SEEDS = 5
 
 def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
               n_seeds=DEFAULT_SEEDS, n_workers=None, scoring=None, label=None,
-              condition_kwargs=None):
+              condition_kwargs=None, ladder_n=LADDER_N):
     """Generate and score one solute in one solvent at every n and seed.
 
     Everything that shapes a run lives on one of two dataclasses and is
@@ -116,6 +116,13 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
 
     Writes `<out_root>/sweep.json` -- `{"params": ..., "runs": [...]}` -- and
     a human-readable `<out_root>/report.txt`, and returns the summaries.
+
+    `ladder_n` is how many rungs the report's Basin spectrum section prints.
+    Display only, hence not a `Condition` or `Scoring` field and absent from
+    the params block -- the same footing `docking.run_docking`'s
+    `dump_screen` is on, and for the same reason: it changes nothing about
+    what the run measured, so two sweeps rendered at different `ladder_n` are
+    still comparable.
     """
     out_root = Path(out_root)
     n_values = list(n_values)
@@ -177,7 +184,8 @@ def run_sweep(solute_path, solvent_path, solvent, n_values, out_root,
                           capacity, [seeds_per_n[n] for n in n_values])
     (out_root / "sweep.json").write_text(
         json.dumps({"params": params, "runs": summaries}, indent=2))
-    (out_root / "report.txt").write_text(format_report(params, summaries))
+    (out_root / "report.txt").write_text(
+        format_report(params, summaries, ladder_n))
     write_best_geometries(out_root, pool_by_n(summaries), "sweep")
     return summaries
 
@@ -328,6 +336,13 @@ def main(argv=None):
     parser.add_argument("--label", default=None,
                         help="solute name in run directories and the table "
                              "(default: the solute filename stem)")
+    parser.add_argument("--ladder", type=int, default=LADDER_N,
+                        help="rungs printed in the report's Basin spectrum "
+                             "section. Display only -- it is not a Condition "
+                             "or Scoring field, does not reach the params "
+                             "block, and the sites / gap-kT columns are read "
+                             "off the whole spectrum either way "
+                             "(default: %(default)s)")
     parser.add_argument("--export-dft", action="store_true",
                         help="also export deduped, near-minimum candidates "
                              "for DFT refinement to <out>/dft_export/")
@@ -353,6 +368,7 @@ def main(argv=None):
             "n_steps": args.steps,
             "dump_interval": args.dump_interval,
         },
+        ladder_n=args.ladder,
     )
     print(Path(args.out) / "report.txt")
 

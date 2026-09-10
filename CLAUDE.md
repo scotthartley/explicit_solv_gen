@@ -21,6 +21,15 @@ what was tried and removed. Read the named section before you touch:
   and was removed deliberately; do not reinvent it)
 - `E_int` plateau reasoning, or adding a second increment column --
   "`E_int(n)` is what makes 'how much explicit solvent?' a measurement"
+- `report.LADDER_MIN_GAP_KT`, `LADDER_WINDOW_KT`, `LADDER_N`, or the rule that
+  a gap must be wider than the manifold below it -- "Binding-site
+  specificity: the basin ladder answers what the increment cannot". The
+  threshold gates only whether `sites` is *printed* and never a verdict; the
+  window is an energy and not a rank on purpose; and dropping the
+  wider-than-the-spread condition was measured to report `sites = 118` at
+  n = 3 of the shipped sweep. Also: a flat ladder is **not** "the solvent
+  barely binds" -- pyrazine + acetone binds at -3.5 kcal/mol with no cliff at
+  any n, which is the measurement that separates strength from specificity
 - docking's `n_refine` / `n_placements` -- "`docking.py` -- a second
   generator, beside the MD sweep" (`1 - 0.93^K` sets the default; `n_refine`
   is per parent and per distinct screened basin since 0.9.0)
@@ -45,7 +54,14 @@ what was tried and removed. Read the named section before you touch:
   that actually refined into the reported minimum. Also: at n >= 2 the pool's
   energy axis does nothing (100% of nearest-neighbour gaps inside the 5 meV
   window) and the whole n = 3 pool spans 3.2 kT, so a `pool` of 233 is a
-  diversity measure at a stated resolution, never 233 species
+  diversity measure at a stated resolution, never 233 species. **And the
+  stated resolution is finer than the run reproduces**: at `Scoring.fmax =
+  0.002` the median residual displacement is 0.11-0.13 A against a 0.15 A
+  tolerance, and tightening to 2e-4 collapses `pool` by 20-45% while moving
+  `E_int(min)` by at most 0.014 kcal/mol. Both remedies were priced and
+  neither default moved; the claim that 0.002 is "converged enough for the
+  criterion to be stable" was withdrawn from three places at 0.15.0, so do
+  not reinstate it
 - `report.DEDUPE_TOL_EV`, `report.GEOM_TOL_A`, the contact descriptor, or
   `Docking.screen_*_tol` -- "Geometric basin dedupe: what the energy-only
   criterion was doing" (both tolerances are picked from measured gaps in a
@@ -68,8 +84,12 @@ it prepended:
     python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
       --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 5
 
-`n_sweep.py --help` lists the rest; every flag maps onto a field of
-`Condition` or of `Scoring`, and takes its default from there. That is the
+`n_sweep.py --help` lists the rest; every flag that changes *what the run is*
+maps onto a field of `Condition` or of `Scoring` and takes its default from
+there. The exceptions are the ones that change only what gets written --
+`--export-dft`, `--occupancy-floor`, `--ladder` -- which stay off both
+dataclasses on purpose, so nothing that cannot move a number reaches the
+params block. That is the
 entry point -- there is no driver script, and `solvate_md.py` has no
 `__main__` smoke test of its own. A fast end-to-end check is the same command
 with `--n 2 --seeds 1 --steps 6000 --equilibrate 2000 --dump-interval 20
@@ -120,7 +140,7 @@ Per run directory: `packed.xyz`, `opt.log`, `traj.xyz`, `energies.json`,
 | `scored.log` | `ensemble.assemble` | provenance, references, per-candidate table (including BFGS `steps`), result block. Named after `out_name`, so a second continuum gives `scored_acetone.json` / `.log` |
 | `scored_candidates.xyz` | `ensemble.assemble` | every deduped candidate, not just the best, as a multi-frame xyz in the same order as `scored.json`'s `candidates` list -- frame *i* is `candidates[i]`. Named after `out_name` like `scored.log` |
 | `ref_solute.xyz`, `ref_solvent.xyz` | `ensemble.assemble` | the relaxed reference geometries `E_int` for this run was measured against (`reference_energies` keeps only energies otherwise). Written into every run directory that shares one reference, redundant but cheap. `dft_export.export_dft` reads either copy to reconstruct `E(solute) + n E(solvent)` at the DFT level |
-| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates, a Best geometry at each n section naming the file behind each row, a Modal geometry at each n section naming the file behind the basin the shell actually spent the most time in, a per-packing detail table (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the two diagnostics below. Each table ends with a one-line column key and points at README's "Reading report.txt", which is where the explanatory prose lives -- once, rather than in a docstring, in every rendered report, and here |
+| `report.txt` | `n_sweep.run_sweep` | params block, the per-n `E_int(n)` table over the pooled candidates (including the `sites` / `gap/kT` pair), a Basin spectrum section carrying the basin ladder those two are read off, a Best geometry at each n section naming the file behind each row, a Modal geometry at each n section naming the file behind the basin the shell actually spent the most time in, a per-packing detail table (with a `best` marker for the packings that reached the pooled minimum), a Basin occupancy section (see below), and the two diagnostics below. Each table ends with a one-line column key and points at README's "Reading report.txt", which is where the explanatory prose lives -- once, rather than in a docstring, in every rendered report, and here |
 | `best_n<N>.xyz` | `n_sweep.run_sweep` | one file per n -- the pooled-minimum packing's `best.xyz` at that n, with `sweep_n=` / `sweep_E_int_kcal=` / `sweep_packing=` appended to its comment line. One file per n, not one multi-frame file, because the atom count changes with n and a viewer that reads a multi-frame xyz as a trajectory (Avogadro, VMD, most others) shows only the first frame. The deliverable of the run |
 | `modal_n<N>.xyz` | `n_sweep.run_sweep` | one file per n (sweep only, never docking) -- the modal basin's own geometry, read out of `<run>/scored_candidates.xyz` at `candidate_index`, with `sweep_n=` / `sweep_E_int_kcal=` (the basin's own, not the pooled minimum) / `sweep_frame_share=` / `sweep_n_frames=` / `sweep_visits=` / `sweep_packing=` appended to its comment line. Written unconditionally, even when the modal basin *is* the minimum -- the report says when the two coincide |
 
@@ -154,6 +174,13 @@ rendering a per-parent table that silently omits the `window` / `cut` / `rank`
 cap cut. Re-run the docking -- there is no rescore path for a docked run. The
 same applies to a `sweep.json` params block without `monolayer_capacity`: it
 raises rather than rendering a report that silently omits the `cover` column.)
+
+**0.15.0's basin ladder is the exception to that list, deliberately.** The
+`sites` / `gap/kT` columns and the whole Basin spectrum section are derived
+from the `e_int_kcal` values every `scored.json` already carries -- no new
+persisted field, no new mandatory subscript, nothing to raise on -- so `python
+-m report <dir>` adds them to any run old enough to render at all, with no
+rescoring. `--ladder N` sets how many rungs print and nothing else.
 
 `E_int(min)` is the reported number, because it alone is comparable across n,
 and at 0.8.0 it is the only energy any table prints. `E_int(ens)` and
@@ -276,6 +303,12 @@ other JSON here. `--screen-dedupe-tol` / `--screen-geom-tol` are the flags for
 moving the tolerances the partition comes out of -- and **moving either moves
 every screened basin count**, so read DESIGN.md's "The screen-to-refine
 handoff" before you do.
+
+`--ladder N` is the second flag on that footing, on both generators and on
+`python -m report`: it sets how many rungs the Basin spectrum section prints
+and nothing else. Not a dataclass field, absent from the params block, and it
+cannot move `sites` or `gap/kT`, which are read off the whole spectrum -- so
+two runs rendered at different `--ladder` stay comparable.
 
 `dft_export.py` exports deduped, near-minimum candidates from either
 generator, plus a manifest, for a downstream DFT single point or reopt:

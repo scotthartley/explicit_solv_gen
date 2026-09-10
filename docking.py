@@ -73,6 +73,7 @@ from report import (
     DEDUPE_TOL_EV,
     EV_TO_KCAL,
     GEOM_TOL_A,
+    LADDER_N,
     VERSION,
     dedupe_energies,
     format_report,
@@ -835,7 +836,7 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
 
 def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
                 docking=None, scoring=None, n_workers=None, label=None,
-                dump_screen=False):
+                dump_screen=False, ladder_n=LADDER_N):
     """Dock one solute in one solvent, chained upward over n.
 
     n = 1's parent is the bare relaxed solute (the same reference
@@ -858,6 +859,11 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
     screening for it was paid for anyway. It is not a `Docking` field on
     purpose: it changes nothing about the run, so it has no business in the
     params block that says what the run was. See `dock_at_n`.
+
+    `ladder_n` -- how many rungs the report's Basin spectrum section prints --
+    is out of the params block for the same reason, and is display only: the
+    `sites` and `gap/kT` columns it substantiates are read off the whole
+    spectrum and do not move with it.
     """
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -933,7 +939,7 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
     (out_root / "dock.json").write_text(
         json.dumps({"params": params, "runs": summaries}, indent=2))
     (out_root / "dock_report.txt").write_text(
-        format_report(params, summaries))
+        format_report(params, summaries, ladder_n))
     write_best_geometries(out_root, pool_by_n(summaries), "dock")
     return summaries
 
@@ -1060,6 +1066,13 @@ def main(argv=None):
                              "screened energy and descriptor plus the "
                              "window/cap decision, so the screening partition "
                              "can be re-examined without re-running the screen")
+    parser.add_argument("--ladder", type=int, default=LADDER_N,
+                        help="rungs printed in the report's Basin spectrum "
+                             "section. Display only, like --dump-screen: it "
+                             "is not a Docking or Scoring field and does not "
+                             "reach the params block, and the sites / gap-kT "
+                             "columns are read off the whole spectrum either "
+                             "way (default: %(default)s)")
     parser.add_argument("--freeze-solute", action="store_true",
                         help="FixAtoms the solute during screening only "
                              "(approximation; refinement is always "
@@ -1111,6 +1124,7 @@ def main(argv=None):
         args.solute, args.solvent_geometry, args.solvent, args.n_values,
         args.out, docking=docking, scoring=scoring, n_workers=args.workers,
         label=args.label, dump_screen=args.dump_screen,
+        ladder_n=args.ladder,
     )
     print(Path(args.out) / "dock_report.txt")
 

@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -165,9 +165,20 @@ DEDUPE_TOL_EV = 5e-3
 # the descriptor distances run 0.01-0.12 A for sixteen pairs and then stop
 # dead until 0.16 A, with the bulk of the distribution only starting at 0.19
 # -- a genuine within-basin cluster, an empty band, and then everything else.
-# 0.15 sits in the empty band. That the within-basin cluster is that tight is
-# also what says `Scoring.fmax = 0.002` is converged enough for the criterion
-# to be stable; at the 0.05 it used to be, it would not be.
+# 0.15 sits in the empty band.
+#
+# That band comes from one n = 2 *sweep* pool, and it used to be quoted here as
+# evidence that `Scoring.fmax = 0.002` is converged enough for the criterion to
+# be stable. **It is not.** Re-relaxing 711 docked candidates to fmax = 2e-4
+# moves them by a median 0.11-0.13 A at n >= 2 -- 73-89% of this tolerance --
+# with roughly half the pool moving further than the tolerance that is supposed
+# to separate distinct minima, and `pool` falls 20-45%. So 0.15 A is below the
+# pipeline's own reproducibility at this `fmax`, and the partition it produces
+# is a resolution the run cannot quite deliver. Neither default moved on that
+# result (DESIGN.md's "'Distinct minima' is a resolution, not a count" has the
+# measurement and the two rejected remedies); `E_int(min)` is a set minimum
+# however the set is partitioned and is untouched by all of it, <= 0.014
+# kcal/mol.
 GEOM_TOL_A = 0.15
 
 # Above this many solvent molecules the brute-force assignment search in
@@ -367,6 +378,107 @@ def ensemble_energy(energies_eV, temperature_K=298.0):
     """
     w = boltzmann_weights(energies_eV, temperature_K)
     return float(np.dot(w, np.asarray(energies_eV, dtype=float)))
+
+
+# The basin ladder answers the question `E_int(n)` structurally cannot: is the
+# solvent at this n making a *defined* interaction, or is it bulk-like? The
+# increment cannot switch off when the specific sites fill -- two roughly
+# linear terms survive the cancellation, which is the whole of DESIGN.md's "It
+# does not plateau, so read the increment" -- and `pool` counts optimiser
+# endpoints at a stated resolution, so neither can tell a contact from a
+# crowd. The spectrum of distinct minima can: sort each n's basins by energy,
+# express them in kT above that n's own minimum, and look for a gap.
+#
+# Measured on pyrazine + chloroform (0.14.0 grid run, n = 1-4): the second
+# basin sits 4.4 kT above the first at n = 1 and 2.6 kT at n = 2 -- one
+# C-H...N contact per nitrogen -- and under 0.1 kT at n = 3 and n = 4, once
+# the nitrogens are saturated. The increments over the same four rows run
+# -6.67, -6.36, -5.36, -5.11: a smooth decay with no feature where the
+# chemistry changes. DESIGN.md's "Binding-site specificity" has the rest,
+# including the 2-methylpyrazine test of the multi-site case and the acetone
+# leg, which binds at -3.5 kcal/mol and has no cliff at any n.
+#
+# 16 rungs, because the default has to survive a many-site solute: six
+# pyrazines is twelve nitrogens, so n = 1 shows twelve near-degenerate rungs
+# before the cliff, and a shorter ladder would show only the flat part --
+# exactly the "bulk-like" misreading this section exists to prevent.
+LADDER_N = 16
+# The largest gap is sought among basins within this many kT of the minimum,
+# not over the whole spectrum: a sparse tail high above the minimum has big
+# gaps of its own and would otherwise supply one bigger than the real cliff.
+# An energy rather than a rank, so it scales to any number of sites and is
+# independent of LADDER_N -- the display knob cannot move `sites` or `gap/kT`.
+# It rarely binds on a docked pool (the whole n = 2 pool spans 2.8 kT) and is
+# the outer of two guards on an MD one, which reaches much higher because it
+# quenches half-dissolved frames: the inner guard, in `basin_ladder`, is that
+# a gap must be wider than the manifold below it. It is a guard, not a knob.
+LADDER_WINDOW_KT = 10.0
+# Below this gap, `sites` is not printed: a manifold size is meaningless
+# without a gap to bound it. It gates whether the count is printed and never a
+# verdict, and the measured separation is an order of magnitude (2.6-4.9 kT
+# where there is a cliff, 0.0-0.7 where there is not), so its exact value is
+# not load-bearing.
+LADDER_MIN_GAP_KT = 1.0
+# Rungs above this render as ">10", which keeps every cell three characters
+# wide and the line width fixed, and loses nothing: past ~5 kT a basin is
+# thermally irrelevant and only its position in the ladder still matters,
+# which the clamp preserves. Equal to LADDER_WINDOW_KT on purpose -- a rung
+# printed as ">10" is one no gap could have been measured from anyway.
+LADDER_CLAMP_KT = LADDER_WINDOW_KT
+
+
+def basin_ladder(e_int_kcal, temperature_K, n_show=LADDER_N):
+    """`(ladder_kT, sites, gap_kT)` from ascending distinct-basin energies.
+
+    `ladder_kT` is the first `n_show` basins in kT above the first one;
+    `gap_kT` the largest gap in the low-energy manifold (see
+    `LADDER_WINDOW_KT`); `sites` how many basins sit below that gap, or `None`
+    when the gap is under `LADDER_MIN_GAP_KT`.
+
+    The largest gap rather than the first one, which is what makes this work
+    for a solute with several inequivalent sites of similar affinity: two
+    distinguishable binding sites give two near-degenerate basins, so a bare
+    "gap to the second basin" is ~0 and would report bulk-like for the case
+    that is most specific of all. Chemically *equivalent* sites need no
+    handling at all -- `contact_descriptor` folds same-element automorphisms,
+    so pyrazine's two nitrogens are one basin by construction.
+
+    A gap qualifies only if it is **wider than the spread of everything below
+    it** -- the manifold it bounds has to be more tightly clustered than it is
+    separated from the rest, which is the whole content of "these k basins are
+    one family and everything else is far away". Without that condition the
+    largest in-window gap can sit high up a wide spectrum: measured on the
+    shipped 5-packing pyrazine/chloroform sweep, n = 3's pool spans 11.5 kT and
+    its largest gap is 2.0 kT at the 118th basin, which reported `sites = 118`
+    for exactly the bulk-like case this diagnostic exists to call bulk-like.
+    Docked pools never showed it (they span 1.9-2.8 kT entire); an MD pool
+    reaches far higher because it quenches half-dissolved frames too. The
+    condition is trivially true at i = 0, so there is always a candidate gap
+    and the answer is never undefined.
+
+    Does no deduping of its own: `e_int_kcal` is already one energy per basin
+    and already ascending, which `dedupe_groups` guarantees for every caller
+    here. A gap whose lower end is inside the window is measured to wherever
+    the next basin actually sits, so a cliff wider than the window is still
+    found; only gaps starting above it are excluded. `sites` and `gap_kT`
+    therefore depend on `LADDER_WINDOW_KT` alone and never on `n_show`.
+    """
+    if any(b < a for a, b in zip(e_int_kcal, e_int_kcal[1:])):
+        raise ValueError(
+            "basin_ladder expects one energy per basin, ascending; these are "
+            "not sorted. Every caller here gets them from `dedupe_groups`, "
+            "which orders groups by their representative's energy.")
+    kt_kcal = KB_EV_PER_K * temperature_K * EV_TO_KCAL
+    rel = [(e - e_int_kcal[0]) / kt_kcal for e in e_int_kcal]
+    # `b - a > a` is the separation condition: the gap must exceed the spread
+    # of the manifold below it. Ties go to the lower gap -- the conservative
+    # reading, fewer sites.
+    gaps = [(b - a, i + 1) for i, (a, b) in enumerate(zip(rel, rel[1:]))
+            if a <= LADDER_WINDOW_KT and b - a > a]
+    gap_kT, sites = max(gaps, key=lambda g: (g[0], -g[1]), default=(None, None))
+    if gap_kT is not None and gap_kT < LADDER_MIN_GAP_KT:
+        sites = None
+    return rel[:n_show], sites, gap_kT
 
 
 def _num(value, spec):
@@ -898,7 +1010,7 @@ def _increments(params, pooled):
             for p in pooled if (p["n_solvent"] - 1) in by_n}
 
 
-def pool_by_n(summaries):
+def pool_by_n(summaries, ladder_n=LADDER_N):
     """Pool every run's candidates at each n, and score the pool as one set.
 
     Both generators go through here, because both produce the same object: a
@@ -964,6 +1076,15 @@ def pool_by_n(summaries):
     says the descriptor is carrying the coordinate energy was missing. `None`
     throughout the occupancy fields for a docked chain, the same as
     `n_frames_pooled` above.
+
+    `basins` is also what the **basin ladder** is read off: `basin_ladder_kT`
+    (the first `ladder_n` of them in kT above that n's own minimum), `sites`
+    and `basin_gap_kT`. They are derived here, once, rather than in the
+    sections that show them, for the reason `format_report`'s docstring gives
+    -- and because `sites` and `basin_gap_kT` must not depend on `ladder_n`,
+    which only says how many rungs get printed. Nothing new is read off disk
+    for them: every `scored.json` already carries the energies they come out
+    of, so a run scored by any earlier version re-reports with them.
 
     `pooled[n]["modal"]` names the basin the shell actually spent the most
     time in -- the pooled `frame_share` maximum, ties broken by `n_seeds_hit`
@@ -1069,6 +1190,12 @@ def pool_by_n(summaries):
                                        for _, _, c in members}) > 1,
             })
 
+        # `basins` is ascending by construction (`dedupe_groups` orders groups
+        # by their representative's energy), which is exactly what the ladder
+        # wants and what its guard checks.
+        ladder, sites, basin_gap_kT = basin_ladder(
+            [b["e_int_kcal"] for b in basins], temperature, ladder_n)
+
         s_best, _idx_best, c_best = keep[0]
         # What corroborates the reported minimum, and out of how many tries.
         # For a sweep those are independent packings agreeing on it. A
@@ -1132,6 +1259,11 @@ def pool_by_n(summaries):
                 if n else 1.0),
             "n_frames_pooled": n_frames_pooled,
             "basins": basins,
+            # The ladder, and the two numbers derived from the whole of it
+            # rather than from the `ladder_n` rungs that get printed.
+            "basin_ladder_kT": ladder,
+            "sites": sites,
+            "basin_gap_kT": basin_gap_kT,
             # Frame-weighted, over the same pooled+deduped basins: how much of
             # the *sampling* actually sat in a contact state, as opposed to
             # how many distinct contact states were found. At n = 0 every
@@ -1183,7 +1315,7 @@ def format_table(params, pooled):
     capacity = params["monolayer_capacity"]
     header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'dE_int':>10} "
               f"{'found by':>9} {'pool':>6} {'contacts':>9} "
-              f"{'dissolved':>10} {'wall':>6}")
+              f"{'dissolved':>10} {'wall':>6} {'sites':>5} {'gap/kT':>6}")
     lines = [f"leg: {params['solute_label']}/{params['solvent']}"
              + (" (docked)" if docked else ""),
              f"full first shell: ~{capacity:.0f} solvent molecules", "",
@@ -1202,8 +1334,12 @@ def format_table(params, pooled):
             f"{p['pool']:>6} "
             f"{_num(p['occupancy_mean_contacts'], '.2f'):>9} "
             + (f"{'-':>10} " if diss is None else f"{100 * diss:>9.0f}% ")
-            + (f"{'-':>6}" if p["wall"] is None
-               else f"{100 * p['wall']:>5.0f}%"))
+            + (f"{'-':>6} " if p["wall"] is None
+               else f"{100 * p['wall']:>5.0f}% ")
+            # `sites` is blank below the gap threshold, not zero: a manifold
+            # size is meaningless without a gap to bound it.
+            + f"{_num(p['sites'], 'd'):>5} "
+            + f"{_num(p['basin_gap_kT'], '.1f'):>6}")
     lines.append(
         "\nE_int in kcal/mol. cover = n as a fraction of a full first-shell "
         "monolayer.\ndE_int = E_int(min) here minus E_int(min) at n - 1: read "
@@ -1218,7 +1354,50 @@ def format_table(params, pooled):
            if docked else
            ", not averaged over distinct minima.\nwall = the worst packing's "
            "fraction of sampling frames with a nonzero wall\nenergy.")
-        + "\nSee README: Reading report.txt.")
+        + f"\ngap/kT = the largest gap in the low-energy basin spectrum "
+          f"(within {LADDER_WINDOW_KT:.0f} kT of\nthe minimum); sites = how "
+          f"many basins sit below it, blank under "
+          f"{LADDER_MIN_GAP_KT:.0f} kT of gap.\nSee the Basin spectrum "
+          "section below, and README: Reading report.txt.")
+    return "\n".join(lines)
+
+
+def format_basin_spectrum(pooled):
+    """The basin ladder at each n -- what substantiates `sites` / `gap/kT`.
+
+    One line per n rather than a nested table: `pool_by_n` already put the
+    rungs in `basin_ladder_kT`, and the whole point of the section is that a
+    ladder is read across, in one glance, against the ladder at the n above
+    and below it. A cliff appears where the specific sites saturate, which is
+    the transition no column of `E_int(n)` can show.
+
+    Both generators get it -- a docked chain's basins are the same object a
+    sweep's are, and the spectrum says the same thing about either.
+
+    Its own section rather than more columns because the per-n table is
+    already nine columns wide; a ladder long enough to be useful cannot fit
+    beside them. What each n's cliff *means* lives in README's "Reading
+    report.txt", once, rather than in every rendered report.
+    """
+    lines = ["Basin spectrum (kT above each n's own minimum)",
+             "-" * 46]
+    for p in pooled:
+        rungs = "".join(
+            f"{'>10' if r > LADDER_CLAMP_KT else format(r, '.1f'):>4}"
+            for r in p["basin_ladder_kT"])
+        lines.append(f"  n = {p['n_solvent']} {rungs}")
+    lines.append(
+        f"\n  Every distinct minimum at that n, lowest first, in kT above "
+        f"that n's own\n  minimum -- the first {LADDER_N} of them, and `pool` "
+        "above says how many there are\n  in total (--ladder changes how many "
+        "rungs print and nothing else; sites and\n  gap/kT are read off the "
+        "whole spectrum). Rungs past "
+        f"{LADDER_CLAMP_KT:.0f} kT print as >10:\n  a basin that far up is "
+        "thermally irrelevant and only its position still\n  matters. A cliff "
+        "of a few kT after the first few rungs means those basins are\n  a "
+        "defined interaction and the rest of the pool is not; no cliff means "
+        "the\n  choice among near-degenerate shells is arbitrary. See README: "
+        "Reading\n  report.txt.")
     return "\n".join(lines)
 
 
@@ -1591,7 +1770,7 @@ def format_search_convergence(params, pooled):
     return "\n".join(lines)
 
 
-def format_report(params, summaries):
+def format_report(params, summaries, ladder_n=LADDER_N):
     """The whole report for either generator, from `sweep.json` / `dock.json`.
 
     One pipeline, not two. Both generators produce the same object -- a set of
@@ -1608,6 +1787,13 @@ def format_report(params, summaries):
     needs it, rather than each calling `pool_by_n(summaries)` on its own --
     they would recompute the same dedupe over the same candidates three times
     over.
+
+    `ladder_n` is how many rungs the Basin spectrum section prints, and the
+    only thing in this signature that is a display choice rather than a
+    property of the run. It is deliberately not a `Condition` or `Scoring`
+    field and so appears in no params block, on the `--dump-screen`
+    precedent: it changes nothing about what was measured, and two reports
+    rendered at different `ladder_n` remain comparable.
     """
     docked = summaries[0]["pack_mode"] == "dock"
     parts = [banner("docking report" if docked else "n-sweep report")]
@@ -1618,10 +1804,14 @@ def format_report(params, summaries):
              if k != "all_n_min_kcal"}
     parts.append(kv_block("Parameters", shown))
 
-    pooled = pool_by_n(summaries)
+    pooled = pool_by_n(summaries, ladder_n)
 
     parts.append("E_int(n) = E(solute + n solvent) - E(solute) - n E(solvent)\n"
                  + "-" * 58 + "\n" + format_table(params, pooled))
+
+    # Beside the table whose `sites` / `gap/kT` columns it substantiates, and
+    # above the docking early return, since a docked chain has a spectrum too.
+    parts.append(format_basin_spectrum(pooled))
 
     parts.append(format_best_geometry(pooled))
 
@@ -1879,7 +2069,7 @@ def render_run_dir(path):
     return written
 
 
-def render_output_dir(path, name, report_name, prefix):
+def render_output_dir(path, name, report_name, prefix, ladder_n=LADDER_N):
     """Rewrite one generator's report and `best_n<N>.xyz`, from its JSON.
 
     `name` is `sweep.json` or `dock.json` -- the two carry the same
@@ -1903,19 +2093,21 @@ def render_output_dir(path, name, report_name, prefix):
             written += render_run_dir(run_dir)
 
     report = path / report_name
-    report.write_text(format_report(params, runs))
+    report.write_text(format_report(params, runs, ladder_n))
     written.append(report)
 
     written += write_best_geometries(path, pool_by_n(runs), prefix)
     return written
 
 
-def render(path):
+def render(path, ladder_n=LADDER_N):
     path = Path(path)
     if (path / "dock.json").exists():
-        return render_output_dir(path, "dock.json", "dock_report.txt", "dock")
+        return render_output_dir(path, "dock.json", "dock_report.txt", "dock",
+                                 ladder_n)
     if (path / "sweep.json").exists():
-        return render_output_dir(path, "sweep.json", "report.txt", "sweep")
+        return render_output_dir(path, "sweep.json", "report.txt", "sweep",
+                                 ladder_n)
     if (path / "metadata.json").exists():
         return render_run_dir(path)
     written = []
@@ -1929,10 +2121,20 @@ def render(path):
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) < 2:
-        raise SystemExit("usage: python -m report <run-or-sweep-dir> ...")
-    for target in sys.argv[1:]:
-        for written in render(target):
+    parser = argparse.ArgumentParser(
+        prog="python -m report",
+        description="Regenerate logs and reports from JSON already on disk. "
+                    "No MD and no calculator.")
+    parser.add_argument("targets", nargs="+", metavar="DIR",
+                        help="a run, sweep or docking output directory")
+    parser.add_argument("--ladder", type=int, default=LADDER_N,
+                        help="rungs printed in the Basin spectrum section. "
+                             "Display only: sites and gap/kT are read off the "
+                             "whole spectrum and do not move with it "
+                             "(default: %(default)s)")
+    args = parser.parse_args()
+    for target in args.targets:
+        for written in render(target, args.ladder):
             print(written)

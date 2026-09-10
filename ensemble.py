@@ -109,6 +109,16 @@ class Scoring:
     # than on the chemistry. xtb's `--opt normal` stops at a gradient norm of
     # 1e-3 Eh/a, which this is comfortably inside -- the two criteria are not
     # comparable by eye, so `scored.log` prints both.
+    #
+    # **It is tight enough for the energies and not for the geometric dedupe**,
+    # a distinction this comment used to blur. Re-relaxing 711 docked
+    # candidates to 2e-4 moves them by a median 0.11-0.13 A at n >= 2, against
+    # `report.GEOM_TOL_A = 0.15`, and collapses `pool` by 20-45%; `E_int(min)`
+    # meanwhile falls by at most 0.014 kcal/mol. So `pool` and every count
+    # derived from it are quoted at a resolution finer than this `fmax`
+    # reproduces, while no reported energy is affected -- DESIGN.md's
+    # "'Distinct minima' is a resolution, not a count" has the measurement and
+    # why neither this default nor `GEOM_TOL_A` moved on it.
     fmax: float = 0.002
     opt_steps: int = 1000
     # For the Boltzmann weights. Normally the same as the MD temperature.
