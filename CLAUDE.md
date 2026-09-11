@@ -168,9 +168,9 @@ mandatory per-candidate `descriptor` (0.11.0) no longer re-renders, since the
 readers no longer default a missing field. Rescore it rather than
 re-reporting it. The same applies to a `dock.json` whose `parent_detail`
 entries predate `n_in_window` (0.13.0) or `screen_cut_kcal` /
-`best_screen_rank` / `best_screen_offset_kcal` (0.14.0): it raises rather than
-rendering a per-parent table that silently omits the `window` / `cut` / `rank`
-/ `offset` columns and with them the warning that says how deep the `n_refine`
+`best_screen_offset_kcal` (0.14.0): it raises rather than
+rendering a per-parent table that silently omits the `window` / `cut` /
+`offset` columns and with them the warning that says how deep the `n_refine`
 cap cut. Re-run the docking -- there is no rescore path for a docked run. The
 same applies to a `sweep.json` params block without `monolayer_capacity`: it
 raises rather than rendering a report that silently omits the `cover` column.

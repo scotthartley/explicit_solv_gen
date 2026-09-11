@@ -151,7 +151,6 @@ class Candidate:
     converged: bool
     fmax: float
     n_contacts: int
-    n_solvent: int
     min_gap_A: float
     # The confinement energy of the *sampling* frame this came from -- the
     # scorer applies no wall. A nonzero value says this geometry was being
@@ -556,7 +555,6 @@ def assemble(run_dir, meta, records, indices, relaxed, references, solvation,
             converged=result.converged,
             fmax=result.fmax,
             n_contacts=int((gaps < CONTACT_GAP_A).sum()),
-            n_solvent=n_solvent,
             min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
             wall_energy_eV=float(records[index]["wall_energy_eV"]),
             gnorm_Eh_bohr=result.gnorm_Eh_bohr,

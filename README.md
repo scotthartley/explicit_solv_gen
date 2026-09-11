@@ -353,6 +353,11 @@ same sections, minus the ones a constructed chain has no analogue of.
 mix is deliberate. A `1/2` in `found by` says the number rests on a single
 draw of the arrangement lottery, and the report warns about it.
 
+A docked table has no `contacts`, `dissolved` or `wall` columns at all: a
+docked structure was placed, not sampled, so all three are `None` in every
+pooled record at that pack mode by construction, not merely usually blank,
+and the table drops them rather than printing three guaranteed dashes.
+
 **What is in the JSON but not in the table.** `E_int(ens)` — the Boltzmann
 average over the pool — and `E(cluster)`, its absolute counterpart, are in
 `sweep.json` / `dock.json` and in every `scored.json`, and are deliberately
@@ -533,11 +538,11 @@ tightly. They differ — marked `!` — only when the `--refine` cap bound, whic
 is a rank cut on an energy that does not predict where a basin refines to.
 `cut` says how far above that parent's screened minimum the last refined basin
 sat, so `cut` against `--refine-window` is how much of the window a binding cap
-left unexplored; `rank` and `offset` are where that parent's own winner sat in
-the same screened ordering. Read the offset, not the rank — and read it as a
-spread rather than a bound. Over 28 measured parents a winner's offset ran the
-full width of the window (+0.00 to +2.98 of 3.0), so there is no cut depth
-that is known to be safe, and a binding cap is always warned about.
+left unexplored; `offset` is where that parent's own winner sat, above its own
+screened minimum — read it as a spread rather than a bound. Over 28 measured
+parents a winner's offset ran the full width of the window (+0.00 to +2.98 of
+3.0), so there is no cut depth that is known to be safe, and a binding cap is
+always warned about.
 
 ## Docking: a constructive alternative
 

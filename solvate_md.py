@@ -66,6 +66,21 @@ def _unit_sphere_points(n):
                  np.cos(phi)]
 
 
+def _quaternion_to_matrix(q):
+    """Rotation matrix from a unit quaternion `(w, x, y, z)`.
+
+    Shared with `docking._orientation_quaternions`' grid poses, which use the
+    identical convention -- extracted here rather than kept as two copies of
+    the same nine-term expansion.
+    """
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def _random_rotation(rng):
     """A uniformly distributed rotation matrix, from a random unit quaternion.
 
@@ -76,12 +91,7 @@ def _random_rotation(rng):
     """
     w, x, y, z = rng.normal(size=4)
     n = (w * w + x * x + y * y + z * z) ** 0.5
-    w, x, y, z = w / n, x / n, y / n, z / n
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
+    return _quaternion_to_matrix((w / n, x / n, y / n, z / n))
 
 
 def _vdw_volume(atoms):
@@ -372,6 +382,25 @@ def shell_padding(semi_axes, v_solute, n_solvent, v_solvent, shell_fill,
     return max(0.5 * (low + high), min_padding)
 
 
+def placement_region(solute_atoms, n_target, solvent, solvent_atoms, shell_fill):
+    """Ellipsoidal shell semi-axes, padding and region for `n_target` solvent
+    molecules against `solute_atoms`.
+
+    The shared sizing recipe `pack_solvent` and `docking.random_placements`
+    both need: the solute's vdW semi-axes, the shell thickness that puts
+    `n_target` molecules against it at bulk density (`shell_padding`), and
+    their sum, the region itself. Returns `(semi_axes, padding, region)` --
+    `pack_solvent` needs the first two separately, for `Packing` and the wall
+    distance; `random_placements` needs only the region.
+    """
+    semi_axes = solute_semi_axes(solute_atoms)
+    padding = shell_padding(
+        semi_axes, _vdw_volume(solute_atoms), n_target,
+        bulk_molecular_volume(solvent, solvent_atoms), shell_fill=shell_fill,
+        min_padding=solvent_radius(solvent, solvent_atoms))
+    return semi_axes, padding, semi_axes + padding
+
+
 def packing_wall_distance(region, solute_positions, r_solvent, wall_slack,
                           n_samples=4096):
     """Wall radius that just contains the packing region, plus slack.
@@ -449,18 +478,9 @@ def pack_solvent(
     solute = align_to_principal_axes(read(solute_path))
     solvent_unit = read(solvent_path)
 
-    semi_axes = solute_semi_axes(solute)
-    v_solvent = bulk_molecular_volume(solvent, solvent_unit)
+    semi_axes, padding, region = placement_region(
+        solute, n_solvent, solvent, solvent_unit, shell_fill)
     r_solvent = solvent_radius(solvent, solvent_unit)
-    padding = shell_padding(
-        semi_axes,
-        _vdw_volume(solute),
-        n_solvent,
-        v_solvent,
-        shell_fill=shell_fill,
-        min_padding=r_solvent,  # always at least a contact layer
-    )
-    region = semi_axes + padding
     wall_distance = packing_wall_distance(
         region, solute.get_positions(), r_solvent, wall_slack=wall_slack
     )

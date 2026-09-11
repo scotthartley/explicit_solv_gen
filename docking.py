@@ -76,6 +76,7 @@ from report import (
     GEOM_TOL_A,
     LADDER_N,
     VERSION,
+    dataclass_default,
     dedupe_energies,
     format_report,
     library_versions,
@@ -86,13 +87,11 @@ from report import (
 )
 from shell_capacity import monolayer_capacity, surface_points
 from solvate_md import (
+    _quaternion_to_matrix,
     _random_rotation,
-    _vdw_volume,
     align_to_principal_axes,
-    bulk_molecular_volume,
+    placement_region,
     pool_map,
-    shell_padding,
-    solute_semi_axes,
     solvent_radius,
 )
 
@@ -311,16 +310,6 @@ def _orientation_quaternions(n):
                  R * np.sin(beta), R * np.cos(beta)]
 
 
-def _quaternion_to_matrix(q):
-    """Rotation matrix from a unit quaternion, `_random_rotation`'s convention."""
-    w, x, y, z = q
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-
-
 def _pose_if_clear(parent_atoms, parent_positions, solvent_unit, centered,
                    rotation, point, tolerance):
     """`solvent_unit` rotated and centred on `point`, appended to the parent.
@@ -464,7 +453,7 @@ def random_placements(parent_atoms, solvent_unit, n_solute, n_total, docking,
     coverage -- see `Docking.place_mode`.
 
     The region is the ellipsoidal shell `place_one` draws in, sized by
-    `shell_padding` around the **solute block alone** (`n_solute` leading
+    `placement_region` around the **solute block alone** (`n_solute` leading
     atoms of an already principal-axis-aligned parent) but holding the whole
     complex, at the `n_total` the shell is eventually meant to hold rather
     than at the parent's own count -- so the region a molecule is drawn into
@@ -475,13 +464,9 @@ def random_placements(parent_atoms, solvent_unit, n_solute, n_total, docking,
     pose for pose.
     """
     solute_only = parent_atoms[:n_solute]
-    semi_axes = solute_semi_axes(solute_only)
-    padding = shell_padding(
-        semi_axes, _vdw_volume(solute_only), n_total,
-        bulk_molecular_volume(docking.solvent, solvent_unit),
-        docking.shell_fill,
-        min_padding=solvent_radius(docking.solvent, solvent_unit))
-    region = semi_axes + padding
+    _, _, region = placement_region(
+        solute_only, n_total, docking.solvent, solvent_unit,
+        docking.shell_fill)
     return [place_one(parent_atoms, solvent_unit, region, docking.tolerance,
                       rng)
             for _ in range(docking.n_placements)]
@@ -489,7 +474,7 @@ def random_placements(parent_atoms, solvent_unit, n_solute, n_total, docking,
 
 @dataclass
 class ScreenOrigin:
-    """Where one refined candidate sat in its parent's screened ranking.
+    """Where one refined candidate sat in its parent's screened selection.
 
     `dock_at_n` used to return a flat list of parent indices beside its
     refined results, with everything else about the selection either discarded
@@ -498,28 +483,28 @@ class ScreenOrigin:
     candidate, so it survives `run_docking`'s `sorted(zip(refined, origins))`
     by construction rather than by two parallel lists agreeing.
 
-    `rank` and `offset_kcal` describe the candidate: its position among its
-    parent's energy-ordered screened representatives (0 is that parent's
-    screened minimum) and how far above that minimum it screened.
-    `n_in_window` and `cut_kcal` describe the parent's whole selection and are
-    identical across its candidates -- how many representatives
-    `refine_window_kcal` admitted, and the offset of the last one `n_refine`
-    actually let through.
+    `offset_kcal` describes the candidate: how far above its parent's own
+    screened minimum it screened. `n_in_window` and `cut_kcal` describe the
+    parent's whole selection and are identical across its candidates -- how
+    many representatives `refine_window_kcal` admitted, and the offset of the
+    last one `n_refine` actually let through.
 
-    **`offset_kcal` is the statistic to read, not `rank`.** "The winner came
-    from rank 12 of 400" does not license "the cap was harmless": that
-    inference needs exactly the screened-rank-to-refined-energy correlation
-    DESIGN.md's "The screen-to-refine handoff" measures as absent. What does
-    transfer between runs is the offset, so `report.refine_cap_warning` says
-    where in energy a binding cap cut and how much of the window that left
-    behind. It stops short of grading that depth *safe*, and deliberately: a
-    refined winner's own offset has been measured across the whole width of
-    the window (`report.SCREEN_WINNER_OFFSET_KCAL`), so there is no depth
-    above which truncating is known to cost nothing.
+    **`offset_kcal` is the statistic to read.** A screened *rank* -- "the
+    winner came from rank 12 of 400" -- does not license "the cap was
+    harmless": that inference needs exactly the screened-rank-to-refined-
+    energy correlation DESIGN.md's "The screen-to-refine handoff" measures as
+    absent, which is why this carries no rank field at all (retired at
+    0.18.0; reconstructable from a `--dump-screen` dump if ever wanted for
+    forensics). What transfers between runs is the offset, so
+    `report.refine_cap_warning` says where in energy a binding cap cut and
+    how much of the window that left behind. It stops short of grading that
+    depth *safe*, and deliberately: a refined winner's own offset has been
+    measured across the whole width of the window
+    (`report.SCREEN_WINNER_OFFSET_KCAL`), so there is no depth above which
+    truncating is known to cost nothing.
     """
 
     parent: int
-    rank: int
     offset_kcal: float
     n_in_window: int
     cut_kcal: float
@@ -667,10 +652,9 @@ def dock_at_n(parents, n_solute, solvent_unit, n_total, docking, scoring,
         offsets = [(screened[members[r]].energy_eV - floor_eV) * EV_TO_KCAL
                    for r in admitted]
         top += [members[r] for r in admitted]
-        origins += [ScreenOrigin(parent=parent_index, rank=rank,
-                                 offset_kcal=offset, n_in_window=len(inside),
-                                 cut_kcal=offsets[-1])
-                    for rank, offset in enumerate(offsets)]
+        origins += [ScreenOrigin(parent=parent_index, offset_kcal=offset,
+                                 n_in_window=len(inside), cut_kcal=offsets[-1])
+                    for offset in offsets]
         if dump_parents is not None:
             # Indices are into this parent's own `members`, so each entry is
             # self-contained: `energies_eV[k]` and `descriptors[k]` are one
@@ -728,6 +712,14 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
     counting them would look like a frame-weighted population and would not
     be one. `Candidate.n_frames` is `None` for these, which is what makes
     `summarise` report no occupancy at all rather than a plausible number.
+
+    Returns `(summary, keep_idx)`: `keep_idx` is this n's dedupe over
+    `candidates`, indices into `pairs`/`candidates` lowest-energy first
+    (`unique` and `best` above are already built from it). `run_docking`
+    reuses it directly to pick the next generation's parents, rather than
+    recomputing the identical `dedupe_energies` call -- and re-deriving every
+    `contact_descriptor` from scratch -- a second time over the same
+    energies.
     """
     e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms = references
     n_dir = dock_run_dir(out_root, label, n)
@@ -745,7 +737,6 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             converged=result.converged,
             fmax=result.fmax,
             n_contacts=int((gaps < CONTACT_GAP_A).sum()),
-            n_solvent=n,
             min_gap_A=float(gaps.min()) if len(gaps) else float("nan"),
             # A docked structure has no sampling frame, so no wall energy and
             # no basin occupancy -- real absences, which is exactly what
@@ -788,10 +779,10 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
     # `n_refine` capped the selection, which `report.refine_cap_warning`
     # surfaces -- a capped run is choosing by screened rank again, and the
     # refined candidates alone cannot show it. `screen_cut_kcal` is how far up
-    # the cap reached before it did, and the two `best_screen_*` fields are
-    # where this parent's own winner sat: together they are what discharges a
-    # cap warning instead of merely repeating it. See `ScreenOrigin` for why
-    # the offset and not the rank is the number to grade on.
+    # the cap reached before it did, and `best_screen_offset_kcal` is where
+    # this parent's own winner sat: together they are what discharges a cap
+    # warning instead of merely repeating it. See `ScreenOrigin` for why the
+    # offset and not a screened rank is the number to grade on.
     parent_detail = []
     for pi, items in sorted(per_parent.items()):
         # `pairs` is energy-sorted, so `items[0]` is this parent's own best
@@ -803,7 +794,6 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             "n_placements": len(items),
             "n_in_window": best_origin.n_in_window,
             "screen_cut_kcal": best_origin.cut_kcal,
-            "best_screen_rank": best_origin.rank,
             "best_screen_offset_kcal": best_origin.offset_kcal,
             "e_int_min_kcal": best_candidate.interaction_eV * EV_TO_KCAL,
             "best": any(is_best(c) for c, _ in items),
@@ -831,13 +821,13 @@ def _assemble_dock_n(out_root, label, n, pairs, references, solvation,
             # The constructive analogue of the sweep's `found by`: refined
             # placements that landed on this n's minimum. Not independent
             # corroboration the way agreeing packings are -- see
-            # `report.format_dock_parent_detail`.
+            # `report.format_parent_detail`.
             "found_by": sum(1 for c in candidates if is_best(c)),
             "parent_detail": parent_detail,
         },
     )
     (n_dir / "scored.json").write_text(json.dumps(summary, indent=2))
-    return summary
+    return summary, keep_idx
 
 
 def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
@@ -922,14 +912,11 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
         n_tried_total += n_tried
 
         pairs = sorted(zip(refined, origins), key=lambda pair: pair[0].energy_eV)
-        summary = _assemble_dock_n(
+        summary, keep_idx = _assemble_dock_n(
             out_root, label, n, pairs, references, solvation, docking,
             scoring, n_tried, n_parents_used, n_solute, aps)
         all_n_min_kcal[n] = summary["min_interaction_kcal"]
 
-        keep_idx = dedupe_energies(
-            [r.energy_eV for r, _ in pairs],
-            [contact_descriptor(r.atoms, n_solute, aps) for r, _ in pairs])
         parents = [pairs[i][0].atoms for i in keep_idx[:docking.n_parents]]
 
         if n in n_values:
@@ -1013,58 +1000,66 @@ def main(argv=None):
                              "(n = 0 is the bare relaxed solute and is not "
                              "swept)")
     parser.add_argument("--out", required=True, help="output directory")
-    parser.add_argument("--placements", type=int, default=Docking.n_placements,
+    parser.add_argument("--placements", type=int,
+                        default=dataclass_default(Docking, "n_placements"),
                         help="random placements tried per parent per n; "
                              "ignored under --place-mode grid "
                              "(default: %(default)s)")
-    parser.add_argument("--place-mode", default=Docking.place_mode,
+    parser.add_argument("--place-mode",
+                        default=dataclass_default(Docking, "place_mode"),
                         choices=("random", "grid"),
                         help="how poses are generated: independent random "
                              "draws, or a systematic scan of the parent's "
                              "solvent-accessible surface x a quasi-uniform "
                              "set of orientations (default: %(default)s)")
     parser.add_argument("--grid-spacing", type=float,
-                        default=Docking.grid_spacing_A,
+                        default=dataclass_default(Docking, "grid_spacing_A"),
                         help="grid mode: separation of surface positions, A "
                              "(default: %(default)s)")
     parser.add_argument("--orientations", type=int,
-                        default=Docking.n_orientations,
+                        default=dataclass_default(Docking, "n_orientations"),
                         help="grid mode: orientations per surface position "
                              "(default: %(default)s)")
     parser.add_argument("--grid-probe-fracs", type=float, nargs="+",
-                        default=list(Docking.grid_probe_fracs),
+                        default=list(dataclass_default(
+                            Docking, "grid_probe_fracs")),
                         metavar="F",
                         help="grid mode: one shell of positions per value, "
                              "each a probe radius as a fraction of the "
                              "solvent's sphere radius (default: "
                              "%(default)s)")
-    parser.add_argument("--parents", type=int, default=Docking.n_parents,
+    parser.add_argument("--parents", type=int,
+                        default=dataclass_default(Docking, "n_parents"),
                         help="deduped minima carried forward as the next n's "
                              "parents (default: %(default)s)")
-    parser.add_argument("--refine", type=int, default=Docking.n_refine,
+    parser.add_argument("--refine", type=int,
+                        default=dataclass_default(Docking, "n_refine"),
                         help="cap on screened basins re-relaxed at the "
                              "scorer's tight fmax, per parent; the selector "
                              "is --refine-window, and this only bounds its "
                              "cost (default: %(default)s)")
     parser.add_argument("--refine-window", type=float,
-                        default=Docking.refine_window_kcal,
+                        default=dataclass_default(
+                            Docking, "refine_window_kcal"),
                         help="screened basins this far above a parent's own "
                              "screened minimum are refined, kcal/mol; the "
                              "screened ranking does not predict the refined "
                              "one, so this is a window and not a rank cut "
                              "(default: %(default)s)")
     parser.add_argument("--screen-fmax", type=float,
-                        default=Docking.screen_fmax,
+                        default=dataclass_default(Docking, "screen_fmax"),
                         help="loose optimiser convergence for the screening "
                              "pass, eV/A (default: %(default)s)")
     parser.add_argument("--screen-dedupe-tol", type=float,
-                        default=Docking.screen_dedupe_tol_eV,
+                        default=dataclass_default(
+                            Docking, "screen_dedupe_tol_eV"),
                         help="energy half of the screening basin criterion, "
                              "eV; deliberately looser than the scorer's "
                              "because a screened geometry is only relaxed to "
                              "--screen-fmax (default: %(default)s)")
     parser.add_argument("--screen-geom-tol", type=float,
-                        default=Docking.screen_geom_tol_A,
+                        default=dataclass_default(
+                            Docking, "screen_geom_tol_A"),
                         help="contact-descriptor half of the screening basin "
                              "criterion, A; splitting one basin here spends "
                              "--refine slots on near-copies of it "
@@ -1086,18 +1081,19 @@ def main(argv=None):
                              "(approximation; refinement is always "
                              "unconstrained)")
     parser.add_argument("--fmax", type=float,
-                        default=Scoring.__dataclass_fields__["fmax"].default,
+                        default=dataclass_default(Scoring, "fmax"),
                         help="refinement optimiser convergence, eV/A "
                              "per-atom max force (default: %(default)s)")
     parser.add_argument("--opt-steps", type=int,
-                        default=Scoring.__dataclass_fields__["opt_steps"].default,
+                        default=dataclass_default(Scoring, "opt_steps"),
                         help="max optimiser steps per candidate "
                              "(default: %(default)s)")
     parser.add_argument("--temperature", type=float,
-                        default=Scoring.__dataclass_fields__["temperature_K"].default,
+                        default=dataclass_default(Scoring, "temperature_K"),
                         help="K, for the Boltzmann weights "
                              "(default: %(default)s)")
-    parser.add_argument("--calculator", default=Docking.calculator,
+    parser.add_argument("--calculator",
+                        default=dataclass_default(Docking, "calculator"),
                         help="default: %(default)s")
     parser.add_argument("--workers", type=int, default=None,
                         help="parallel workers (default: all cores)")

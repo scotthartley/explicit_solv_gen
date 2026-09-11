@@ -37,7 +37,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -114,6 +114,18 @@ def library_versions(calculator):
             found = None
         versions[f"{name.replace('-', '_')}_version"] = found
     return versions
+
+
+def dataclass_default(cls, name):
+    """A dataclass field's default, for a CLI to advertise as its own.
+
+    Read off `Condition` / `Scoring` / `Docking` rather than restated, so a
+    `--flag`'s help text cannot drift away from the value the dataclass
+    documents -- which is exactly what had happened, twice. Lives here
+    rather than on any one generator's module because both `n_sweep.py` and
+    `docking.py` need it and neither imports the other.
+    """
+    return cls.__dataclass_fields__[name].default
 
 
 def kv_block(title, mapping, indent="  "):
@@ -281,9 +293,12 @@ def _descriptor_pair(a, b):
 def descriptors_match(a, b, tol_A=GEOM_TOL_A):
     """Are these two contact descriptors the same basin, within `tol_A`?
 
-    `descriptor_distance` with an early exit, which is the form the greedy
-    dedupe below wants: it only ever asks whether a candidate belongs in a
-    group, never how far away it is.
+    The max per-feature deviation, minimised over assignments of one
+    structure's solvent molecules to the other's -- a permutation search in
+    *descriptor* space rather than in Cartesian space, which is what makes it
+    a basin criterion rather than an RMSD -- checked with an early exit,
+    which is the form the greedy dedupe below wants: it only ever asks
+    whether a candidate belongs in a group, never how far away it is.
     """
     ca, cb, floor = _descriptor_pair(a, b)
     if floor > tol_A:
@@ -292,28 +307,6 @@ def descriptors_match(a, b, tol_A=GEOM_TOL_A):
         return True
     return any(np.abs(ca[list(p)] - cb).max() <= tol_A
                for p in permutations(range(ca.shape[0])))
-
-
-def descriptor_distance(a, b):
-    """How far apart two contact descriptors are, in Angstrom.
-
-    The max per-feature deviation, minimised over assignments of one
-    structure's solvent molecules to the other's -- a permutation search in
-    *descriptor* space rather than in Cartesian space, which is what makes it
-    a basin criterion rather than an RMSD. A naive coordinate RMSD would be
-    worse than the energy test it replaces: solvent molecules occupy a fixed
-    block layout but are chemically interchangeable, so two structures
-    identical up to swapping solvent 1 and 2 would score far apart and split,
-    where the energy test fused them correctly.
-
-    Brute force over `n_mol!` assignments. Not on the dedupe's hot path --
-    that is `descriptors_match` -- but the number a calibration wants.
-    """
-    ca, cb, floor = _descriptor_pair(a, b)
-    if ca.shape[0] == 0:
-        return floor
-    return max(floor, min(float(np.abs(ca[list(p)] - cb).max())
-                          for p in permutations(range(ca.shape[0]))))
 
 
 def dedupe_groups(energies_eV, descriptors=None, tol_eV=DEDUPE_TOL_EV,
@@ -886,9 +879,11 @@ def _candidate_table(summary, temperature_K):
         # or to BFGS before anyone swaps optimisers on a guess.
         steps_s = str(c["n_opt_steps"])
         # Of the *sampling* frame this candidate came from -- the scorer
-        # applies no wall. "-" for a docked candidate, which has no sampling
-        # frame and so no wall energy to report -- a real absence, not a
-        # zero.
+        # applies no wall. MD-only: `format_scored_log`, the only caller,
+        # runs on a docking run's summary through neither `ensemble.assemble`
+        # nor `render_run_dir` (which requires a `metadata.json`, and docking
+        # never writes one), so `c["wall_energy_eV"]` is always a real number
+        # here, never the `None` a docked candidate would carry.
         wall_s = _num(c["wall_energy_eV"], ".6f")
         frames_s = _num(c["n_frames"], "d")
         visits_s = _num(
@@ -905,10 +900,13 @@ def _candidate_table(summary, temperature_K):
 
 
 def _sampling_wall_str(summary):
-    """One-line summary of the wall during the MD that produced these frames."""
-    # None for a docked candidate -- there is no sampling frame at all, and
-    # for an MD run that dumped no frames, which `wall_stats` reports rather
-    # than guessing at.
+    """One-line summary of the wall during the MD that produced these frames.
+
+    MD-only, like `_candidate_table`: reachable only through
+    `format_scored_log`, which never runs on a docking summary. `None` here
+    is therefore only for an MD run that dumped no frames, which
+    `wall_stats` reports rather than guessing at.
+    """
     wall = summary["sampling_wall"]
     if wall is None or wall["wall_active_fraction"] is None:
         return None
@@ -1008,8 +1006,9 @@ def format_scored_log(summary, meta):
     parts.append(kv_block("Result", result))
 
     # After the Result block rather than up in Provenance: these are the
-    # energies the confinement contaminated. None for a docked candidate,
-    # which has no sampling wall at all.
+    # energies the confinement contaminated. `format_scored_log` is MD-only
+    # (see `_sampling_wall_str`), so `summary["sampling_wall"]` is always a
+    # real dict here.
     warning = (wall_warning(summary["sampling_wall"]["wall_active_fraction"])
               if summary["sampling_wall"] is not None else None)
     if warning:
@@ -1123,15 +1122,15 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
     `mean_contacts` is a property of the *search* (how many kinds of basin
     were found), the `occupancy_*` pair a property of the *trajectory* (how
     much of it sat in each). Quarantined from every energy in this record --
-    occupancy never enters `e_int_min_kcal` or `e_int_ens_kcal`.
+    occupancy never enters `e_int_min_kcal`.
 
     Each basin carries its own identity, not just its statistics -- `run`,
     `seed`, `candidate_index` (its index within that run's own
     `summary["candidates"]`, and therefore its frame index into that run's
-    `scored_candidates.xyz`, guaranteed equal by `ensemble.assemble`), `frame`,
-    `min_gap_A` and `wall_energy_eV`, so a reader (or `write_best_geometries`)
-    can go straight to the geometry a basin's numbers describe instead of
-    grepping every `scored.json` in the sweep for a matching energy. `n_visits`
+    `scored_candidates.xyz`, guaranteed equal by `ensemble.assemble`), so a
+    reader (or `write_best_geometries`) can go straight to the geometry a
+    basin's numbers describe instead of grepping every `scored.json` in the
+    sweep for a matching energy. `n_visits`
     / `mean_dwell` (`basin_visits`, summed over every run that contributed to
     the basin) separate "many genuine revisits" from "one long loiter" with
     the same frame count; `n_seeds` is the same denominator `found_by` uses,
@@ -1186,7 +1185,6 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
                                      [c["descriptor"] for _, _, c in tagged])
         keep = [tagged[g[0]] for g in basin_groups]
         interactions = [c["interaction_eV"] for _, _, c in keep]
-        absolutes = [c["energy_eV"] for _, _, c in keep]
         e_min = min(interactions)
         temperature = group[0]["temperature_K"]
         pack_mode = group[0]["pack_mode"]
@@ -1238,9 +1236,6 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
                 "run": Path(s_rep["run_dir"]).name,
                 "seed": s_rep["seed"],
                 "candidate_index": idx_rep,
-                "frame": rep_c["frame"],
-                "min_gap_A": rep_c["min_gap_A"],
-                "wall_energy_eV": rep_c["wall_energy_eV"],
                 "n_frames": frames,
                 "frame_share": (frames / n_frames_pooled
                                 if n_frames_pooled else None),
@@ -1271,7 +1266,7 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
         # how many of its refined random placements landed on the same
         # minimum -- the number `docking` already computed as `found_by`. The
         # two are the same column and emphatically not the same evidence;
-        # `format_dock_parent_detail` is where that is spelt out.
+        # `format_parent_detail` is where that is spelt out.
         if pack_mode == "dock":
             found_by = sum(s["found_by"] for s in group)
             n_searches = sum(s["n_refined"] for s in group)
@@ -1296,9 +1291,9 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
                                                    b["n_seeds_hit"],
                                                    -b["e_int_kcal"]))
                       if pack_mode != "dock" and basins else None)
-        modal = ({"run": modal_basin["run"], "seed": modal_basin["seed"],
+        modal = ({"run": modal_basin["run"],
                  "candidate_index": modal_basin["candidate_index"],
-                 "weight": modal_basin["weight"], "basin": modal_basin}
+                 "basin": modal_basin}
                 if modal_basin is not None else None)
         pooled.append({
             "n_solvent": n,
@@ -1307,11 +1302,6 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
             "n_searches": n_searches,
             "pool": len(keep),
             "e_int_min_kcal": e_min * EV_TO_KCAL,
-            "e_int_ens_kcal":
-                ensemble_energy(interactions, temperature) * EV_TO_KCAL,
-            # Identical weights to the line above, by the minimum-subtraction
-            # argument in `boltzmann_weights`.
-            "e_cluster_ens_eV": ensemble_energy(absolutes, temperature),
             "found_by": found_by,
             "found_by_seeds": found_by_seeds,
             "seed_minima_kcal": [m * EV_TO_KCAL for m in seed_minima],
@@ -1348,7 +1338,6 @@ def pool_by_n(summaries, ladder_n=LADDER_N):
             # `None` for a docked chain, which has no sampling wall at all.
             "wall": max(walls) if walls else None,
             "best": {"run": Path(s_best["run_dir"]).name,
-                     "seed": s_best["seed"],
                      "weight": float(weights[0]),
                      "candidate": c_best},
             "modal": modal,
@@ -1377,13 +1366,26 @@ def format_table(params, pooled):
     over distinct minima, because that is the one that answers a question
     about the system rather than about the search; `pool` already reports the
     search.
+
+    A docked row's `occupancy_mean_contacts`, `occupancy_dissolved_fraction`
+    and `wall` are always `None` -- not usually blank, provably so by
+    construction: `_assemble_dock_n` writes `n_frames=None` on every docked
+    `Candidate`, so `pool_by_n`'s `counted` flag is always `False` for a
+    docked chain and there is no sampling wall to measure at all. So a docked
+    table (0.18.0) drops the `contacts` / `dissolved` / `wall` columns
+    outright rather than printing three guaranteed dashes -- the same
+    render-time-only convention `inert_params` already applies to the
+    Parameters block. `sweep.json` / `dock.json` are unaffected: this crops a
+    *displayed* table, and the pooled record still carries all three keys.
     """
     docked = pooled[0]["pack_mode"] == "dock"
     deltas = _increments(params, pooled)
     capacity = params["monolayer_capacity"]
     header = (f"{'n':>3} {'cover':>6} {'E_int(min)':>12} {'dE_int':>10} "
-              f"{'found by':>9} {'pool':>6} {'contacts':>9} "
-              f"{'dissolved':>10} {'wall':>6} {'sites':>5} {'gap/kT':>6}")
+              f"{'found by':>9} {'pool':>6}"
+              + ("" if docked else f" {'contacts':>9} {'dissolved':>10} "
+                                   f"{'wall':>6}")
+              + f" {'sites':>5} {'gap/kT':>6}")
     lines = [f"leg: {params['solute_label']}/{params['solvent']}"
              + (" (docked)" if docked else ""),
              f"full first shell: ~{capacity:.0f} solvent molecules", "",
@@ -1393,6 +1395,11 @@ def format_table(params, pooled):
         delta = deltas.get(n)
         found = f"{p['found_by']}/{p['n_searches']}"
         diss = p["occupancy_dissolved_fraction"]
+        occupancy_cells = "" if docked else (
+            f"{_num(p['occupancy_mean_contacts'], '.2f'):>9} "
+            + (f"{'-':>10} " if diss is None else f"{100 * diss:>9.0f}% ")
+            + (f"{'-':>6} " if p["wall"] is None
+               else f"{100 * p['wall']:>5.0f}% "))
         lines.append(
             f"{n:>3} "
             f"{100 * n / capacity:>5.0f}% "
@@ -1400,10 +1407,7 @@ def format_table(params, pooled):
             + (f"{'-':>10} " if delta is None else f"{delta:>10.2f} ")
             + f"{found:>9} "
             f"{p['pool']:>6} "
-            f"{_num(p['occupancy_mean_contacts'], '.2f'):>9} "
-            + (f"{'-':>10} " if diss is None else f"{100 * diss:>9.0f}% ")
-            + (f"{'-':>6} " if p["wall"] is None
-               else f"{100 * p['wall']:>5.0f}% ")
+            + occupancy_cells
             # `sites` is blank below the gap threshold, not zero: a manifold
             # size is meaningless without a gap to bound it.
             + f"{_num(p['sites'], 'd'):>5} "
@@ -1416,12 +1420,12 @@ def format_table(params, pooled):
         + (" refined placements;\npool = distinct minima among them."
            if docked else
            " packings; pool = distinct minima in the pool.")
-        + " contacts / dissolved\nare frame-weighted over the scored frames"
-        + (" -- blank here, and so is wall: a docked\nstructure was placed, "
-           "not sampled, so it has neither an occupancy nor a wall."
+        + (""
            if docked else
-           ", not averaged over distinct minima.\nwall = the worst packing's "
-           "fraction of sampling frames with a nonzero wall\nenergy.")
+           " contacts / dissolved\nare frame-weighted over the scored "
+           "frames, not averaged over distinct minima.\nwall = the worst "
+           "packing's fraction of sampling frames with a nonzero wall\n"
+           "energy.")
         + f"\ngap/kT = the largest gap in the low-energy basin spectrum "
           f"(within {LADDER_WINDOW_KT:.0f} kT of\nthe minimum); sites = how "
           f"many basins sit below it, blank under "
@@ -1581,7 +1585,7 @@ def format_seed_detail(summaries, pooled):
 _OCCUPANCY_TOP_N = 5
 
 
-def format_basin_occupancy(params, summaries, pooled, top_n=_OCCUPANCY_TOP_N):
+def format_basin_occupancy(summaries, pooled, top_n=_OCCUPANCY_TOP_N):
     """How the trajectory's time was actually spent, per n -- not just which
     distinct minima the search turned up.
 
@@ -1766,7 +1770,7 @@ def format_wall_diagnostic(summaries):
     return "\n".join(lines)
 
 
-def format_search_convergence(params, pooled):
+def format_search_convergence(pooled):
     """Do the independent packings at each n agree on the minimum?
 
     A packing is a search, not a replica, so the useful question about a set
@@ -1906,9 +1910,9 @@ def format_report(params, summaries, ladder_n=LADDER_N):
 
     parts.append(format_modal_geometry(pooled))
     parts.append(format_seed_detail(summaries, pooled))
-    parts.append(format_basin_occupancy(params, summaries, pooled))
+    parts.append(format_basin_occupancy(summaries, pooled))
 
-    for section in (format_search_convergence(params, pooled),
+    for section in (format_search_convergence(pooled),
                     format_wall_diagnostic(summaries)):
         if section:
             parts.append(section)
@@ -2070,7 +2074,7 @@ def format_parent_detail(params, summaries):
     the cap stopped and only the window says how much that left behind.
     """
     header = (f"{'n':>3} {'parent':>6} {'best':>4} {'refined':>8} "
-              f"{'window':>7} {'cut':>7} {'rank':>5} {'offset':>7} "
+              f"{'window':>7} {'cut':>7} {'offset':>7} "
               f"{'E_int(min)':>12}")
     lines = ["Per-parent detail", "-----------------", header,
              "-" * len(header)]
@@ -2087,7 +2091,6 @@ def format_parent_detail(params, summaries):
                 f"{parent['n_placements']:>8} "
                 f"{str(parent['n_in_window']) + capped:>7} "
                 f"{'+%.2f' % parent['screen_cut_kcal']:>7} "
-                f"{parent['best_screen_rank']:>5} "
                 f"{'+%.2f' % parent['best_screen_offset_kcal']:>7} "
                 f"{parent['e_int_min_kcal']:>12.2f}")
     lines.append(
@@ -2102,12 +2105,12 @@ def format_parent_detail(params, summaries):
         "and is warned about below. 'cut' is how\n  far above that parent's "
         "screened minimum the last refined basin sat, kcal/mol:\n  against "
         "--refine-window it says how much of the window a binding cap left\n  "
-        "unexplored, which is what the cap costs. 'rank' and 'offset' are "
-        "where that\n  parent's own winner sat in the same screened ordering. "
-        "Read the offset, not the\n  rank -- the screened ranking does not "
-        "predict the refined one, which is why the\n  selector is a window -- "
-        "and read it as a spread rather than a bound: measured\n  winners run "
-        "the full width of the window. Unlike the sweep's 'found by',\n  "
+        "unexplored, which is what the cap costs. 'offset' is where that "
+        "parent's own\n  winner sat, above its own screened minimum -- read "
+        "it as a spread rather than a\n  bound: measured winners run the "
+        "full width of the window, since the screened\n  ranking does not "
+        "predict the refined one, which is why the selector is a window\n  "
+        "rather than a rank cut. Unlike the sweep's 'found by',\n  "
         "several parents landing near one minimum is not independent "
         "corroboration:\n  every parent explores the same shell region, not a "
         "differently-arranged packing.")

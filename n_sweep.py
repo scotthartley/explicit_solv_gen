@@ -71,8 +71,8 @@ from ase.io import read
 
 from ensemble import Scoring, score_run_grid
 from report import (DEDUPE_TOL_EV, GEOM_TOL_A, LADDER_N, VERSION,
-                    format_report, library_versions, pool_by_n, timestamp,
-                    write_best_geometries)
+                    dataclass_default, format_report, library_versions,
+                    pool_by_n, timestamp, write_best_geometries)
 from shell_capacity import monolayer_capacity
 from solvate_md import Condition, run_job_grid
 
@@ -249,16 +249,6 @@ def sweep_params(condition, scoring, n_values, n_seeds, label, capacity,
     # the two params blocks would agree.
     params.update(library_versions(condition.calculator))
     return params
-
-
-def dataclass_default(cls, name):
-    """A dataclass field's default, for the CLI to advertise as its own.
-
-    Read off `Condition` and `Scoring` rather than restated, so `--steps` and
-    friends cannot drift away from the values those dataclasses document --
-    which is exactly what had happened, twice.
-    """
-    return cls.__dataclass_fields__[name].default
 
 
 def main(argv=None):
