@@ -84,6 +84,15 @@ it prepended:
     python n_sweep.py examples/pyrazine.xyz examples/chloroform.xyz \
       --solvent chcl3 --n 0 1 2 3 --out pyrazine_chcl3/ --seeds 5
 
+**Under a read-restricted agent sandbox, `conda activate` does not work** --
+it sources `<conda-base>/etc/profile.d/conda.sh`, which lies outside the env
+directory such a sandbox grants read access to, so the failure is the
+allowlist and not a missing package. Prepending the env's bin is the
+equivalent that needs nothing but the env itself, and was verified to import
+numpy, ase and tblite and to resolve packmol:
+
+    PATH="<conda-base>/envs/solvate_md/bin:$PATH" python n_sweep.py ...
+
 `n_sweep.py --help` lists the rest; every flag that changes *what the run is*
 maps onto a field of `Condition` or of `Scoring` and takes its default from
 there. The exceptions are the ones that change only what gets written --
