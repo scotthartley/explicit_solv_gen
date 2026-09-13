@@ -29,7 +29,6 @@ import json
 import time
 from datetime import datetime
 from importlib import metadata
-from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +36,7 @@ import numpy as np
 # Bump on any change to the pipeline's numerics or output shapes -- it lands
 # in every sweep's params block via `n_sweep.sweep_params`, so a report can be
 # matched back to the code that produced it.
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 
 # Live here rather than in `ensemble` so that a text-only consumer never has to
 # import ASE to format or weight a number. `ensemble` re-exports both.
@@ -252,12 +251,17 @@ DEDUPE_TOL_EV = 5e-3
 # kcal/mol.
 GEOM_TOL_A = 0.15
 
-# Above this many solvent molecules the brute-force assignment search in
-# `descriptors_match` stops being free (8! = 40320 comparisons of small
-# arrays). Real n stays well under it -- `monolayer_capacity` is what says how
-# far a first shell goes -- and there is no scipy in `environment.yml` to
-# reach for a Hungarian solver, so this raises rather than silently degrading.
-MAX_DESCRIPTOR_MOLECULES = 8
+# Sanity bound on descriptor size, not an algorithmic limit. Through 0.18.0
+# `descriptors_match` searched permutations directly (8! = 40320 comparisons
+# of small arrays), which is what this capped; since 0.19.0 it instead asks a
+# bottleneck (minimax) assignment feasibility question by Kuhn's
+# augmenting-path algorithm, O(n_mol^3), which does not care whether n_mol is
+# 8 or 30 (measured: 10 microseconds either way). 32 sits comfortably past a
+# full first shell for the solutes this targets (~27 chloroform on pyrazine,
+# from `monolayer_capacity`); this still raises above it, now to catch a
+# descriptor that plausibly comes from mixing two unrelated systems rather
+# than to fence off a cost cliff.
+MAX_DESCRIPTOR_MOLECULES = 32
 
 
 def _descriptor_arrays(descriptor):
@@ -283,30 +287,70 @@ def _descriptor_pair(a, b):
     if ca.shape[0] > MAX_DESCRIPTOR_MOLECULES:
         raise ValueError(
             f"{ca.shape[0]} solvent molecules exceeds "
-            f"MAX_DESCRIPTOR_MOLECULES = {MAX_DESCRIPTOR_MOLECULES}; the "
-            "assignment search in `descriptors_match` is brute force and "
-            "there is no scipy in this environment to replace it with.")
+            f"MAX_DESCRIPTOR_MOLECULES = {MAX_DESCRIPTOR_MOLECULES}; this is "
+            "a sanity bound on descriptor size, not an algorithmic limit, and "
+            "a real n stays well under it -- see `monolayer_capacity`. "
+            "Comparing descriptors this large most likely means two "
+            "unrelated systems got mixed.")
     floor = float(np.abs(ga - gb).max()) if ga.size else 0.0
     return ca, cb, floor
+
+
+def _has_perfect_matching(ok):
+    """Does bipartite graph `ok` (n x n bool, edge iff `ok[i, j]`) have one?
+
+    Kuhn's augmenting-path algorithm: greedily match each left node in turn,
+    re-routing earlier matches along an alternating path when a left node's
+    neighbours are all already taken. O(n^3) worst case (n augmenting-path
+    searches, each O(n^2)) against the O(n!) permutation search this
+    replaced -- the two ask the same question (a perfect matching exists)
+    but the permutation search answers it by enumerating candidates for one
+    while this one grows a matching, which is why it stays cheap as n grows
+    past the count a permutation search could ever afford. Recursion depth
+    is bounded by n, which `MAX_DESCRIPTOR_MOLECULES` bounds in turn, so
+    plain recursion is safe.
+    """
+    n = ok.shape[0]
+    match_right = [-1] * n  # right-node index -> the left node matched to it
+
+    def augment(left, seen_right):
+        for right in range(n):
+            if ok[left, right] and right not in seen_right:
+                seen_right.add(right)
+                if match_right[right] == -1 or augment(match_right[right],
+                                                        seen_right):
+                    match_right[right] = left
+                    return True
+        return False
+
+    return all(augment(left, set()) for left in range(n))
 
 
 def descriptors_match(a, b, tol_A=GEOM_TOL_A):
     """Are these two contact descriptors the same basin, within `tol_A`?
 
-    The max per-feature deviation, minimised over assignments of one
-    structure's solvent molecules to the other's -- a permutation search in
-    *descriptor* space rather than in Cartesian space, which is what makes it
-    a basin criterion rather than an RMSD -- checked with an early exit,
-    which is the form the greedy dedupe below wants: it only ever asks
-    whether a candidate belongs in a group, never how far away it is.
+    A bottleneck (minimax) assignment *feasibility* test: does there exist an
+    assignment of one structure's solvent molecules to the other's whose max
+    per-feature deviation is <= `tol_A`? Thresholding the pairwise cost
+    matrix at `tol_A` turns that into "does this bipartite graph have a
+    perfect matching", answered exactly (not approximated) by
+    `_has_perfect_matching` -- assignment in *descriptor* space rather than
+    in Cartesian space, which is what makes this a basin criterion rather
+    than an RMSD. Two free numpy prefilters before any matching work: the
+    `solvent_gaps` floor above, and here, a row or column of the cost matrix
+    that is all-infeasible, which no perfect matching can survive.
     """
     ca, cb, floor = _descriptor_pair(a, b)
     if floor > tol_A:
         return False
-    if ca.shape[0] == 0:
+    n_mol = ca.shape[0]
+    if n_mol == 0:
         return True
-    return any(np.abs(ca[list(p)] - cb).max() <= tol_A
-               for p in permutations(range(ca.shape[0])))
+    cost = np.abs(ca[:, None, :] - cb[None, :, :]).max(axis=2)
+    ok = cost <= tol_A
+    if not (ok.any(axis=1).all() and ok.any(axis=0).all()):
+        return False
+    return _has_perfect_matching(ok)
 
 
 def dedupe_groups(energies_eV, descriptors=None, tol_eV=DEDUPE_TOL_EV,

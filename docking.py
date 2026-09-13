@@ -846,8 +846,14 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
 
     Writes `<out_root>/dock.json` -- `{"params": ..., "runs": [...]}`,
     matching `sweep.json`'s shape -- and `<out_root>/dock_report.txt`, plus
-    one `best_n<N>.xyz` per requested n. Returns the list of summaries, one
-    per requested n.
+    one `best_n<N>.xyz` per requested n, **after every completed n**, not
+    only at the end: all four writes are calculator-free and cheap against a
+    whole generation of BFGS, so redoing them once per n costs nothing
+    measurable, and it means a chain that dies partway through (an OOM, a
+    cluster wall-clock limit, an uncaught error at some later n) leaves a
+    readable report behind for every n it did finish, rather than only the
+    per-n run directories a crash used to strand. Returns the list of
+    summaries, one per requested n.
 
     `dump_screen` additionally writes `screen.json` into every n's run
     directory -- **every** n the chain walks, not only the requested ones,
@@ -896,6 +902,25 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
         docking.calculator_kwargs, scoring.fmax, scoring.opt_steps)
     references = (e_solute, e_solvent, ref_solute_atoms, ref_solvent_atoms)
 
+    def write_outputs():
+        """Rewrite the three terminal artefacts from `summaries` so far.
+
+        Called after every completed n, once `summaries` is non-empty, so a
+        chain that dies partway through still leaves a readable
+        `dock.json` / `dock_report.txt` for every n it reached -- see this
+        function's docstring for why the cost of doing this every n is
+        negligible. Guarded on `summaries` at each call site rather than
+        here, so an n below the first requested one (walked only to get the
+        chain there) never renders an empty report.
+        """
+        params = dock_params(docking, scoring, n_values, label, capacity,
+                             solute_path, solvent_path, all_n_min_kcal)
+        (out_root / "dock.json").write_text(
+            json.dumps({"params": params, "runs": summaries}, indent=2))
+        (out_root / "dock_report.txt").write_text(
+            format_report(params, summaries, ladder_n))
+        write_best_geometries(out_root, pool_by_n(summaries), "dock")
+
     parents = [ref_solute_atoms]
     all_n_min_kcal = {0: 0.0}  # E_int(0) = 0 by construction
     summaries = []
@@ -921,19 +946,15 @@ def run_docking(solute_path, solvent_path, solvent, n_values, out_root,
 
         if n in n_values:
             summaries.append(summary)
+            write_outputs()
 
     elapsed = time.time() - start
     print(f"docking: {n_tried_total} placements screened, "
           f"{sum(s['n_refined'] for s in summaries)} refined at requested n "
           f"in {elapsed:.1f} s")
 
-    params = dock_params(docking, scoring, n_values, label, capacity,
-                         solute_path, solvent_path, all_n_min_kcal)
-    (out_root / "dock.json").write_text(
-        json.dumps({"params": params, "runs": summaries}, indent=2))
-    (out_root / "dock_report.txt").write_text(
-        format_report(params, summaries, ladder_n))
-    write_best_geometries(out_root, pool_by_n(summaries), "dock")
+    if summaries:
+        write_outputs()
     return summaries
 
 

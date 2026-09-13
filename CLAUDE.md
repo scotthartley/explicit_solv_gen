@@ -228,8 +228,10 @@ tolerances are recorded in each summary and each params block
 leaving `E_int(min)` exactly where it was -- so **check them before comparing
 two sweeps' basin counts**, the same way you check `wall_slack` before
 subtracting two energies. DESIGN.md's "Geometric basin dedupe" has the
-measurements; `report.MAX_DESCRIPTOR_MOLECULES = 8` caps the brute-force
-assignment search and raises above it.
+measurements; `report.MAX_DESCRIPTOR_MOLECULES = 32` is a sanity bound on
+descriptor size, not an algorithmic limit (0.19.0 replaced the brute-force
+permutation search with an exact bottleneck-matching feasibility test), and
+raises above it.
 
 An MD candidate in `scored.json` also carries `n_frames` and `frames` -- how
 many scored frames quenched into that minimum, and their sampling dump

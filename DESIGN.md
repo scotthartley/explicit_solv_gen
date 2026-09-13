@@ -518,16 +518,40 @@ superpositions:
   are still distinguished. Sorted, hence already invariant under solvent
   relabelling.
 
-Comparing two of them minimises the max per-feature deviation over
-*assignments of solvent molecules* -- a permutation search in descriptor
-space, not in Cartesian space. Brute-force `itertools.permutations` up to
+Comparing two of them asks whether there is an assignment of one structure's
+solvent molecules to the other's whose max per-feature deviation is within
+tolerance -- a *feasibility* question in descriptor space, not in Cartesian
+space, and not the sum-minimisation Hungarian solves. That makes it a
+bottleneck (minimax) assignment problem: threshold the pairwise cost matrix
+at the tolerance and ask whether the resulting bipartite graph has a perfect
+matching, which `report._has_perfect_matching` answers exactly by Kuhn's
+augmenting-path algorithm, O(n_mol^3), no scipy needed. Through 0.18.0 this
+was instead a brute-force `itertools.permutations` search, capped at
 `report.MAX_DESCRIPTOR_MOLECULES = 8` (8! = 40320 comparisons of small
-arrays; `monolayer_capacity` is what says real n stays well under it), and it
-raises above that rather than degrading silently, because there is no scipy
-in `environment.yml` to reach for a Hungarian solver. Cost is negligible
-regardless: the greedy dedupe compares each candidate against group
+arrays) because it had nowhere else to go past that. Measured head to head on
+the same inputs, worst case (no assignment satisfies the tolerance, so a
+permutation search exhausts every one of them):
+
+| n_mol | permutation search (worst case) | matching |
+| --- | --- | --- |
+| 6 | 0.93 ms | 8.8 us |
+| 8 | 52.4 ms | 8.4 us |
+| 9 | 483.2 ms | 15.4 us |
+| 32 | (32! -- not attempted) | 38.1 us |
+
+Identical verdict on 2160 randomized pairs (matching, non-matching and
+near-threshold cases, `n_mol` 0-8, four tolerances each) confirms it is the
+same predicate, not an approximation of it -- the cap was never forced by an
+absent Hungarian solver, it was forced by naming the wrong algorithm for a
+minimax question in the first place. `MAX_DESCRIPTOR_MOLECULES` is now 32:
+not a factorial wall any more, just a sanity bound comfortably past a full
+first shell for the solutes this targets (~27 chloroform on pyrazine, from
+`monolayer_capacity`), so a descriptor larger than that is more likely two
+unrelated systems mixed than a real run. Cost is negligible regardless, now
+doubly so: the greedy dedupe compares each candidate against group
 *representatives* only, never pairwise, so a sweep's ~150 candidates against
-~50 groups is milliseconds against an hour of BFGS.
+~50 groups was already milliseconds against an hour of BFGS, and the matching
+test does not care whether `n_mol` is 8 or 32.
 
 **Both tolerances were picked from gaps in the data, not guessed.** Over all
 2850 pairs of that n = 2 pool the descriptor distances run 0.01-0.12 A for
@@ -1570,7 +1594,14 @@ cohesion takes over (already a known limitation of `E_int` at n >= 2 above),
 and a greedy chain compounds many sequential conditioned placement decisions
 into an arrangement space no longer well sampled by a handful of random
 poses. `run_docking` prints a warning once `n` exceeds that fraction of
-capacity, the same convention `n_sweep`'s `cover` column uses.
+capacity, the same convention `n_sweep`'s `cover` column uses. Since 0.19.0
+n >= 9 (`MONOLAYER_WARN_FRACTION` of chloroform's ~27-molecule monolayer on
+pyrazine) actually *runs* in both generators, where it used to hit
+`MAX_DESCRIPTOR_MOLECULES` in the dedupe -- so this warning is now the only
+thing saying past-a-third-of-capacity is a bad idea. It always was a
+statement about the chemistry (no single minimum dominates, solvent-solvent
+cohesion takes over), never a former implementation limit that happened to
+sit near the same n by coincidence.
 
 ### `dft_export.py`, verified end to end
 
